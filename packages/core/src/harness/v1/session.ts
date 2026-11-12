@@ -47,7 +47,6 @@ import {
   AgentThreadSignalAdmissionError,
   isAgentThreadOutputDrainTeardownError,
 } from '../../agent/thread-stream-runtime';
-import { parseToolApprovalDecision } from '../../agent/tool-call-identity';
 import type { ToolApprovalDecision } from '../../agent/tool-call-identity';
 import {
   ON_BEFORE_TOOL_EXECUTION_KEY,
@@ -61,7 +60,6 @@ import {
   clearSuspendedToolSurfaceFence,
   createToolSurfaceFence,
   materializeToolSurfaceFence,
-  readToolSurfaceFence,
   stageToolSurfaceFenceRestore,
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
@@ -164,7 +162,6 @@ import {
   HarnessConfigError,
   HarnessError,
   HarnessInboxItemNotFoundError,
-  HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
   HarnessOverrideConflictError,
   HarnessPendingInteractionDiscardedError,
@@ -175,8 +172,6 @@ import {
   HarnessQueuedTurnDeferredError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
-  HarnessSessionCorruptError,
-  HarnessSessionClosingError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessMessageResultErasedError,
@@ -342,27 +337,70 @@ import {
 import type { ObservationalMemorySessionPort } from './session-observational-memory';
 import {
   appendExpiredPendingInteraction,
-  ASK_USER_TOOL_NAME,
-  cancelledPendingAudit,
-  compactJsonObject,
-  DISCARD_PENDING_INTERACTION_KINDS,
-  discardReceiptResult,
+  applyInboxReceiptFromCompletedQueue,
+  assertMatchingInboxReceipt,
+  captureMessageSuspendWithTokenUsage,
+  clearPendingInteractionExpiryTimer,
+  completeDiscardedPendingInteraction,
+  computeInboxResponseHash,
+  discardClaimForPending,
+  discardedErrorForReceipt,
+  discardPendingInteraction,
+  discardPendingInteractionForAbort,
+  discardReceiptForAnswer,
+  emitPendingEvent,
+  expirePendingInteraction,
+  findDiscardReceipt,
   findDiscardReceiptIn,
   getOwnRecordValue,
-  MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH,
+  inboxReceiptResult,
+  internalExpirePendingInteractionGeneration,
+  markInboxResponseApplied,
   MAX_INBOX_RESPONSE_RECEIPTS,
+  maybeCaptureSuspend,
+  maybeFinalizeRetriedResumedTerminal,
+  maybeRecoverStaleQueuedResume,
+  messageSuspendedTokenUsageDelta,
+  modeIdForPendingResume,
+  pendingInteractionDueAt,
+  pendingInteractionExpiresAt,
+  pendingInteractionGeneration,
   pendingInteractionGenerationKey,
-  preRegistrationSlot,
+  pendingResumeFromSuspendedOutput,
+  pendingRunToolReceiptProjection,
+  probeResumeAdmissionByRun,
   pruneInboxResponseReceipts,
+  queuedItemIdForPendingResume,
   receiptGenerationDiscarded,
-  receiptMatchesDiscardGeneration,
-  SUBMIT_PLAN_TOOL_NAME,
+  reconcilePendingInteractionDeadlineGeneration,
+  reconcilePendingInteractionExpiryOnHydrate,
+  recordInboxResponsePreDispatchFailure,
+  recoverStaleResumeAdmission,
+  registerPlanApproval,
+  registerQuestion,
+  registerSandboxAccess,
+  resolvePlanApprovalModeFlipTarget,
+  resolveStoredInboxResponse,
+  respondToPlanApproval,
+  respondToQuestion,
+  respondToSandboxAccess,
+  respondToToolApproval,
+  respondToToolSuspension,
+  runtimeDependenciesForPendingResume,
+  settlePendingInteractionCancellation,
+  settleResumedTerminalHandoff,
+  syncPendingInteractionExpiryTimer,
+  throwIfPendingGenerationDiscarded,
+  throwStoredInboxResponseFailure,
+  tokenUsageDeltaFromFullOutput,
+  waitForMessageSuspendedTokenUsageOwner,
 } from './session-pending-interactions';
 import type {
   DiscardGeneration,
   InboxReceiptResponseOptions,
   LegacyInboxResponseOptions,
   PendingExpiryOutcome,
+  PendingInteractionsSessionPort,
   QueueResumeRecoveryResult,
 } from './session-pending-interactions';
 import {
@@ -527,7 +565,7 @@ type SignalAdmission = {
 
 type SignalDispatchingState = Extract<AgentSignalDispatchState, { state: 'dispatching' }>;
 type SignalAcceptedDispatchState = Extract<AgentSignalDispatchState, { state: 'accepted' }>;
-type SignalSettlementAdmission = Pick<
+export type SignalSettlementAdmission = Pick<
   SignalAdmission,
   'admissionId' | 'admissionHash' | 'modeId' | 'modelId' | 'dispatch'
 >;
@@ -570,7 +608,7 @@ type MessageAdmissionHashes = {
   legacyCompatible: readonly string[];
 };
 
-type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
+export type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 
 /**
  * Tool IDs the harness translates from `tool-call-approval` /
@@ -1847,10 +1885,107 @@ export class Session {
     return this._subagentBudget;
   }
 
-  /** Spend to persist with a pending interaction, so a restart cannot reset it. */
-  private _subagentBudgetSpentProjection(): Pick<PendingResume, 'subagentBudgetSpent'> {
-    const meter = this._subagentBudgetMeter();
-    return meter === undefined ? {} : { subagentBudgetSpent: meter.spent() };
+  /** Build the port the pending-interactions-resume functions reach the session through. */
+  private _pendingInteractionsPort(): PendingInteractionsSessionPort {
+    const session = this;
+    return {
+      emitter: this._emitter,
+      harness: this._harness,
+      id: this.id,
+      messageTokenLedger: this._messageTokenLedger,
+      queueHead: this._queueHead,
+      replacementToolSurface: this._replacementToolSurface,
+      resourceId: this.resourceId,
+      runOutcomes: this._runOutcomes,
+      runToolReceipts: this._runToolReceipts,
+      subagentDepth: this.subagentDepth,
+      threadId: this.threadId,
+      get currentAgentRequestContext() {
+        return session._currentAgentRequestContext;
+      },
+      get currentRunId() {
+        return session._currentRunId;
+      },
+      get currentTurnAbortController() {
+        return session._currentTurnAbortController;
+      },
+      get currentTurnReplacementToolSurface() {
+        return session._currentTurnReplacementToolSurface;
+      },
+      get currentTurnRequestContext() {
+        return session._currentTurnRequestContext;
+      },
+      get currentTurnSourceWriteGuard() {
+        return session._currentTurnSourceWriteGuard;
+      },
+      get currentTurnYolo() {
+        return session._currentTurnYolo;
+      },
+      get ownedSignalTurnOrigin() {
+        return session._ownedSignalTurnOrigin;
+      },
+      get pendingInteractionExpiryAt() {
+        return session._pendingInteractionExpiryAt;
+      },
+      set pendingInteractionExpiryAt(value) {
+        session._pendingInteractionExpiryAt = value;
+      },
+      get pendingInteractionExpiryTimer() {
+        return session._pendingInteractionExpiryTimer;
+      },
+      set pendingInteractionExpiryTimer(value) {
+        session._pendingInteractionExpiryTimer = value;
+      },
+      get queuedResumeRecoveryTimer() {
+        return session._queuedResumeRecoveryTimer;
+      },
+      set queuedResumeRecoveryTimer(value) {
+        session._queuedResumeRecoveryTimer = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get storage() {
+        return session._storage;
+      },
+      get subagentParentToolCallId() {
+        return session._subagentParentToolCallId;
+      },
+      accountStagedTerminalUsage: (...args) => session._accountStagedTerminalUsage(...args),
+      assertLive: (...args) => session._assertLive(...args),
+      assertOpenForTurn: (...args) => session._assertOpenForTurn(...args),
+      cancelTerminalizedPendingAdmission: (...args) => session._cancelTerminalizedPendingAdmission(...args),
+      captureTurnRunId: (...args) => session._captureTurnRunId(...args),
+      clearPendingDurableTurnFlushErrorIfRepaired: (...args) =>
+        session._clearPendingDurableTurnFlushErrorIfRepaired(...args),
+      commitTerminalHandoff: (...args) => session._commitTerminalHandoff(...args),
+      commitWakeTerminalWithRetry: (...args) => session._commitWakeTerminalWithRetry(...args),
+      deferQueuedTurnRetry: (...args) => session._deferQueuedTurnRetry(...args),
+      emit: (...args) => session._emit(...args),
+      emitAbortedToolEnds: (...args) => session._emitAbortedToolEnds(...args),
+      emitAgentEnd: (...args) => session._emitAgentEnd(...args),
+      emitTurnEvent: (...args) => session._emitTurnEvent(...args),
+      ensureQueuedItemContext: (...args) => session._ensureQueuedItemContext(...args),
+      finalizeQueuedRunCompletion: (...args) => session._finalizeQueuedRunCompletion(...args),
+      finalizeResumedTurnOutcome: (...args) => session._finalizeResumedTurnOutcome(...args),
+      flushUpdate: (...args) => session._flushUpdate(...args),
+      markQueuedPostRunFinalized: (...args) => session._markQueuedPostRunFinalized(...args),
+      maybeDrainQueue: (...args) => session._maybeDrainQueue(...args),
+      modelIdForQueuedItem: (...args) => session._modelIdForQueuedItem(...args),
+      notifyMaybeIdle: (...args) => session._notifyMaybeIdle(...args),
+      persistTokenUsageDelta: (...args) => session._persistTokenUsageDelta(...args),
+      raceActiveTurnWaiter: (...args) => session._raceActiveTurnWaiter(...args),
+      resume: (...args) => session._resume(...args),
+      settleSignalResult: (...args) => session._settleSignalResult(...args),
+      stageCompletedTerminalOutput: (...args) => session._stageCompletedTerminalOutput(...args),
+      subagentBudgetMeter: (...args) => session._subagentBudgetMeter(...args),
+      terminalFailure: (...args) => session._terminalFailure(...args),
+      withActiveDeletedWaiter: (...args) => session._withActiveDeletedWaiter(...args),
+      writeQueueSignalResultEvidence: (...args) => session._writeQueueSignalResultEvidence(...args),
+    };
   }
 
   /** @internal — the budget that stopped this child, if one did. */
@@ -3197,7 +3332,7 @@ export class Session {
 
   /** §10.2 `agent_end.usage`: the run's token usage (zero when unavailable, e.g. an error path with no terminal output). */
   private _runUsage(full?: FullOutput<unknown>): TokenUsage {
-    const delta = full ? this._tokenUsageDeltaFromFullOutput(full) : undefined;
+    const delta = full ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full) : undefined;
     return delta ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   }
 
@@ -3245,151 +3380,12 @@ export class Session {
     });
   }
 
-  private _pendingInteractionExpiresAt(pending: PendingResume): number {
-    if (
-      !Number.isSafeInteger(pending.expiresAt) ||
-      pending.expiresAt < 0 ||
-      !Number.isSafeInteger(pending.requestedAt) ||
-      pending.requestedAt < 0 ||
-      pending.expiresAt < pending.requestedAt
-    ) {
-      throw new HarnessSessionCorruptError({
-        reason: 'pending_state_corrupt',
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-      });
-    }
-    return pending.expiresAt;
-  }
-
-  private _pendingInteractionDueAt(pending: PendingResume): number {
-    if (pending.resumedAt === undefined) return this._pendingInteractionExpiresAt(pending);
-    if (pending.resumeRecoveryAt === undefined) {
-      // At-least-once resume marker without a recovery stamp: rows written by
-      // builds that predate `resumeRecoveryAt` (the admission CAS now stamps
-      // both fields atomically, so current code can no longer produce this
-      // shape). The marker stays RECOVERABLE — its effective deadline is the
-      // admission time plus the accepted-recovery stale window, exactly what
-      // the stamping writer would have persisted. Classifying it corrupt would
-      // permanently wedge the session on hydrate, the precise outcome the
-      // crash-mid-resume recovery contract forbids (queue not parked).
-      if (!Number.isSafeInteger(pending.resumedAt) || pending.resumedAt < 0) {
-        throw new HarnessSessionCorruptError({
-          reason: 'pending_state_corrupt',
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-        });
-      }
-      return pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    }
-    if (!Number.isSafeInteger(pending.resumeRecoveryAt) || pending.resumeRecoveryAt < pending.resumedAt) {
-      throw new HarnessSessionCorruptError({
-        reason: 'pending_state_corrupt',
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-      });
-    }
-    return pending.resumeRecoveryAt;
-  }
-
   private _pendingInteractionGeneration(pending: PendingResume): PendingInteractionExpiryGeneration {
-    const dueAt = this._pendingInteractionDueAt(pending);
-    return {
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      kind: pending.kind,
-      itemId: pending.itemId ?? pending.toolCallId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      requestedAt: pending.requestedAt,
-      dueAt,
-      expiresAt: pending.expiresAt,
-      ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
-      ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
-      ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
-      ...(pending.resumeRecoveryStartedAt !== undefined
-        ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
-        : {}),
-    };
-  }
-
-  /**
-   * Freeze this interaction's deadline onto the pending row. The TTL is
-   * resolved per kind (`sessions.pendingInteractionTtlMsByKind`, falling back
-   * to `sessions.pendingInteractionTtlMs`) at capture time only, so a later
-   * config change never moves an already-parked interaction's deadline and a
-   * restart reads the same `expiresAt` back out of storage.
-   */
-  private _newPendingInteractionTiming(kind: PendingResume['kind']): Pick<PendingResume, 'requestedAt' | 'expiresAt'> {
-    const requestedAt = Date.now();
-    return {
-      requestedAt,
-      expiresAt: requestedAt + this._harness._internalPendingInteractionTtlMsForKind(kind),
-    };
+    return pendingInteractionGeneration(this._pendingInteractionsPort(), pending);
   }
 
   private _clearPendingInteractionExpiryTimer(): void {
-    if (this._pendingInteractionExpiryTimer !== undefined) {
-      clearTimeout(this._pendingInteractionExpiryTimer);
-      this._pendingInteractionExpiryTimer = undefined;
-    }
-    this._pendingInteractionExpiryAt = undefined;
-  }
-
-  /**
-   * The timer is only a liveness wake-up. The callback re-checks the exact
-   * pending identity inside `_flushUpdate`, which is the authority for an
-   * expiry-vs-response race and remains correct after a restart.
-   */
-  private _syncPendingInteractionExpiryTimer(): void {
-    const pending = this._record.pendingResume;
-    if (this._state !== 'live' || pending === undefined) {
-      this._clearPendingInteractionExpiryTimer();
-      return;
-    }
-    const dueAt = this._pendingInteractionDueAt(pending);
-    if (this._pendingInteractionExpiryTimer !== undefined && this._pendingInteractionExpiryAt === dueAt) return;
-    this._clearPendingInteractionExpiryTimer();
-    this._pendingInteractionExpiryAt = dueAt;
-    const identity = this._pendingInteractionGeneration(pending);
-    this._pendingInteractionExpiryTimer = setTimeout(
-      () => {
-        this._pendingInteractionExpiryTimer = undefined;
-        this._pendingInteractionExpiryAt = undefined;
-        void this._reconcilePendingInteractionDeadlineGeneration(identity).catch(err => {
-          console.error('[harness/v1] pending interaction expiry persistence failed:', err);
-          if (this._state !== 'live') return;
-          this._emitter.emit({
-            type: 'storage_error',
-            operation: 'session_save',
-            retryable: true,
-            error: { code: 'harness.storage', message: 'pending interaction expiry persistence failed' },
-            resourceId: this.resourceId,
-            threadId: this.threadId,
-            harnessName: this._record.harnessName,
-          } as EmitInput);
-          // A transient save failure must retry without requiring another user
-          // action. Back off before re-arming: the persisted deadline is now in
-          // the past, so an immediate `_sync` would otherwise create a hot
-          // zero-delay retry loop while storage remains unavailable.
-          this._pendingInteractionExpiryAt = dueAt;
-          this._pendingInteractionExpiryTimer = setTimeout(() => {
-            this._pendingInteractionExpiryTimer = undefined;
-            this._pendingInteractionExpiryAt = undefined;
-            this._syncPendingInteractionExpiryTimer();
-          }, 1_000);
-          this._pendingInteractionExpiryTimer.unref?.();
-        });
-      },
-      pending.expiryStartedAt !== undefined || pending.resumeRecoveryStartedAt !== undefined
-        ? 1_000
-        : Math.max(0, dueAt - Date.now()),
-    );
-    this._pendingInteractionExpiryTimer.unref?.();
+    return clearPendingInteractionExpiryTimer(this._pendingInteractionsPort());
   }
 
   /**
@@ -3429,30 +3425,8 @@ export class Session {
   }
 
   /** @internal — called after the Harness has installed its event bridge. */
-  async _reconcilePendingInteractionExpiryOnHydrate(): Promise<void> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) {
-      this._clearPendingInteractionExpiryTimer();
-      return;
-    }
-    if (pending.resumedAt !== undefined) {
-      const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
-      if (recovery.status !== 'none') return;
-      if (pending.resumeRecoveryAt === undefined) {
-        // Legacy at-least-once marker (no recovery stamp): resolution belongs
-        // to the interactive lanes — the next respond surfaces the
-        // deterministic `harness.resume_recovery_stale` outcome and durably
-        // clears the marker. Hydration only adopts; it neither terminalizes
-        // the marker nor races the caller's next respond with an expiry timer.
-        return;
-      }
-    }
-    const dueAt = this._pendingInteractionDueAt(pending);
-    if (Date.now() < dueAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return;
-    }
-    await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(pending));
+  _reconcilePendingInteractionExpiryOnHydrate(): Promise<void> {
+    return reconcilePendingInteractionExpiryOnHydrate(this._pendingInteractionsPort());
   }
 
   /**
@@ -3531,19 +3505,23 @@ export class Session {
     // terminal admission is cancelled and its turn settled, and it no longer
     // blocks the close. A resume still running here is left to finish.
     const due = this._record.pendingResume;
-    if (due !== undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
+    if (due !== undefined && pendingInteractionDueAt(this._pendingInteractionsPort(), due) <= Date.now()) {
       try {
-        await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
-          drainQueue: false,
-          whileClosing: true,
-        });
+        await reconcilePendingInteractionDeadlineGeneration(
+          this._pendingInteractionsPort(),
+          this._pendingInteractionGeneration(due),
+          {
+            drainQueue: false,
+            whileClosing: true,
+          },
+        );
       } catch (error) {
         // PF-7631: a resumed wake turn has no caller to report to. When its
         // stale-resume settlement does not commit, the failure is surfaced,
         // the interaction stays parked, and the scan below refuses the close
         // typed, as for an orphaned wake. The re-drive emits per attempt only
         // while live, so a closing session reports the failure here.
-        const admission = await this._probeResumeAdmissionByRun(due).catch(() => undefined);
+        const admission = await probeResumeAdmissionByRun(this._pendingInteractionsPort(), due).catch(() => undefined);
         if (!admission || !isHarnessWakeReservedKey(admission.admissionId)) throw error;
         if (this._state !== 'live') {
           this._emitTurnEvent({
@@ -3580,7 +3558,7 @@ export class Session {
         if (parked) {
           // Answerable until it is due; one that could not be expired above
           // is retried shortly.
-          const dueAt = this._pendingInteractionDueAt(this._record.pendingResume!);
+          const dueAt = pendingInteractionDueAt(this._pendingInteractionsPort(), this._record.pendingResume!);
           return {
             holder: 'parked-admission',
             retryAt: dueAt > Date.now() ? dueAt : Date.now() + ORPHANED_DISPATCH_RETRY_MS,
@@ -4134,58 +4112,14 @@ export class Session {
    * sweep sessions suppress queue draining; any surviving backlog starts on a
    * later normal hydration after the expired pending row has been cleared.
    */
-  async _internalExpirePendingInteractionGeneration(
+  _internalExpirePendingInteractionGeneration(
     expected: PendingInteractionExpiryGeneration,
     opts: { drainQueue?: boolean } = {},
   ): Promise<boolean> {
-    if (
-      expected.harnessName !== this._record.harnessName ||
-      expected.sessionId !== this.id ||
-      expected.resourceId !== this.resourceId
-    ) {
-      return false;
-    }
-    return this._reconcilePendingInteractionDeadlineGeneration(expected, opts);
+    return internalExpirePendingInteractionGeneration(this._pendingInteractionsPort(), expected, opts);
   }
 
-  private async _reconcilePendingInteractionDeadlineGeneration(
-    expected: PendingInteractionExpiryGeneration,
-    opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
-  ): Promise<boolean> {
-    // A `discardPendingInteraction` claim whose clear did not commit (crash or
-    // storage failure between its phases) completes as that discard, not as
-    // an expiry. Only rows carrying a matching discard receipt reach this.
-    const current = this._record.pendingResume;
-    const discardClaim = current === undefined ? undefined : this._discardClaimForPending(current);
-    if (
-      current !== undefined &&
-      discardClaim !== undefined &&
-      current.kind === expected.kind &&
-      (current.itemId ?? current.toolCallId) === expected.itemId &&
-      current.runId === expected.runId &&
-      current.toolCallId === expected.toolCallId &&
-      current.requestedAt === expected.requestedAt
-    ) {
-      return this._completeDiscardedPendingInteraction(current, discardClaim, { drainQueue: opts.drainQueue });
-    }
-    if (expected.resumedAt !== undefined) {
-      return this._recoverStaleResumeAdmission(expected, opts);
-    }
-    const outcome = await this._expirePendingInteraction(
-      {
-        kind: expected.kind,
-        itemId: expected.itemId,
-        runId: expected.runId,
-        toolCallId: expected.toolCallId,
-        requestedAt: expected.requestedAt,
-        expiresAt: expected.expiresAt,
-      },
-      opts,
-    );
-    return outcome !== 'none';
-  }
-
-  private async _expirePendingInteraction(
+  private _expirePendingInteraction(
     expected: {
       kind: PendingResume['kind'];
       itemId: string;
@@ -4196,610 +4130,7 @@ export class Session {
     },
     opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
   ): Promise<PendingExpiryOutcome> {
-    // A close may expire an overdue interaction: the parked turn could never
-    // be answered once the session closes.
-    if (this._state !== 'live' && !(opts.whileClosing === true && this._state === 'closing')) return 'none';
-    const expiredAt = Date.now();
-    if (expiredAt < expected.expiresAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return 'none';
-    }
-    const expiryError = new HarnessPendingInteractionExpiredError(this.id, expected.itemId, expected.expiresAt);
-    const projectedError = projectHarnessPublicError(expiryError);
-    const generationKey = pendingInteractionGenerationKey(expected);
-    let expiryStarted = false;
-    let expiredPending: PendingResume | undefined;
-    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
-    let discardOwned: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
-
-    await this._flushUpdate(prev => {
-      expiryStarted = false;
-      expiredPending = undefined;
-      failedQueueReceipt = undefined;
-      discardOwned = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        (current.resumedAt !== undefined && current.expiryStartedAt === undefined) ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt
-      ) {
-        return prev;
-      }
-      // A `discardPendingInteraction` claim owns this generation (its claim
-      // moved `expiresAt`, so an expiry captured earlier still lands here):
-      // never record expiry evidence for it; finish it as the discard below.
-      const discardReceipt = discardClaimReceipt(prev, current);
-      if (discardReceipt !== undefined) {
-        discardOwned = { pending: current, receipt: discardReceipt };
-        return prev;
-      }
-      if (this._pendingInteractionExpiresAt(current) !== expected.expiresAt) return prev;
-
-      expiryStarted = true;
-      const expiryStartedAt = current.expiryStartedAt ?? expiredAt;
-      expiredPending = { ...current, expiryStartedAt };
-      const next: SessionRecord = { ...prev, pendingResume: expiredPending };
-      next.expiredPendingInteractions = appendExpiredPendingInteraction(prev.expiredPendingInteractions, {
-        generationKey,
-        itemId: expected.itemId,
-        kind: expected.kind,
-        runId: expected.runId,
-        toolCallId: expected.toolCallId,
-        requestedAt: expected.requestedAt,
-        expiresAt: expected.expiresAt,
-        expiredAt: expiryStartedAt,
-        error: projectedError,
-      });
-
-      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
-        if (
-          receipt.itemId !== expected.itemId ||
-          receipt.kind !== expected.kind ||
-          receipt.runId !== expected.runId ||
-          receipt.toolCallId !== expected.toolCallId ||
-          receipt.pendingRequestedAt !== expected.requestedAt ||
-          receipt.status !== 'failed' ||
-          receipt.retryable !== true
-        ) {
-          continue;
-        }
-        next.inboxResponseReceipts = {
-          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            retryable: false,
-            failedAt: receipt.failedAt ?? expiryStartedAt,
-            updatedAt: expiryStartedAt,
-          },
-        };
-      }
-
-      if (current.queuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== current.queuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[current.queuedItemId];
-        failedQueueReceipt = receipt;
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          failedQueueReceipt = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? expiredAt,
-            updatedAt: expiredAt,
-          };
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [current.queuedItemId]: failedQueueReceipt,
-          };
-        }
-      }
-      return next;
-    });
-
-    if (discardOwned !== undefined) {
-      const owned: { pending: PendingResume; receipt: InboxResponseReceipt } = discardOwned;
-      await this._completeDiscardedPendingInteraction(owned.pending, owned.receipt, { drainQueue: opts.drainQueue });
-      return 'discarded';
-    }
-    if (!expiryStarted || expiredPending === undefined) return 'none';
-    this._replacementToolSurface.drop(expiredPending.runId);
-    const activeController = this._currentTurnAbortController;
-    if (activeController !== undefined) activeController.abort(expiryError);
-
-    const queuedItemId = expiredPending.queuedItemId;
-    if (queuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
-      if (settledReceipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: settledReceipt.signalId,
-          runId: settledReceipt.runId,
-          error: projectedError,
-        });
-      }
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(expiryError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-    }
-
-    if (expiredPending.originSignalId !== undefined) {
-      await this._settleSignalResult(expiredPending.originSignalId, {
-        status: 'failed',
-        runId: expiredPending.runId,
-        error: projectedError,
-      });
-    }
-    // An expired suspension may have deferred a terminal admission — settle the
-    // pending grant alongside the signal evidence so the handoff cannot strand
-    // pending forever behind an interaction that no longer exists.
-    await this._cancelTerminalizedPendingAdmission(expiredPending, projectedError);
-
-    // Phase two clears the still-discoverable pending row only after every
-    // durable queue/signal settlement has succeeded. A crash or storage error
-    // before this CAS leaves `expiryStartedAt` indexed for hydrate/sweep retry.
-    let finalized = false;
-    await this._flushUpdate(prev => {
-      finalized = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.expiryStartedAt !== expiredPending!.expiryStartedAt
-      ) {
-        return prev;
-      }
-      finalized = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      return next;
-    });
-    if (!finalized) return 'none';
-
-    if (queuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
-        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
-        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: expiredPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    // An already-running pre-registered ask/plan tool owns its terminal event;
-    // the abort above makes that path finish. A parked suspension has no live
-    // owner, so expiry closes its run here.
-    if (activeController === undefined) {
-      this._releaseParkedRun(expiredPending);
-      this._emitAgentEnd({ runId: expiredPending.runId, finishReason: 'error' });
-    }
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return 'expired';
-  }
-
-  /**
-   * Resolve a response admission whose owner disappeared after persisting
-   * `resumedAt` but before committing terminal provider evidence. Re-dispatch
-   * is intentionally forbidden: the provider/tool may already have performed
-   * side effects. Instead, a two-phase exact-generation transition fails all
-   * related receipts/signals and terminalizes the abandoned run.
-   */
-  private async _recoverStaleResumeAdmission(
-    expected: PendingInteractionExpiryGeneration,
-    opts: { drainQueue?: boolean } = {},
-  ): Promise<boolean> {
-    if (expected.resumedAt === undefined) return false;
-    // Legacy at-least-once markers carry no recovery stamp; their effective
-    // deadline is the synthesized one `_pendingInteractionDueAt` folded into
-    // `dueAt` (admission + stale window). Stamped rows keep the exact-identity
-    // requirement between the generation's dueAt and the persisted stamp.
-    const expectedRecoveryDueAt = expected.resumeRecoveryAt ?? expected.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    if (expected.dueAt !== expectedRecoveryDueAt) {
-      return false;
-    }
-    const currentPending = this._record.pendingResume;
-    let expectedQueuedItemId: string | undefined;
-    if (
-      currentPending?.resumedAt === expected.resumedAt &&
-      currentPending.runId === expected.runId &&
-      currentPending.toolCallId === expected.toolCallId
-    ) {
-      const queuedItemId = this._queuedItemIdForPendingResume(currentPending);
-      expectedQueuedItemId = queuedItemId;
-      if (queuedItemId !== undefined && this._record.queueAdmissionReceipts?.[queuedItemId]?.status === 'completed') {
-        const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: opts.drainQueue !== false });
-        return recovery.status === 'completed';
-      }
-    }
-    if (Date.now() < expectedRecoveryDueAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return false;
-    }
-    // A legitimately slow resume still owns this live session. Only a cold
-    // owner (or a hydrated session with no active turn) may classify the
-    // persisted admission as abandoned.
-    if (this._currentTurnAbortController !== undefined) {
-      this._pendingInteractionExpiryAt = expectedRecoveryDueAt;
-      this._pendingInteractionExpiryTimer = setTimeout(() => {
-        this._pendingInteractionExpiryTimer = undefined;
-        this._pendingInteractionExpiryAt = undefined;
-        this._syncPendingInteractionExpiryTimer();
-      }, 1_000);
-      this._pendingInteractionExpiryTimer.unref?.();
-      return false;
-    }
-
-    // A committed admission or staged completed output means the provider run
-    // finished before its owner died. Recover it and finish settlement and
-    // bookkeeping instead of failing the interaction as abandoned.
-    const recoveryIncarnation = this._record.sessionIncarnation;
-    if (
-      this._storage.supportsTerminalHandoff &&
-      recoveryIncarnation !== undefined &&
-      currentPending !== undefined &&
-      currentPending.resumedAt === expected.resumedAt &&
-      currentPending.runId === expected.runId &&
-      currentPending.toolCallId === expected.toolCallId
-    ) {
-      const boundAdmission = await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        runId: expected.runId,
-        sessionIncarnation: recoveryIncarnation,
-      });
-      if (boundAdmission?.status === 'committed' || boundAdmission?.status === 'pending') {
-        const stored = await this._storage.loadMessageResultEvidence({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-          signalId: boundAdmission.signalId,
-        });
-        const parked = this._record.pendingResume;
-        if (
-          stored !== null &&
-          'status' in stored &&
-          ((stored.status === 'completed' && stored.result !== undefined) ||
-            (stored.status === 'pending' && stored.stagedResult !== undefined)) &&
-          parked !== undefined &&
-          parked.runId === expected.runId &&
-          parked.toolCallId === expected.toolCallId &&
-          parked.resumedAt === expected.resumedAt
-        ) {
-          const full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
-          // Repopulate the local run cache so the per-generation usage marker
-          // still dedupes a concurrent settlement retry.
-          this._runOutcomes.remember(parked.runId, { ok: true, full });
-          const pendingQueuedItemId = this._queuedItemIdForPendingResume(parked);
-          const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(parked);
-          // The resume-data payload lived in the dead caller, but a
-          // `responseId` respond persisted it on the generation's inbox
-          // receipt — recover an approved plan transition from there (and the
-          // pending's declared fallback) instead of clearing the interaction
-          // while leaving the old mode and permission policy active.
-          let modeFlipTarget: string | undefined;
-          if (parked.kind === 'plan-approval') {
-            const generationReceipt = Object.values(this._record.inboxResponseReceipts ?? {}).find(
-              candidate =>
-                candidate.status === 'accepted' &&
-                candidate.kind === parked.kind &&
-                candidate.runId === parked.runId &&
-                candidate.toolCallId === parked.toolCallId &&
-                candidate.pendingRequestedAt === parked.requestedAt &&
-                candidate.itemId === (parked.itemId ?? parked.toolCallId),
-            );
-            try {
-              modeFlipTarget = this._resolvePlanApprovalModeFlipTarget(
-                parked,
-                generationReceipt?.response as { approved?: boolean; transitionToMode?: string } | undefined,
-              );
-            } catch {
-              // The target mode vanished from config since admission —
-              // recovery must stay total; skip the flip rather than brick the
-              // session on a mode that no longer exists.
-            }
-          }
-          await this._withActiveDeletedWaiter(async activeTurnWaiter => {
-            await this._finalizeResumedTurnOutcome(parked, full, {
-              pendingQueuedItemId,
-              completingQueuedItemId: expectedQueuedItemId,
-              modeFlipTarget,
-              previousModeId: this._record.modeId,
-              resumeModeId: this._modeIdForPendingResume(parked),
-              resumeModelId: resumeRuntimeDependencies.modelId,
-              deletedTurnWaiter: activeTurnWaiter,
-            });
-          });
-          if (expectedQueuedItemId !== undefined) void this._maybeDrainQueue();
-          return true;
-        }
-      }
-    }
-
-    const recoveryError = new ResumeRecoveryStaleError();
-    const projectedError = projectHarnessPublicError(recoveryError);
-    const recoveryAt = Date.now();
-    let recoveryStarted = false;
-    let recoveringPending: PendingResume | undefined;
-    let recoveringQueuedItemId: string | undefined;
-    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
-
-    await this._flushUpdate(prev => {
-      recoveryStarted = false;
-      recoveringPending = undefined;
-      recoveringQueuedItemId = undefined;
-      failedQueueReceipt = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.expiryStartedAt !== expected.expiryStartedAt ||
-        current.resumedAt !== expected.resumedAt ||
-        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
-        current.resumeRecoveryStartedAt !== expected.resumeRecoveryStartedAt
-      ) {
-        return prev;
-      }
-
-      recoveryStarted = true;
-      const resumeRecoveryStartedAt = current.resumeRecoveryStartedAt ?? recoveryAt;
-      recoveringPending = { ...current, resumeRecoveryStartedAt };
-      const next: SessionRecord = { ...prev, pendingResume: recoveringPending };
-
-      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
-        if (
-          receipt.itemId !== expected.itemId ||
-          receipt.kind !== expected.kind ||
-          receipt.runId !== expected.runId ||
-          receipt.toolCallId !== expected.toolCallId ||
-          receipt.pendingRequestedAt !== expected.requestedAt ||
-          receipt.status !== 'accepted'
-        ) {
-          continue;
-        }
-        next.inboxResponseReceipts = {
-          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            retryable: false,
-            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
-            updatedAt: resumeRecoveryStartedAt,
-          },
-        };
-      }
-
-      recoveringQueuedItemId =
-        current.queuedItemId ??
-        (prev.pendingQueue ?? []).find(item => {
-          const receipt = prev.queueAdmissionReceipts?.[item.id];
-          return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === current.runId;
-        })?.id;
-      if (recoveringQueuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== recoveringQueuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[recoveringQueuedItemId];
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          failedQueueReceipt = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
-            updatedAt: resumeRecoveryStartedAt,
-          };
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [recoveringQueuedItemId]: failedQueueReceipt,
-          };
-        }
-      }
-      return next;
-    });
-
-    if (!recoveryStarted || recoveringPending === undefined) {
-      if (
-        expectedQueuedItemId !== undefined &&
-        this._queueHead.currentId === expectedQueuedItemId &&
-        this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
-        !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
-      ) {
-        this._queueHead.release();
-        this._notifyMaybeIdle();
-      }
-      return false;
-    }
-
-    await this._accountStagedResumeUsage(recoveringPending, recoveringQueuedItemId);
-
-    if (recoveringQueuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
-      if (settledReceipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: settledReceipt.signalId,
-          runId: settledReceipt.runId,
-          error: projectedError,
-        });
-      }
-    }
-    if (recoveringPending.originSignalId !== undefined) {
-      await this._settleSignalResult(recoveringPending.originSignalId, {
-        status: 'failed',
-        runId: recoveringPending.runId,
-        error: projectedError,
-      });
-    }
-    // The abandoned resume may have deferred a terminal admission — settle the
-    // pending grant alongside the signal evidence so the handoff cannot strand
-    // pending forever behind an interaction being terminalized here.
-    await this._cancelTerminalizedPendingAdmission(recoveringPending, projectedError);
-
-    let finalized = false;
-    await this._flushUpdate(prev => {
-      finalized = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.resumedAt !== expected.resumedAt ||
-        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
-        current.resumeRecoveryStartedAt !== recoveringPending!.resumeRecoveryStartedAt
-      ) {
-        return prev;
-      }
-      finalized = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      return next;
-    });
-    if (!finalized) return false;
-
-    this._replacementToolSurface.drop(recoveringPending.runId);
-    if (recoveringQueuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId: recoveringQueuedItemId,
-        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
-        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
-        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-      const resolver = this._queueHead.takeResolver(recoveringQueuedItemId);
-      if (resolver) {
-        resolver.reject(recoveryError);
-      }
-      this._queueHead.releaseIf(recoveringQueuedItemId);
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: recoveringPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    this._emitAgentEnd({ runId: recoveringPending.runId, finishReason: 'error' });
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return true;
-  }
-
-  /**
-   * §10.2 suspension event: project a captured `PendingResume` into the matching
-   * pending shape (tool_approval_required / tool_suspension_required /
-   * question_pending / plan_approval_required). Sandbox/path-access prompts
-   * project to `question_pending` (§10.2 defines no dedicated sandbox event).
-   * Emitted after the durable-parking barrier so subscribers can reconstruct
-   * the pending state from storage.
-   */
-  private _emitPendingEvent(pending: PendingResume): void {
-    const sourceFields =
-      pending.source === 'subagent'
-        ? {
-            source: 'subagent' as const,
-            subagentToolCallId: pending.subagentToolCallId ?? '',
-            subagentSessionId: this.id,
-          }
-        : { source: 'parent' as const };
-    const base = {
-      runId: pending.runId,
-      itemId: pending.itemId ?? '',
-      requestedAt: pending.requestedAt,
-      expiresAt: this._pendingInteractionExpiresAt(pending),
-      toolCallId: pending.toolCallId,
-      ...sourceFields,
-    };
-    const p = pending.payload ?? {};
-    switch (pending.kind) {
-      case 'tool-approval':
-        this._emitTurnEvent({
-          type: 'tool_approval_required',
-          ...base,
-          toolName: pending.toolName ?? '',
-          ...(p.toolCategory !== undefined ? { toolCategory: p.toolCategory } : {}),
-          approvalReasons: p.approvalReasons ?? [],
-          // §10.2 (events.ts:202 "Public payloads are JSON-safe projections"):
-          // `p.input` is the raw runtime `payload.args` from the suspended
-          // output (Date/Map/class/bigint). Project it at emit so the first
-          // live subscriber and the durable/replayed row carry the identical
-          // value — the same live===replay guarantee as tool_start/tool_end.
-          input: projectToolEventPayloadForJson(
-            p.input,
-            'tool_approval_required.input',
-            this._harness._internalMaxEventPayloadBytes,
-          ),
-        } as EmitInput);
-        return;
-      case 'tool-suspension':
-        this._emitTurnEvent({
-          type: 'tool_suspension_required',
-          ...base,
-          toolName: pending.toolName ?? '',
-          // §10.2: `suspendData` is the tool's raw `suspendPayload` and can hold
-          // runtime objects, so project it at emit for live===replay parity.
-          suspendData: projectToolEventPayloadForJson(
-            p.suspendData,
-            'tool_suspension_required.suspendData',
-            this._harness._internalMaxEventPayloadBytes,
-          ),
-        } as EmitInput);
-        return;
-      case 'question':
-        this._emitTurnEvent({
-          type: 'question_pending',
-          ...base,
-          question: p.question ?? '',
-          ...(p.options !== undefined ? { options: p.options } : {}),
-          ...(p.selectionMode !== undefined ? { selectionMode: p.selectionMode } : {}),
-        } as EmitInput);
-        return;
-      case 'plan-approval':
-        this._emitTurnEvent({
-          type: 'plan_approval_required',
-          ...base,
-          title: p.title ?? '',
-          plan: p.plan ?? '',
-        } as EmitInput);
-        return;
-      case 'sandbox-access':
-        // §10.2: sandbox/path-access prompts project to question_pending.
-        this._emitTurnEvent({
-          type: 'question_pending',
-          ...base,
-          question: p.sandboxAccess?.reason ?? `Allow ${p.sandboxAccess?.semanticType ?? 'sandbox'} access?`,
-        } as EmitInput);
-        return;
-    }
+    return expirePendingInteraction(this._pendingInteractionsPort(), expected, opts);
   }
 
   private _raceActiveTurnWaiter<T>(promise: Promise<T>, activeTurnWaiter?: Promise<never>): Promise<T> {
@@ -4947,70 +4278,6 @@ export class Session {
     }
   }
 
-  private _tokenUsageDeltaFromFullOutput(
-    full: FullOutput<unknown>,
-    accountedCumulative?: TokenUsage,
-  ): TokenUsage | undefined {
-    const usage = (full as { totalUsage?: unknown; usage?: unknown }).totalUsage ?? (full as { usage?: unknown }).usage;
-    if (usage && typeof usage === 'object') {
-      const u = usage as {
-        promptTokens?: number;
-        completionTokens?: number;
-        totalTokens?: number;
-        inputTokens?: number;
-        outputTokens?: number;
-      };
-      const prompt = u.promptTokens ?? u.inputTokens;
-      const completion = u.completionTokens ?? u.outputTokens;
-      const promptNumber = typeof prompt === 'number' && Number.isInteger(prompt) && prompt >= 0 ? prompt : undefined;
-      const completionNumber =
-        typeof completion === 'number' && Number.isInteger(completion) && completion >= 0 ? completion : undefined;
-      const delta: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-      const incremented =
-        promptNumber !== undefined ||
-        completionNumber !== undefined ||
-        (typeof u.totalTokens === 'number' && Number.isInteger(u.totalTokens) && u.totalTokens >= 0);
-      if (promptNumber !== undefined) delta.promptTokens += promptNumber;
-      if (completionNumber !== undefined) delta.completionTokens += completionNumber;
-      const derivedTotalTokens = (promptNumber ?? 0) + (completionNumber ?? 0);
-      if (typeof u.totalTokens === 'number' && Number.isInteger(u.totalTokens) && u.totalTokens >= 0) {
-        delta.totalTokens += u.totalTokens < derivedTotalTokens ? derivedTotalTokens : u.totalTokens;
-      } else if (promptNumber !== undefined || completionNumber !== undefined) {
-        // Providers that only emit `inputTokens`/`outputTokens` leave `totalTokens`
-        // off; derive it so the aggregate stays consistent with its parts.
-        delta.totalTokens += derivedTotalTokens;
-      }
-      if (!incremented) return undefined;
-      if (accountedCumulative === undefined) return delta;
-
-      // A resumed Mastra stream restores its prior usage counter, so FullOutput
-      // is cumulative across suspend boundaries. Subtract the durable baseline
-      // component-wise. If a provider resets a counter, treat the new value as
-      // this segment's usage rather than producing a negative delta.
-      const promptTokens =
-        delta.promptTokens >= accountedCumulative.promptTokens
-          ? delta.promptTokens - accountedCumulative.promptTokens
-          : delta.promptTokens;
-      const completionTokens =
-        delta.completionTokens >= accountedCumulative.completionTokens
-          ? delta.completionTokens - accountedCumulative.completionTokens
-          : delta.completionTokens;
-      const rawTotalTokens =
-        delta.totalTokens >= accountedCumulative.totalTokens
-          ? delta.totalTokens - accountedCumulative.totalTokens
-          : delta.totalTokens;
-      const resumedDelta = {
-        promptTokens,
-        completionTokens,
-        totalTokens: Math.max(rawTotalTokens, promptTokens + completionTokens),
-      };
-      return resumedDelta.promptTokens === 0 && resumedDelta.completionTokens === 0 && resumedDelta.totalTokens === 0
-        ? undefined
-        : resumedDelta;
-    }
-    return undefined;
-  }
-
   private _applyTokenUsageDelta(delta: TokenUsage | undefined): void {
     if (delta === undefined) return;
     this._tokenUsage = {
@@ -5101,7 +4368,7 @@ export class Session {
     opts: { persist?: boolean; accountedCumulative?: TokenUsage } = {},
   ): TokenUsage | undefined {
     this._captureTurnRunId(full);
-    const delta = this._tokenUsageDeltaFromFullOutput(full, opts.accountedCumulative);
+    const delta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, opts.accountedCumulative);
     this._applyTokenUsageDelta(delta);
     if (delta !== undefined && opts.persist !== false) this._schedulePersistTokenUsage();
     return delta;
@@ -5118,7 +4385,7 @@ export class Session {
     ) {
       return { tokenUsageAccounted: true };
     }
-    const tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+    const tokenUsageDelta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
       if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
@@ -5132,71 +4399,17 @@ export class Session {
   }
 
   private _messageSuspendedTokenUsageDelta(full: FullOutput<unknown>): TokenUsage | undefined {
-    if (
-      full.runId &&
-      (this._messageTokenLedger.isAccounted(full.runId) || this._messageTokenLedger.isReserved(full.runId))
-    ) {
-      return undefined;
-    }
-    // The in-memory accounted sets are empty after a reopen even though the
-    // suspended run's cumulative usage is durably recorded on the parked
-    // pending. Subtract that durable baseline so a cached-duplicate replay
-    // cannot re-apply usage the session already persisted.
-    const parked = this._record.pendingResume;
-    const durableBaseline =
-      parked !== undefined && parked.runId === full.runId ? parked.accountedTokenUsage : undefined;
-    return this._tokenUsageDeltaFromFullOutput(full, durableBaseline);
+    return messageSuspendedTokenUsageDelta(this._pendingInteractionsPort(), full);
   }
 
-  private _reserveMessageSuspendedTokenUsage(full: FullOutput<unknown>): {
-    tokenUsageDelta?: TokenUsage;
-    reservedRunId?: string;
-    reservation?: Deferred<void>;
-  } {
-    const tokenUsageDelta = this._messageSuspendedTokenUsageDelta(full);
-    if (tokenUsageDelta !== undefined && full.runId) {
-      const reservation = createDeferred<void>();
-      this._messageTokenLedger.reserve(full.runId, reservation);
-      void reservation.promise.catch(() => {});
-      return { tokenUsageDelta, reservedRunId: full.runId, reservation };
-    }
-    return { tokenUsageDelta };
-  }
-
-  private _commitMessageSuspendedTokenUsage(reservation: {
-    tokenUsageDelta?: TokenUsage;
-    reservedRunId?: string;
-    reservation?: Deferred<void>;
-  }): void {
-    if (reservation.reservedRunId !== undefined) {
-      this._messageTokenLedger.commit(reservation.reservedRunId, reservation.reservation);
-      reservation.reservation?.resolve();
-    }
-  }
-
-  private _rollbackMessageSuspendedTokenUsage(reservation: {
-    reservedRunId?: string;
-    reservation?: Deferred<void>;
-  }): void {
-    if (reservation.reservedRunId !== undefined) {
-      this._messageTokenLedger.rollback(reservation.reservedRunId, reservation.reservation);
-      reservation.reservation?.resolve();
-    }
-  }
-
-  private async _waitForMessageSuspendedTokenUsageOwner(
+  private _waitForMessageSuspendedTokenUsageOwner(
     full: FullOutput<unknown>,
     activeTurnWaiter?: Promise<never>,
   ): Promise<void> {
-    if (!full.runId) return;
-    while (!this._messageTokenLedger.isAccounted(full.runId)) {
-      const reservation = this._messageTokenLedger.reservationFor(full.runId);
-      if (reservation === undefined) return;
-      await this._raceActiveTurnWaiter(reservation.promise, activeTurnWaiter);
-    }
+    return waitForMessageSuspendedTokenUsageOwner(this._pendingInteractionsPort(), full, activeTurnWaiter);
   }
 
-  private async _captureMessageSuspendWithTokenUsage(
+  private _captureMessageSuspendWithTokenUsage(
     full: FullOutput<unknown>,
     queuedItemId: string | undefined,
     modeId: string,
@@ -5204,21 +4417,15 @@ export class Session {
     activeTurnWaiter?: Promise<never>,
     opts: { restoreFence?: { expectedKey?: string } } = {},
   ): Promise<void> {
-    await this._waitForMessageSuspendedTokenUsageOwner(full, activeTurnWaiter);
-    const reservation = this._reserveMessageSuspendedTokenUsage(full);
-    try {
-      await this._raceActiveTurnWaiter(
-        this._maybeCaptureSuspend(full, queuedItemId, modeId, modelId, {
-          tokenUsageDelta: reservation.tokenUsageDelta,
-          restoreFence: opts.restoreFence,
-        }),
-        activeTurnWaiter,
-      );
-      this._commitMessageSuspendedTokenUsage(reservation);
-    } catch (err) {
-      this._rollbackMessageSuspendedTokenUsage(reservation);
-      throw err;
-    }
+    return captureMessageSuspendWithTokenUsage(
+      this._pendingInteractionsPort(),
+      full,
+      queuedItemId,
+      modeId,
+      modelId,
+      activeTurnWaiter,
+      opts,
+    );
   }
 
   /**
@@ -5820,7 +5027,7 @@ export class Session {
         );
       }
       if (opts?.discardPendingInteraction !== false) {
-        await this._discardPendingInteractionForAbort(opts?.reason ?? 'parent_work_aborted');
+        await discardPendingInteractionForAbort(this._pendingInteractionsPort(), opts?.reason ?? 'parent_work_aborted');
       }
       // Catch a resume controller that was admitted immediately before the
       // invalidation epoch changed but became visible after the first abort.
@@ -6016,7 +5223,10 @@ export class Session {
     this._assertNotDeleted();
     const existingCancel = this._currentCancelRequest();
     if (existingCancel !== undefined) {
-      await this._settlePendingInteractionCancellation(existingCancel.reason ?? opts?.reason);
+      await settlePendingInteractionCancellation(
+        this._pendingInteractionsPort(),
+        existingCancel.reason ?? opts?.reason,
+      );
       return cascadeCancellationToOwnedSubagents(
         this._delegationDriverPort(),
         existingCancel.reason ?? opts?.reason ?? 'parent_cancelled',
@@ -6132,214 +5342,10 @@ export class Session {
       await this._settleCompletedQueuedItemAfterCancellation(completed.item, completed.result, completed.modeId);
     }
 
-    await this._settlePendingInteractionCancellation(durableReason);
+    await settlePendingInteractionCancellation(this._pendingInteractionsPort(), durableReason);
     this._notifyMaybeIdle();
 
     return cascadeCancellationToOwnedSubagents(this._delegationDriverPort(), reason ?? 'parent_cancelled');
-  }
-
-  /**
-   * A suspended signal remains in `pendingResume` as immutable audit/recovery
-   * evidence after session cancellation, but its durable signal result must be
-   * failed immediately. Otherwise `signal()` callers (including detached task
-   * delegation drivers) wait until the interaction TTL and retain concurrency
-   * reservations for up to ten minutes.
-   */
-  private async _settlePendingInteractionCancellation(reason?: string): Promise<void> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) return;
-    const cancellationError = new HarnessSessionCancelledError(this.id, reason);
-    const projectedError = projectHarnessPublicError(cancellationError);
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    if (queuedItemId !== undefined) {
-      const receipt = this._record.queueAdmissionReceipts?.[queuedItemId];
-      if (receipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: receipt.signalId,
-          runId: receipt.runId,
-          error: projectedError,
-        });
-      }
-    }
-    if (pending.originSignalId !== undefined) {
-      await this._settleSignalResult(pending.originSignalId, {
-        status: 'failed',
-        runId: pending.runId,
-        error: projectedError,
-      });
-    }
-    // A cancelled suspended turn may have deferred a terminal admission —
-    // settle the pending grant so its retained observers and durable row do
-    // not outlive the owning interaction.
-    await this._cancelTerminalizedPendingAdmission(pending, projectedError);
-  }
-
-  /**
-   * Abort/branch-revision counterpart to cancellation settlement. The pending
-   * interaction is terminalized and removed without setting a parent
-   * `cancelRequest`, so the conversation session remains reusable. Durable
-   * signal evidence is failed before the exact-generation clear; a crash in
-   * between leaves the pending row visible and safely retryable.
-   */
-  private async _discardPendingInteractionForAbort(reason: string): Promise<boolean> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) return false;
-    const abortError = new HarnessSessionCancelledError(this.id, reason);
-    const projectedError = projectHarnessPublicError(abortError);
-    const failedAt = Date.now();
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
-
-    // First win a durable waiting/resuming -> terminalizing transition. Resume
-    // admission rejects any generation carrying expiryStartedAt, so evidence is
-    // never failed for a response that can still proceed. If the process dies
-    // after this claim, the ordinary pending-deadline recovery finishes it.
-    let discardClaimed = false;
-    await this._flushUpdate(prev => {
-      discardClaimed = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== pending.kind ||
-        current.runId !== pending.runId ||
-        current.toolCallId !== pending.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
-        current.requestedAt !== pending.requestedAt ||
-        current.expiresAt !== pending.expiresAt ||
-        current.resumedAt !== pending.resumedAt ||
-        current.expiryStartedAt !== undefined
-      ) {
-        return prev;
-      }
-      discardClaimed = true;
-      return {
-        ...prev,
-        pendingResume: { ...current, expiryStartedAt: failedAt },
-      };
-    });
-    if (!discardClaimed) return false;
-
-    if (queueReceipt?.signalId !== undefined) {
-      await this._writeQueueSignalResultEvidence({
-        status: 'failed',
-        signalId: queueReceipt.signalId,
-        runId: queueReceipt.runId,
-        error: projectedError,
-      });
-    }
-    if (pending.originSignalId !== undefined) {
-      await this._settleSignalResult(pending.originSignalId, {
-        status: 'failed',
-        runId: pending.runId,
-        error: projectedError,
-      });
-    }
-    // A discarded suspension may have deferred a terminal admission — settle
-    // the pending grant alongside the other durable evidence BEFORE the
-    // pending row clears below. If cancellation fails here the claim marker
-    // (`expiryStartedAt`) stays on the row, the interaction remains
-    // discoverable, and the pending-deadline recovery finishes the cancel.
-    await this._cancelTerminalizedPendingAdmission(pending, projectedError);
-
-    let discarded = false;
-    await this._flushUpdate(prev => {
-      discarded = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== pending.kind ||
-        current.runId !== pending.runId ||
-        current.toolCallId !== pending.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
-        current.requestedAt !== pending.requestedAt ||
-        current.expiresAt !== pending.expiresAt ||
-        current.resumedAt !== pending.resumedAt ||
-        current.expiryStartedAt !== failedAt
-      ) {
-        return prev;
-      }
-      discarded = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      // A response may have durably won admission (`resumedAt` + accepted
-      // inbox receipt) immediately before Stop invalidated the branch. Because
-      // no provider resume is allowed to start afterward, terminalize every
-      // accepted receipt for this exact pending generation instead of leaving a
-      // permanent "accepted" receipt that a reconnect could mistake for work
-      // still in flight.
-      const inboxResponseReceipts = { ...(prev.inboxResponseReceipts ?? {}) };
-      let inboxReceiptsChanged = false;
-      for (const [responseId, receipt] of Object.entries(inboxResponseReceipts)) {
-        if (
-          receipt.status === 'accepted' &&
-          receipt.kind === pending.kind &&
-          receipt.runId === pending.runId &&
-          receipt.toolCallId === pending.toolCallId &&
-          receipt.pendingRequestedAt === pending.requestedAt
-        ) {
-          inboxResponseReceipts[responseId] = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? failedAt,
-            updatedAt: failedAt,
-            retryable: false,
-          };
-          inboxReceiptsChanged = true;
-        }
-      }
-      if (inboxReceiptsChanged) next.inboxResponseReceipts = inboxResponseReceipts;
-      if (queuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[queuedItemId];
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [queuedItemId]: {
-              ...receipt,
-              status: 'failed',
-              error: projectedError,
-              failedAt: receipt.failedAt ?? failedAt,
-              updatedAt: failedAt,
-            },
-          };
-        }
-      }
-      return next;
-    });
-    if (!discarded) return false;
-
-    this._clearPendingInteractionExpiryTimer();
-    this._replacementToolSurface.drop(pending.runId);
-    if (queuedItemId !== undefined) {
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(abortError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(queueReceipt?.runId ? { runId: queueReceipt.runId } : {}),
-        ...(queueReceipt?.signalId ? { signalId: queueReceipt.signalId } : {}),
-        ...(queueReceipt?.admissionId ? { admissionId: queueReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: pending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    if (this._currentTurnAbortController === undefined) {
-      this._releaseParkedRun(pending);
-      this._emitAgentEnd({ runId: pending.runId, finishReason: 'error' });
-    }
-    this._notifyMaybeIdle();
-    return true;
   }
 
   /**
@@ -6362,7 +5368,9 @@ export class Session {
       const queue = prev.pendingQueue ?? [];
       const idx = queue.findIndex(item => item.id === targetId);
       const activeResumeId =
-        prev.pendingResume !== undefined ? this._queuedItemIdForPendingResume(prev.pendingResume) : undefined;
+        prev.pendingResume !== undefined
+          ? queuedItemIdForPendingResume(this._pendingInteractionsPort(), prev.pendingResume)
+          : undefined;
       if (idx <= 0 || this._queueHead.currentId === targetId || activeResumeId === targetId) return prev;
 
       const item = queue[idx]!;
@@ -7350,12 +6358,7 @@ export class Session {
   private _pendingRunToolReceiptProjection(
     runId: string,
   ): Pick<PendingResume, 'toolReceipts' | 'toolReceiptsOverflow'> {
-    const state = this._runToolReceipts.get(runId);
-    if (state === undefined) return {};
-    return {
-      ...(state.receipts.length > 0 ? { toolReceipts: state.receipts.map(receipt => ({ ...receipt })) } : {}),
-      ...(state.overflow ? { toolReceiptsOverflow: true } : {}),
-    };
+    return pendingRunToolReceiptProjection(this._pendingInteractionsPort(), runId);
   }
 
   private _restorePendingRunToolReceipts(pending: PendingResume): void {
@@ -9477,7 +8480,8 @@ export class Session {
           // A completed (terminal, immutable) suspended result whose
           // suspension was discarded replays the discard, not `suspended`.
           const discardedSuspension = this._discardReceiptForSuspendedOutput(completedResult);
-          if (discardedSuspension !== undefined) throw this._discardedErrorForReceipt(discardedSuspension);
+          if (discardedSuspension !== undefined)
+            throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardedSuspension);
           if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
             await this._commitCachedDuplicateTerminal(
               completedResult as FullOutput<unknown>,
@@ -9747,7 +8751,7 @@ export class Session {
       const discardedCallRunId = full.runId ?? evidence.runId;
       const discard = parked === undefined ? this._discardReceiptForSuspendedOutput(full, evidence.runId) : undefined;
       if (discard !== undefined) {
-        const discardError = this._discardedErrorForReceipt(discard);
+        const discardError = discardedErrorForReceipt(this._pendingInteractionsPort(), discard);
         if (evidence.status === 'pending') {
           // Same admitted failure write a failed message turn makes, so later
           // retries replay a terminal outcome. Best effort: the discard
@@ -9831,67 +8835,6 @@ export class Session {
   }
 
   /**
-   * Deferred terminal settlement for a message that suspended. The admission's
-   * deterministic `runId` is the resumed run's id, so the durable row is
-   * recoverable without persisting extra correlation on `pendingResume`.
-   * The probe is by-run across statuses: a cancelled or fenced grant must still
-   * surface its terminal outcome (the commit helper throws it and drains
-   * retained observers) instead of letting the resume clear `pendingResume`
-   * and report success on a revoked grant; a committed row replays its durable
-   * receipt through the same barrier.
-   */
-  private async _settleResumedTerminalHandoff(
-    pending: PendingResume,
-    full: FullOutput<unknown>,
-    options: { modeId?: string; modelId?: string },
-    deletedTurnWaiter: Promise<never>,
-    turnAbortSignal: AbortSignal | undefined,
-  ): Promise<void> {
-    // Probe durable state even when no finalizer is registered on this session
-    // instance — a reopened session must still observe a bound admission and
-    // fail closed through the commit barrier rather than report success on an
-    // unsettled (or dead) grant.
-    const admission = await this._probeResumeAdmissionByRun(pending);
-    if (!admission) return;
-    // PF-7631: a resumed wake turn's terminal commit is a wake terminal commit:
-    // the same bounded re-drive with an `error` event per failed attempt. If it
-    // still fails, the resume rejects and the parked interaction stays, so a
-    // retry of the response or stale-resume recovery settles it later.
-    if (isHarnessWakeReservedKey(admission.admissionId)) {
-      await this._commitWakeTerminalWithRetry(admission, full, options, deletedTurnWaiter, turnAbortSignal);
-      return;
-    }
-    await this._commitTerminalHandoff(admission, full, options);
-  }
-
-  /**
-   * Stale-resume recovery terminalizes a resumed turn without delivering its
-   * reply, but the resumed run may already have staged completed output and
-   * consumed tokens. Count that usage before any evidence rewrite.
-   */
-  private async _accountStagedResumeUsage(pending: PendingResume, queuedItemId: string | undefined): Promise<void> {
-    const admission = await this._probeResumeAdmissionByRun(pending);
-    if (!admission) return;
-    const stored = await this._storage.loadMessageResultEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: admission.signalId,
-    });
-    if (
-      stored === null ||
-      !('status' in stored) ||
-      stored.status !== 'pending' ||
-      stored.stagedResult === undefined ||
-      stored.runId !== pending.runId
-    ) {
-      return;
-    }
-    await this._accountStagedTerminalUsage(pending.runId, stored.stagedResult as FullOutput<unknown>, queuedItemId);
-  }
-
-  /**
    * Count a staged turn's consumed usage exactly once before its pending
    * evidence is rewritten without delivery (cancellation or interruption).
    * A parked resumed run counts against its generation's durable baseline;
@@ -9924,7 +8867,7 @@ export class Session {
       });
       // A run this process already accounted keeps its armed baseline, and
       // a queued post-run finalization already persisted its delta.
-      const queuedId = queuedItemId ?? this._queuedItemIdForPendingResume(parked);
+      const queuedId = queuedItemId ?? queuedItemIdForPendingResume(this._pendingInteractionsPort(), parked);
       const queuedUsagePersisted =
         queuedId !== undefined && this._record.queueAdmissionReceipts?.[queuedId]?.postRunFinalizedAt !== undefined;
       // Resumed finalization and this path share one once-only marker.
@@ -9932,7 +8875,7 @@ export class Session {
       this._runOutcomes.noteResumeAccounted(runId, generationKey);
       if (!queuedUsagePersisted && !finalizationAccounted && !this._resumeUsageFence.isArmedFor(generationKey)) {
         this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
-        const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
+        const runUsage = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), staged);
         if (runUsage !== undefined) this._resumeUsageFence.arm(generationKey, runUsage);
       }
       this._messageTokenLedger.markAccounted(runId);
@@ -9941,27 +8884,6 @@ export class Session {
     }
     this._terminalStagingLedger.markStagedAndAccounted(runId);
     await this._persistTokenUsageOrLatch();
-  }
-
-  /**
-   * By-run admission probe shared by the settle and cancel paths. A probe
-   * failure never reaches `_commitTerminalHandoff`'s drain, so the
-   * indeterminate outcome is reported to the run's retained observers here
-   * while the admission stays pending/recoverable.
-   */
-  private async _probeResumeAdmissionByRun(pending: PendingResume) {
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return undefined;
-    try {
-      return await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        runId: pending.runId,
-        sessionIncarnation,
-      });
-    } catch (err) {
-      throw this._terminalFailure(err, undefined, pending.runId);
-    }
   }
 
   /**
@@ -9991,7 +8913,7 @@ export class Session {
     // Probe across statuses: an external cancellation may have already moved
     // the row out of 'pending', and the retained observers still need their
     // terminal outcome.
-    const admission = await this._probeResumeAdmissionByRun(pending);
+    const admission = await probeResumeAdmissionByRun(this._pendingInteractionsPort(), pending);
     if (!admission) return;
     if (admission.status === 'cancelled') {
       await this._settleCancelledTerminalMessage(admission, error.message, settleOptions);
@@ -10160,137 +9082,6 @@ export class Session {
       admission,
       ...(intent !== null ? { intent } : {}),
     });
-  }
-
-  /**
-   * Resolve an approved plan-approval mode transition. A caller-supplied
-   * `transitionToMode` on the response overrides the submitting mode's
-   * declared `transitionsTo` (captured into `pending.transitionModeId` at
-   * suspend time); a same-mode or unapproved response flips nothing. Throws
-   * when the target mode no longer exists — recovery callers that must stay
-   * total catch and skip the flip.
-   */
-  private _resolvePlanApprovalModeFlipTarget(
-    pending: PendingResume,
-    data: { approved?: boolean; transitionToMode?: string } | undefined,
-  ): string | undefined {
-    if (data?.approved !== true) return undefined;
-    const candidate = data.transitionToMode ?? pending.transitionModeId;
-    if (!candidate || candidate === this._record.modeId) return undefined;
-    this._harness._getMode(candidate);
-    return candidate;
-  }
-
-  /**
-   * Settlement-only retry for a resume whose provider run already completed but
-   * whose post-output bookkeeping threw. `resumedAt` is durable so the caller
-   * cannot re-run `resumeStream`; instead the cached completed `FullOutput` is
-   * committed through `_finalizeResumedTurnOutcome`, which is idempotent for
-   * every step the failed attempt did not reach. Returns the completed result
-   * when it handled the retry, `undefined` when there is nothing recoverable
-   * (no cached output, no pending admission, or the run re-suspended) and the
-   * caller should fall through to the ordinary already-responded handling.
-   */
-  private async _maybeFinalizeRetriedResumedTerminal(
-    pending: PendingResume,
-    resumeData: unknown,
-    options: {
-      expectedKind: PendingResume['kind'];
-      responseMode: ResumeResponseMode;
-      responseId?: string;
-    },
-  ): Promise<AgentResult | InboxResponseResult | undefined> {
-    // Probe durable state even without a locally-registered finalizer — a
-    // reopened session must still reconcile a bound admission (the commit
-    // barrier replays a sealed winner or fails closed on a live one).
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return undefined;
-    // Probe by run regardless of status: a commit may have sealed the grant
-    // while the post-commit bookkeeping (the pendingResume-clearing flush)
-    // failed — the admission is then 'committed' rather than 'pending', and
-    // the retry must still finish the remaining bookkeeping. A cancelled or
-    // fenced row means the interaction was already terminalized elsewhere.
-    const admission = await this._storage.loadTerminalAdmissionByRun({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      runId: pending.runId,
-      sessionIncarnation,
-    });
-    if (!admission || (admission.status !== 'pending' && admission.status !== 'committed')) {
-      return undefined;
-    }
-    const cached = this._runOutcomes.get(pending.runId);
-    let full: FullOutput<unknown>;
-    if (cached !== undefined && cached.ok && cached.full.finishReason !== 'suspended') {
-      full = cached.full;
-    } else {
-      // A restart emptied the local run cache — canonical evidence still
-      // carries the committed or staged completed output, so
-      // recover it instead of reporting the resume as abandoned. The cached
-      // entry is repopulated so the per-generation usage marker still dedupes
-      // a second retry.
-      const stored = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: admission.signalId,
-      });
-      if (
-        !stored ||
-        !('status' in stored) ||
-        !(
-          (stored.status === 'completed' && stored.result !== undefined) ||
-          (stored.status === 'pending' && stored.stagedResult !== undefined)
-        )
-      ) {
-        return undefined;
-      }
-      full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
-      this._runOutcomes.remember(pending.runId, { ok: true, full });
-    }
-
-    const { expectedKind, responseMode, responseId } = options;
-    const pendingQueuedItemId = this._queuedItemIdForPendingResume(pending);
-    const resumeModeId = this._modeIdForPendingResume(pending);
-    const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
-    const modeFlipTarget =
-      expectedKind === 'plan-approval'
-        ? this._resolvePlanApprovalModeFlipTarget(
-            pending,
-            resumeData as { approved: boolean; transitionToMode?: string },
-          )
-        : undefined;
-    const completingQueuedItemId = pendingQueuedItemId;
-    await this._withActiveDeletedWaiter(async activeTurnWaiter => {
-      try {
-        await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(pending.runId, full), activeTurnWaiter);
-        await this._finalizeResumedTurnOutcome(pending, full, {
-          responseId,
-          pendingQueuedItemId,
-          completingQueuedItemId,
-          modeFlipTarget,
-          previousModeId: this._record.modeId,
-          resumeModeId,
-          resumeModelId: resumeRuntimeDependencies.modelId,
-          deletedTurnWaiter: activeTurnWaiter,
-        });
-      } catch (err) {
-        if (err instanceof QueuePostRunFinalizationPendingError && completingQueuedItemId !== undefined) {
-          this._deferQueuedTurnRetry(err);
-        }
-        throw redactPublicBoundaryRejection(err);
-      }
-    });
-    if (completingQueuedItemId !== undefined) {
-      void this._maybeDrainQueue();
-    }
-    if (responseMode === 'inbox-receipt') {
-      const receipt =
-        responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
-      if (receipt) return this._inboxReceiptResult(receipt, false);
-    }
-    return full as AgentResult;
   }
 
   private _retainTerminalObservers(
@@ -13104,7 +11895,7 @@ export class Session {
           .then(async full => {
             const tokenUsageDelta =
               full.finishReason === 'suspended'
-                ? this._tokenUsageDeltaFromFullOutput(full)
+                ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full)
                 : this._recordTurnCompletion(full, { persist: false });
             await Promise.race([
               this._maybeCaptureSuspend(full, undefined, effectiveModeId, effectiveModelId, {
@@ -13776,7 +12567,7 @@ export class Session {
             // staged output never counts it twice.
             const tokenUsageDelta =
               full.finishReason === 'suspended'
-                ? this._tokenUsageDeltaFromFullOutput(full)
+                ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full)
                 : wakeTerminal !== undefined
                   ? this._recordMessageTurnCompletion(full, { persist: false }).tokenUsageDelta
                   : this._recordTurnCompletion(full, { persist: false });
@@ -13949,7 +12740,7 @@ export class Session {
    *
    * No-op when the run did not suspend.
    */
-  private async _maybeCaptureSuspend(
+  private _maybeCaptureSuspend(
     full: FullOutput<unknown>,
     queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
@@ -13960,261 +12751,7 @@ export class Session {
       restoreFence?: { expectedKey?: string };
     } = {},
   ): Promise<void> {
-    if (full.finishReason !== 'suspended') return;
-    this._captureTurnRunId(full);
-    const payload = full.suspendPayload as
-      | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] }
-      | undefined;
-    if (!payload || !full.runId) {
-      await this._persistTokenUsageDelta(opts.tokenUsageDelta);
-      this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-      return;
-    }
-
-    const pending = this._pendingResumeFromSuspendedOutput(
-      full,
-      payload,
-      queuedItemId,
-      modeId,
-      modelId,
-      opts.originSignalId,
-    );
-    if (pending === undefined) return;
-    const suspendedFenceLease = this._currentAgentRequestContext
-      ? captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, full.runId)
-      : undefined;
-    // For a fenced cached-restore the token delta is evaluated at flush time
-    // against the generation that actually survived the CAS: a skipped write
-    // applies no usage, and an applied write reconciles the cached output's
-    // cumulative counter against the durable per-run baseline still on the
-    // record (the in-memory accounted sets are empty after a reopen).
-    let writeApplied = false;
-    const flushTokenUsageDelta =
-      opts.restoreFence === undefined
-        ? opts.tokenUsageDelta
-        : () => {
-            if (!writeApplied) return undefined;
-            const baseline =
-              this._record.pendingResume !== undefined && this._record.pendingResume.runId === full.runId
-                ? this._record.pendingResume.accountedTokenUsage
-                : undefined;
-            return this._tokenUsageDeltaFromFullOutput(full, baseline);
-          };
-    const existing = this._record.pendingResume;
-    if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
-      if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
-      await this._flushUpdate(
-        prev => {
-          // CAS retries re-run this updater against newer state — the apply
-          // flag must reflect the attempt that actually won, not a failed one.
-          writeApplied = false;
-          const current = prev.pendingResume;
-          if (opts.restoreFence !== undefined) {
-            const currentKey = current === undefined ? undefined : pendingInteractionGenerationKey(current);
-            if (currentKey !== opts.restoreFence.expectedKey) return prev;
-          }
-          // A tool-registered pending (ctx.registerQuestion / registerPlanApproval
-          // / registerSandboxAccess) is written mid-turn without the turn's
-          // origin. Settlement and queue routing read `queuedItemId` /
-          // `originSignalId` off the parked pending, so adopt the captured
-          // origin when the registered pending lacks it.
-          const originToAdopt = {
-            ...(current?.queuedItemId === undefined && pending.queuedItemId !== undefined
-              ? { queuedItemId: pending.queuedItemId }
-              : {}),
-            ...(current?.originSignalId === undefined && pending.originSignalId !== undefined
-              ? { originSignalId: pending.originSignalId }
-              : {}),
-          };
-          if (
-            current === undefined ||
-            current.runId !== full.runId ||
-            current.toolCallId !== payload.toolCallId ||
-            (pending.accountedTokenUsage === undefined &&
-              pending.toolReceipts === undefined &&
-              pending.toolReceiptsOverflow !== true &&
-              pending.subagentBudgetSpent === undefined &&
-              Object.keys(originToAdopt).length === 0)
-          ) {
-            return prev;
-          }
-          writeApplied = true;
-          return {
-            ...prev,
-            pendingResume: {
-              ...current,
-              ...originToAdopt,
-              ...(pending.accountedTokenUsage !== undefined
-                ? { accountedTokenUsage: pending.accountedTokenUsage }
-                : {}),
-              ...(pending.toolReceipts !== undefined ? { toolReceipts: pending.toolReceipts } : {}),
-              ...(pending.toolReceiptsOverflow === true ? { toolReceiptsOverflow: true } : {}),
-              ...(pending.subagentBudgetSpent !== undefined
-                ? { subagentBudgetSpent: pending.subagentBudgetSpent }
-                : {}),
-            },
-          };
-        },
-        { tokenUsageDelta: flushTokenUsageDelta },
-      );
-      if (this._currentAgentRequestContext && suspendedFenceLease) {
-        clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
-      }
-      this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-      return;
-    }
-    // A cached-suspension restore (restoreFence) reads `pendingResume` before
-    // awaiting a durable probe; a resume can clear and re-park a NEWER
-    // generation — or clear it entirely on commit — in that gap. Re-check the
-    // pre-probe generation key inside the CAS updater so the stale restore
-    // cannot resurrect a cleared interaction or overwrite the newer pending:
-    // the durable park is authoritative.
-    let restored = true;
-    await this._flushUpdate(
-      prev => {
-        restored = true;
-        writeApplied = false;
-        if (opts.restoreFence !== undefined) {
-          const current = prev.pendingResume;
-          const currentKey = current === undefined ? undefined : pendingInteractionGenerationKey(current);
-          if (currentKey !== opts.restoreFence.expectedKey) {
-            restored = false;
-            return prev;
-          }
-        }
-        writeApplied = true;
-        return { ...prev, pendingResume: pending };
-      },
-      { tokenUsageDelta: flushTokenUsageDelta },
-    );
-    if (this._currentAgentRequestContext && suspendedFenceLease) {
-      clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
-    }
-    // Announce the suspension only when the durable write actually landed this
-    // pending — a fenced-out restore or a size-budget drop must not surface a
-    // pending event for an interaction storage never recorded.
-    if (!restored || this._record.pendingResume !== pending) return;
-    this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-
-    // Emit the §10.2 pending event AFTER the durable-parking barrier (§5.4) so
-    // any subscriber observing it can reconstruct the pending state from storage.
-    this._emitPendingEvent(pending);
-  }
-
-  private _pendingResumeFromSuspendedOutput(
-    full: FullOutput<unknown>,
-    payload: {
-      toolCallId: string;
-      toolName: string;
-      args?: unknown;
-      suspendPayload?: unknown;
-      approvalReasons?: string[];
-    },
-    queuedItemId = this._queueHead.currentId,
-    modeId = this._record.modeId,
-    modelId = this._modelIdForQueuedItem(queuedItemId),
-    originSignalId?: string,
-  ): PendingResume | undefined {
-    if (!full.runId) return undefined;
-    const kind = this._classifyResumeKind(payload);
-    const accountedTokenUsage = this._tokenUsageDeltaFromFullOutput(full);
-    const toolReceiptProjection = this._pendingRunToolReceiptProjection(full.runId);
-    const pending: PendingResume = {
-      kind,
-      itemId: `${kind}:${payload.toolCallId}`,
-      runId: full.runId,
-      toolCallId: payload.toolCallId,
-      toolName: payload.toolName,
-      ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(kind),
-      ...(queuedItemId !== undefined ? { queuedItemId } : {}),
-      ...(originSignalId !== undefined ? { originSignalId } : {}),
-      modeId,
-      // §4.2e — carry the active turn's yolo so the resumed run keeps auto-granting.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(modeId, modelId),
-      // §5.1 — persist the suspended turn's caller app bag so a resume rebuilds the
-      // SAME context (a re-suspend re-captures it because resume re-stashes it).
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(full.runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
-        : {}),
-      ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
-      ...toolReceiptProjection,
-      ...this._subagentBudgetSpentProjection(),
-      payload: this._buildResumePayload(kind, payload),
-    };
-
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
-
-    if (kind === 'plan-approval') {
-      const mode = this._harness._getMode(modeId);
-      if (mode.transitionsTo) pending.transitionModeId = mode.transitionsTo;
-    }
-    return pending;
-  }
-
-  /** Correlate child-side pending interactions with their parent invocation. */
-  private _pendingResumeSourceFields(): Pick<PendingResume, 'source' | 'subagentToolCallId'> {
-    if (this.subagentDepth <= 0) return { source: 'parent' };
-    return {
-      source: 'subagent',
-      ...(this._subagentParentToolCallId !== undefined ? { subagentToolCallId: this._subagentParentToolCallId } : {}),
-    };
-  }
-
-  private _classifyResumeKind(payload: { toolName: string; suspendPayload?: unknown }): PendingResume['kind'] {
-    if (payload.toolName === ASK_USER_TOOL_NAME) return 'question';
-    if (payload.toolName === SUBMIT_PLAN_TOOL_NAME) return 'plan-approval';
-    if ('suspendPayload' in payload && payload.suspendPayload !== undefined) return 'tool-suspension';
-    return 'tool-approval';
-  }
-
-  private _buildResumePayload(
-    kind: PendingResume['kind'],
-    payload: { args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] },
-  ): PendingResume['payload'] {
-    // The payload is persisted and published as JSON: an argument the model
-    // omitted (an optional `selectionMode`, `options`, `title`, a tool with no
-    // args, a suspension without data) is left out rather than stored as an
-    // explicit `undefined`, which strict JSON consumers read as a non-JSON
-    // payload. Absent stays absent; present values are unchanged.
-    switch (kind) {
-      case 'tool-approval':
-        return {
-          ...(payload.args !== undefined ? { input: payload.args } : {}),
-          ...(payload.approvalReasons !== undefined ? { approvalReasons: payload.approvalReasons } : {}),
-        };
-      case 'tool-suspension':
-        return {
-          ...(payload.args !== undefined ? { input: payload.args } : {}),
-          ...(payload.suspendPayload !== undefined ? { suspendData: payload.suspendPayload } : {}),
-        };
-      case 'question': {
-        const args = (payload.args ?? {}) as {
-          question?: string;
-          options?: { label: string; description?: string }[];
-          selectionMode?: 'single_select' | 'multi_select';
-        };
-        return {
-          ...(args.question !== undefined ? { question: args.question } : {}),
-          ...(args.options !== undefined ? { options: args.options } : {}),
-          ...(args.selectionMode !== undefined ? { selectionMode: args.selectionMode } : {}),
-        };
-      }
-      case 'plan-approval': {
-        const args = (payload.args ?? {}) as { title?: string; plan?: string };
-        return {
-          ...(args.title !== undefined ? { title: args.title } : {}),
-          ...(args.plan !== undefined ? { plan: args.plan } : {}),
-        };
-      }
-    }
+    return maybeCaptureSuspend(this._pendingInteractionsPort(), full, queuedItemId, modeId, modelId, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -15005,28 +13542,8 @@ export class Session {
   async respondToToolApproval(
     opts: ToolApprovalDecision & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToToolApproval(
-    opts: ToolApprovalDecision & InboxResponseOptions,
-  ): Promise<AgentResult | InboxResponseResult> {
-    const approvalDecision =
-      opts.editedArgs !== undefined
-        ? parseToolApprovalDecision({ approved: opts.approved, editedArgs: opts.editedArgs })
-        : undefined;
-    if (opts.editedArgs !== undefined && !approvalDecision) {
-      throw new HarnessValidationError(
-        'respond[tool-approval].editedArgs',
-        'editedArgs requires an approved decision and a JSON object',
-      );
-    }
-    return this._resume(
-      'tool-approval',
-      compactJsonObject({
-        approved: opts.approved,
-        reason: opts.reason,
-        editedArgs: approvalDecision?.editedArgs,
-      }),
-      opts,
-    );
+  respondToToolApproval(opts: ToolApprovalDecision & InboxResponseOptions): Promise<AgentResult | InboxResponseResult> {
+    return respondToToolApproval(this._pendingInteractionsPort(), opts);
   }
 
   /** Resume a pending tool-suspension. `resumeData` is forwarded to the tool. */
@@ -15037,20 +13554,18 @@ export class Session {
   async respondToToolSuspension(
     opts: { resumeData: unknown } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToToolSuspension(
+  respondToToolSuspension(
     opts: { resumeData: unknown } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume('tool-suspension', opts.resumeData, opts);
+    return respondToToolSuspension(this._pendingInteractionsPort(), opts);
   }
 
   /** Resume a pending `ask_user` question. */
   async respondToQuestion(opts: { answer: unknown } & InboxReceiptResponseOptions): Promise<InboxResponseResult>;
   async respondToQuestion(opts: { answer: unknown } & LegacyInboxResponseOptions): Promise<AgentResult>;
   async respondToQuestion(opts: { answer: unknown } & InboxResponseOptions): Promise<AgentResult | InboxResponseResult>;
-  async respondToQuestion(
-    opts: { answer: unknown } & InboxResponseOptions,
-  ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume('question', { answer: opts.answer }, opts);
+  respondToQuestion(opts: { answer: unknown } & InboxResponseOptions): Promise<AgentResult | InboxResponseResult> {
+    return respondToQuestion(this._pendingInteractionsPort(), opts);
   }
 
   async respondToSandboxAccess(
@@ -15062,17 +13577,10 @@ export class Session {
   async respondToSandboxAccess(
     opts: { approved: boolean; reason?: string } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToSandboxAccess(
+  respondToSandboxAccess(
     opts: { approved: boolean; reason?: string } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume(
-      'sandbox-access',
-      compactJsonObject({
-        approved: opts.approved,
-        reason: opts.reason,
-      }),
-      opts,
-    );
+    return respondToSandboxAccess(this._pendingInteractionsPort(), opts);
   }
 
   /**
@@ -15109,27 +13617,14 @@ export class Session {
       transitionToMode?: string;
     } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToPlanApproval(
+  respondToPlanApproval(
     opts: {
       approved: boolean;
       revision?: string;
       transitionToMode?: string;
     } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    if (opts.transitionToMode !== undefined) {
-      // Validate eagerly so callers see a clean error rather than a CAS-time
-      // throw from inside the resume flow.
-      this._harness._getMode(opts.transitionToMode);
-    }
-    return this._resume(
-      'plan-approval',
-      compactJsonObject({
-        approved: opts.approved,
-        revision: opts.revision,
-        transitionToMode: opts.transitionToMode,
-      }),
-      opts,
-    );
+    return respondToPlanApproval(this._pendingInteractionsPort(), opts);
   }
 
   /**
@@ -15156,328 +13651,8 @@ export class Session {
    * `responseId` already used for a different response rejects with
    * `HarnessInboxResponseConflictError`.
    */
-  async discardPendingInteraction(opts: DiscardPendingInteractionOptions): Promise<DiscardPendingInteractionResult> {
-    this._assertLive('discardPendingInteraction()');
-    const input = parseDiscardPendingInteractionOptions(opts);
-    const responseHash = sha256CanonicalJson({
-      operation: 'discard',
-      kind: input.kind,
-      itemId: input.itemId,
-      runId: input.runId,
-      toolCallId: input.toolCallId,
-      pendingRequestedAt: input.pendingRequestedAt,
-      reason: input.reason,
-    });
-    try {
-      // One retry: a lost CAS re-classifies against the reloaded record.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const observed = this._classifyPendingInteractionDiscard(input, responseHash);
-        if (observed.status === 'finish') {
-          await this._completeDiscardedPendingInteraction(observed.pending, observed.receipt);
-          return discardReceiptResult('already_resolved', observed.receipt);
-        }
-        if (observed.status !== 'claimable') return observed.result;
-        const claimed = await this._claimPendingInteractionDiscard(input, responseHash, observed.pending);
-        if (claimed !== undefined) {
-          await this._completeDiscardedPendingInteraction(claimed.pending, claimed.receipt);
-          return discardReceiptResult('discarded', claimed.receipt);
-        }
-      }
-      throw new HarnessBusyError(this.id, 'in_flight');
-    } catch (err) {
-      throw this._discardPendingInteractionFailure(err, input.responseId);
-    }
-  }
-
-  private _classifyPendingInteractionDiscard(
-    input: DiscardPendingInteractionOptions,
-    responseHash: string,
-  ):
-    | { status: 'claimable'; pending: PendingResume }
-    | { status: 'finish'; pending: PendingResume; receipt: InboxResponseReceipt }
-    | { status: 'resolved'; result: DiscardPendingInteractionResult } {
-    const generation = discardGeneration(input);
-    const notCurrent = (): { status: 'resolved'; result: DiscardPendingInteractionResult } => ({
-      status: 'resolved',
-      result: { status: 'not_current', itemId: input.itemId, kind: input.kind },
-    });
-    const pending = this._record.pendingResume;
-    const pendingIsGeneration = pending !== undefined && pendingMatchesDiscardGeneration(pending, generation);
-    const ownReceipt = getOwnRecordValue(this._record.inboxResponseReceipts, input.responseId);
-    if (ownReceipt !== undefined) {
-      if (
-        ownReceipt.discardedAt === undefined ||
-        ownReceipt.responseHash !== responseHash ||
-        !receiptMatchesDiscardGeneration(ownReceipt, generation)
-      ) {
-        throw new HarnessInboxResponseConflictError(this.id, input.itemId, input.responseId);
-      }
-      if (pendingIsGeneration && pending!.expiryStartedAt === ownReceipt.discardedAt) {
-        return { status: 'finish', pending: pending!, receipt: ownReceipt };
-      }
-      return { status: 'resolved', result: discardReceiptResult('already_resolved', ownReceipt) };
-    }
-    if (!pendingIsGeneration) {
-      const prior = this._findDiscardReceipt(generation);
-      return prior !== undefined
-        ? { status: 'resolved', result: discardReceiptResult('already_resolved', prior) }
-        : notCurrent();
-    }
-    if (pending!.expiryStartedAt !== undefined) {
-      // Another terminalizer (expiry, Stop, or an earlier discard whose clear
-      // has not committed) already claimed this generation.
-      const claim = this._discardClaimForPending(pending!);
-      return claim !== undefined ? { status: 'finish', pending: pending!, receipt: claim } : notCurrent();
-    }
-    // A resume admitted for this generation, or a still-running tool that
-    // registered it, owns the interaction. Resolving it underneath would need a
-    // turn abort, which this operation never performs.
-    if (
-      pending!.resumedAt !== undefined ||
-      (this._currentTurnAbortController !== undefined &&
-        (pending!.kind === 'question' || pending!.kind === 'plan-approval' || pending!.kind === 'sandbox-access'))
-    ) {
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-    return { status: 'claimable', pending: pending! };
-  }
-
-  /**
-   * Phase one: a single session CAS fenced to the exact unresumed, unclaimed
-   * generation stamps the terminalizing claim (`expiryStartedAt`, which resume
-   * admission rejects), writes the discard receipt, and finalizes every
-   * unsettled inbox receipt of that generation as discarded.
-   */
-  private async _claimPendingInteractionDiscard(
-    input: DiscardPendingInteractionOptions,
-    responseHash: string,
-    observed: PendingResume,
-  ): Promise<{ pending: PendingResume; receipt: InboxResponseReceipt } | undefined> {
-    const generation = discardGeneration(input);
-    const discardError = new HarnessPendingInteractionDiscardedError(this.id, input.itemId, input.reason);
-    const projectedError = projectHarnessPublicError(discardError);
-    let claimed: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
-    await this._flushUpdate(
-      prev => {
-        claimed = undefined;
-        const current = prev.pendingResume;
-        if (
-          current === undefined ||
-          !pendingMatchesDiscardGeneration(current, generation) ||
-          current.expiresAt !== observed.expiresAt ||
-          current.resumedAt !== undefined ||
-          current.expiryStartedAt !== undefined ||
-          getOwnRecordValue(prev.inboxResponseReceipts, input.responseId) !== undefined
-        ) {
-          return prev;
-        }
-        // Never below `requestedAt`: the parking host's clock may be ahead of
-        // ours (lease handoff, NTP step), and `expiresAt < requestedAt` is a
-        // corrupt pending row.
-        const discardedAt = Math.max(Date.now(), current.requestedAt);
-        const receipt: InboxResponseReceipt = {
-          responseId: input.responseId,
-          responseHash,
-          resumeAttemptId: input.responseId,
-          itemId: input.itemId,
-          ...(current.queuedItemId !== undefined ? { queuedItemId: current.queuedItemId } : {}),
-          kind: input.kind,
-          runId: input.runId,
-          toolCallId: input.toolCallId,
-          pendingRequestedAt: input.pendingRequestedAt,
-          response: { discarded: true, reason: input.reason },
-          status: 'failed',
-          error: projectedError,
-          retryable: false,
-          acceptedAt: discardedAt,
-          failedAt: discardedAt,
-          discardedAt,
-          ...(prev.cancelRequest !== undefined
-            ? { cancelledPendingResume: cancelledPendingAudit(current, prev.cancelRequest) }
-            : {}),
-          updatedAt: discardedAt,
-        };
-        // Built with data-property semantics only (entries / computed keys),
-        // never `map[id] = ...`, so a caller id such as "__proto__" stays an
-        // own, serializable receipt instead of hitting the prototype setter.
-        const inboxResponseReceipts: Record<string, InboxResponseReceipt> = Object.fromEntries([
-          ...Object.entries(prev.inboxResponseReceipts ?? {}).map(([responseId, candidate]) =>
-            receiptMatchesDiscardGeneration(candidate, generation) &&
-            (candidate.status === 'accepted' || (candidate.status === 'failed' && candidate.retryable === true))
-              ? ([
-                  responseId,
-                  {
-                    ...candidate,
-                    status: 'failed',
-                    error: projectedError,
-                    retryable: false,
-                    failedAt: discardedAt,
-                    updatedAt: discardedAt,
-                  } satisfies InboxResponseReceipt,
-                ] as const)
-              : ([responseId, candidate] as const),
-          ),
-          [input.responseId, receipt] as const,
-        ]);
-        // The claim also moves the row's deadline to now, so a completion that
-        // fails after this commit is due at once for the live timer, hydrate,
-        // and the cold sweep instead of waiting for the original TTL. Expiry
-        // never acts on a discard-owned row, so nothing else reads it.
-        claimed = { pending: { ...current, expiryStartedAt: discardedAt, expiresAt: discardedAt }, receipt };
-        return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
-      },
-      { skipIfUnchanged: true, keepPendingResume: true },
-    );
-    return claimed;
-  }
-
-  /**
-   * Settlement + phase two for a discard claim. Idempotent: replays, the
-   * pending-deadline reconciler (live timer, hydrate, cold sweep) and the
-   * original caller may all drive it; the clear is fenced to the claim.
-   */
-  private async _completeDiscardedPendingInteraction(
-    claimedPending: PendingResume,
-    receipt: InboxResponseReceipt,
-    opts: { drainQueue?: boolean } = {},
-  ): Promise<boolean> {
-    const discardedAt = receipt.discardedAt;
-    if (discardedAt === undefined || claimedPending.expiryStartedAt !== discardedAt) return false;
-    const discardError = this._discardedErrorForReceipt(receipt);
-    const projectedError = projectHarnessPublicError(discardError);
-    const generation = {
-      kind: claimedPending.kind,
-      itemId: claimedPending.itemId ?? claimedPending.toolCallId,
-      runId: claimedPending.runId,
-      toolCallId: claimedPending.toolCallId,
-      pendingRequestedAt: claimedPending.requestedAt,
-    };
-    const queuedItemId = this._queuedItemIdForPendingResume(claimedPending);
-    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
-    if (queueReceipt?.signalId !== undefined) {
-      await this._writeQueueSignalResultEvidence({
-        status: 'failed',
-        signalId: queueReceipt.signalId,
-        runId: queueReceipt.runId,
-        error: projectedError,
-      });
-    }
-    if (claimedPending.originSignalId !== undefined) {
-      // Required, not best effort: if the signal evidence cannot be written,
-      // the claim stays as the (immediately due) recovery marker.
-      await this._settleSignalResult(
-        claimedPending.originSignalId,
-        { status: 'failed', runId: claimedPending.runId, error: projectedError },
-        undefined,
-        { strict: true },
-      );
-    }
-    // Settle a deferred terminal admission before the claim marker clears, so
-    // a failure here leaves the claimed row discoverable for retry.
-    await this._cancelTerminalizedPendingAdmission(claimedPending, projectedError, { settleAsDiscard: true });
-
-    let cleared = false;
-    let settledQueueReceipt: QueueAdmissionReceipt | undefined;
-    await this._flushUpdate(
-      prev => {
-        cleared = false;
-        settledQueueReceipt = undefined;
-        const current = prev.pendingResume;
-        if (
-          current === undefined ||
-          !pendingMatchesDiscardGeneration(current, generation) ||
-          current.expiryStartedAt !== discardedAt
-        ) {
-          return prev;
-        }
-        cleared = true;
-        const next: SessionRecord = { ...prev };
-        delete next.pendingResume;
-        if (queuedItemId !== undefined) {
-          next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
-          const queued = prev.queueAdmissionReceipts?.[queuedItemId];
-          settledQueueReceipt = queued;
-          if (queued && queued.status !== 'completed' && queued.status !== 'failed' && queued.status !== 'dead') {
-            settledQueueReceipt = {
-              ...queued,
-              status: 'failed',
-              error: projectedError,
-              failedAt: queued.failedAt ?? discardedAt,
-              updatedAt: discardedAt,
-            };
-            next.queueAdmissionReceipts = {
-              ...(prev.queueAdmissionReceipts ?? {}),
-              [queuedItemId]: settledQueueReceipt,
-            };
-          }
-        }
-        return next;
-      },
-      { skipIfUnchanged: true },
-    );
-    if (!cleared) return false;
-
-    this._clearPendingInteractionExpiryTimer();
-    this._replacementToolSurface.drop(claimedPending.runId);
-    if (queuedItemId !== undefined) {
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(discardError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(settledQueueReceipt?.runId ? { runId: settledQueueReceipt.runId } : {}),
-        ...(settledQueueReceipt?.signalId ? { signalId: settledQueueReceipt.signalId } : {}),
-        ...(settledQueueReceipt?.admissionId ? { admissionId: settledQueueReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    // The parked run has no live owner (the claim refuses discards while a
-    // turn owns the interaction); close it here. Tool rows and agent_end
-    // belong to a live turn when one is running, so leave those alone.
-    const turnActive = this._currentTurnAbortController !== undefined;
-    if (!turnActive) this._releaseParkedRun(claimedPending);
-    if (!turnActive) this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: claimedPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    if (!turnActive) this._emitAgentEnd({ runId: claimedPending.runId, finishReason: 'error' });
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return true;
-  }
-
-  /**
-   * PF-8122: a suspension settled with no live turn (discarded, expired or stopped)
-   * leaves its agent run parked on the thread, and a parked run holds the
-   * thread until the suspended-run TTL sweeps it, so the next message cannot
-   * start a fresh run. Abort that parked run so the thread is free again.
-   */
-  private _releaseParkedRun(pending: PendingResume): void {
-    try {
-      const { agent } = this._harness._resolveAgentForRuntimeDependencies(
-        this._runtimeDependenciesForPendingResume(pending),
-        'settled pending interaction release',
-      );
-      agent.abortRunStream(pending.runId);
-    } catch (err) {
-      // The interaction is already settled; the TTL sweep still releases the run.
-      console.error('[harness/v1] parked run release after a settled pending interaction failed:', err);
-    }
-  }
-
-  /** The discard receipt whose claim is stamped on `pending`, if any. */
-  private _discardClaimForPending(pending: PendingResume): InboxResponseReceipt | undefined {
-    return discardClaimReceipt(this._record, pending);
-  }
-
-  private _findDiscardReceipt(generation: DiscardGeneration): InboxResponseReceipt | undefined {
-    return findDiscardReceiptIn(this._record, generation);
+  discardPendingInteraction(opts: DiscardPendingInteractionOptions): Promise<DiscardPendingInteractionResult> {
+    return discardPendingInteraction(this._pendingInteractionsPort(), opts);
   }
 
   /** The discard receipt for the suspended call `output` parked on, if discarded. */
@@ -15490,66 +13665,6 @@ export class Session {
     return Object.values(this._record.inboxResponseReceipts ?? {}).find(
       receipt => receipt.discardedAt !== undefined && receipt.runId === runId && receipt.toolCallId === toolCallId,
     );
-  }
-
-  /** Throw the typed discard outcome when `pending`'s generation was discarded. */
-  private _throwIfPendingGenerationDiscarded(pending: PendingResume): void {
-    const discard = this._findDiscardReceipt({
-      kind: pending.kind,
-      itemId: pending.itemId ?? pending.toolCallId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      pendingRequestedAt: pending.requestedAt,
-    });
-    if (discard !== undefined) throw this._discardedErrorForReceipt(discard);
-  }
-
-  private _discardedErrorForReceipt(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
-    const reason = (receipt.response as { reason?: unknown } | undefined)?.reason;
-    return new HarnessPendingInteractionDiscardedError(
-      this.id,
-      receipt.itemId,
-      typeof reason === 'string' ? reason : 'discarded',
-    );
-  }
-
-  private _discardPendingInteractionFailure(err: unknown, responseId: string): unknown {
-    // Storage errors raised inside the discard's own writes (e.g. the claim
-    // rejected by the record size budget) carry the discard's response subject.
-    if (err instanceof HarnessStorageError && err.operation !== 'inbox_response') {
-      return new HarnessStorageError({
-        operation: 'inbox_response',
-        cause: err.cause ?? err,
-        retryable: err.retryable,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        harnessName: this._record.harnessName,
-        subject: { kind: 'inbox_response', id: responseId },
-      });
-    }
-    if (
-      err instanceof HarnessError ||
-      err instanceof HarnessStorageError ||
-      err instanceof HarnessValidationError ||
-      err instanceof HarnessInboxResponseConflictError ||
-      err instanceof HarnessSessionClosedError ||
-      err instanceof HarnessSessionClosingError ||
-      err instanceof HarnessSessionDeletedError ||
-      err instanceof HarnessSessionLockedError
-    ) {
-      return err;
-    }
-    return new HarnessStorageError({
-      operation: 'inbox_response',
-      cause: err,
-      retryable: true,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      harnessName: this._record.harnessName,
-      subject: { kind: 'inbox_response', id: responseId },
-    });
   }
 
   // -------------------------------------------------------------------------
@@ -15833,7 +13948,12 @@ export class Session {
       return await this._resumeAnswer(expectedKind, resumeData, responseOptions, progress);
     } catch (err) {
       if (err instanceof HarnessPendingInteractionDiscardedError || !progress.validated) throw err;
-      const discard = this._discardReceiptForAnswer(expectedKind, responseOptions, progress.pending);
+      const discard = discardReceiptForAnswer(
+        this._pendingInteractionsPort(),
+        expectedKind,
+        responseOptions,
+        progress.pending,
+      );
       if (discard === undefined) throw err;
       const reason = (discard.response as { reason?: unknown } | undefined)?.reason;
       throw new HarnessPendingInteractionDiscardedError(
@@ -15843,39 +13963,6 @@ export class Session {
         { cause: err },
       );
     }
-  }
-
-  /**
-   * The discard receipt owning the generation this answer targeted: the
-   * answer's explicit generation fields when present, else the pending
-   * interaction it observed on entry.
-   */
-  private _discardReceiptForAnswer(
-    expectedKind: PendingResume['kind'],
-    responseOptions: InboxResponseOptions,
-    observed: PendingResume | undefined,
-  ): InboxResponseReceipt | undefined {
-    const options = responseOptions as Record<string, unknown>;
-    const itemId = getOwnRecordValue(options, 'itemId');
-    const runId = getOwnRecordValue(options, 'runId');
-    const toolCallId = getOwnRecordValue(options, 'toolCallId');
-    const pendingRequestedAt = getOwnRecordValue(options, 'pendingRequestedAt');
-    if (
-      typeof itemId === 'string' &&
-      typeof runId === 'string' &&
-      typeof toolCallId === 'string' &&
-      typeof pendingRequestedAt === 'number'
-    ) {
-      return this._findDiscardReceipt({ kind: expectedKind, itemId, runId, toolCallId, pendingRequestedAt });
-    }
-    if (observed === undefined || observed.kind !== expectedKind) return undefined;
-    return this._findDiscardReceipt({
-      kind: observed.kind,
-      itemId: observed.itemId ?? observed.toolCallId,
-      runId: observed.runId,
-      toolCallId: observed.toolCallId,
-      pendingRequestedAt: observed.requestedAt,
-    });
   }
 
   private async _resumeAnswer(
@@ -15952,14 +14039,22 @@ export class Session {
     const storedReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
     if (storedReceipt !== undefined) {
-      const duplicate = this._resolveStoredInboxResponse(expectedKind, resumeData, responseOptions);
+      const duplicate = resolveStoredInboxResponse(
+        this._pendingInteractionsPort(),
+        expectedKind,
+        resumeData,
+        responseOptions,
+      );
       const retryClaim = storedReceipt.status === 'failed' && storedReceipt.retryable === true;
       if (!retryClaim && storedReceipt.status === 'applied') {
         return duplicate!;
       }
       if (!retryClaim && this._record.pendingResume === undefined) {
-        const recoveredReceipt = await this._applyInboxReceiptFromCompletedQueue(storedReceipt);
-        if (recoveredReceipt) return this._inboxReceiptResult(recoveredReceipt, true);
+        const recoveredReceipt = await applyInboxReceiptFromCompletedQueue(
+          this._pendingInteractionsPort(),
+          storedReceipt,
+        );
+        if (recoveredReceipt) return inboxReceiptResult(this._pendingInteractionsPort(), recoveredReceipt, true);
         return duplicate!;
       }
       // The original caller owns the in-flight resume. A later delivery of the
@@ -15988,7 +14083,7 @@ export class Session {
       typeof requestedToolCallId === 'string' &&
       typeof requestedPendingRequestedAt === 'number'
     ) {
-      const discarded = this._findDiscardReceipt({
+      const discarded = findDiscardReceipt(this._pendingInteractionsPort(), {
         kind: expectedKind,
         itemId: requestedItemId,
         runId: requestedRunId,
@@ -15997,12 +14092,14 @@ export class Session {
       });
       if (discarded !== undefined) {
         const claimed = this._record.pendingResume;
-        if (claimed !== undefined && this._discardClaimForPending(claimed) === discarded) {
+        if (claimed !== undefined && discardClaimForPending(this._pendingInteractionsPort(), claimed) === discarded) {
           // Best effort: the claim is durable and the deadline reconciler
           // retries the clear, so the answer still gets the discard outcome.
-          await this._completeDiscardedPendingInteraction(claimed, discarded).catch(() => false);
+          await completeDiscardedPendingInteraction(this._pendingInteractionsPort(), claimed, discarded).catch(
+            () => false,
+          );
         }
-        throw this._discardedErrorForReceipt(discarded);
+        throw discardedErrorForReceipt(this._pendingInteractionsPort(), discarded);
       }
     }
 
@@ -16074,12 +14171,14 @@ export class Session {
         'the pending tool approval has no grantable tool name',
       );
     }
-    const pendingExpiresAt = this._pendingInteractionExpiresAt(pending);
+    const pendingExpiresAt = pendingInteractionExpiresAt(this._pendingInteractionsPort(), pending);
     // A discard-claimed generation is resolved by its discard, never expired.
-    const discardClaim = this._discardClaimForPending(pending);
+    const discardClaim = discardClaimForPending(this._pendingInteractionsPort(), pending);
     if (discardClaim !== undefined) {
-      await this._completeDiscardedPendingInteraction(pending, discardClaim).catch(() => false);
-      throw this._discardedErrorForReceipt(discardClaim);
+      await completeDiscardedPendingInteraction(this._pendingInteractionsPort(), pending, discardClaim).catch(
+        () => false,
+      );
+      throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardClaim);
     }
     if (pending.expiryStartedAt !== undefined || (pending.resumedAt === undefined && Date.now() >= pendingExpiresAt)) {
       const expiryOutcome = await this._expirePendingInteraction({
@@ -16091,7 +14190,7 @@ export class Session {
         expiresAt: pendingExpiresAt,
       });
       // A discard that won while this answer was in flight is the outcome.
-      this._throwIfPendingGenerationDiscarded(pending);
+      throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), pending);
       const didExpire = expiryOutcome === 'expired';
       const generationKey = pendingInteractionGenerationKey({
         kind: pending.kind,
@@ -16123,7 +14222,7 @@ export class Session {
     const existingReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
     if (existingReceipt !== undefined) {
-      this._assertMatchingInboxReceipt(existingReceipt, {
+      assertMatchingInboxReceipt(this._pendingInteractionsPort(), existingReceipt, {
         kind: expectedKind,
         itemId,
         responseId: responseId!,
@@ -16131,12 +14230,12 @@ export class Session {
       });
       const retryClaim = existingReceipt.status === 'failed' && existingReceipt.retryable === true;
       if (!retryClaim) {
-        this._throwStoredInboxResponseFailure(existingReceipt);
+        throwStoredInboxResponseFailure(this._pendingInteractionsPort(), existingReceipt);
         if (
           responseMode === 'inbox-receipt' &&
           (pending.resumedAt === undefined || existingReceipt.status === 'applied')
         ) {
-          return this._inboxReceiptResult(existingReceipt, true);
+          return inboxReceiptResult(this._pendingInteractionsPort(), existingReceipt, true);
         }
         if (existingReceipt.status === 'applied' && existingReceipt.result !== undefined) {
           return existingReceipt.result as AgentResult;
@@ -16156,31 +14255,42 @@ export class Session {
         // execution and then failed inside terminal settlement. Re-drive the
         // durable bookkeeping from the cached run output — this marks this
         // receipt applied — before falling back to stale-recovery handling.
-        const settled = await this._maybeFinalizeRetriedResumedTerminal(pending, resumeData, {
-          expectedKind,
-          responseMode,
-          responseId,
-        });
+        const settled = await maybeFinalizeRetriedResumedTerminal(
+          this._pendingInteractionsPort(),
+          pending,
+          resumeData,
+          {
+            expectedKind,
+            responseMode,
+            responseId,
+          },
+        );
         if (settled !== undefined) return settled;
         const recovery = await this._maybeRecoverStaleQueuedResume();
         if (recovery.status === 'completed') {
-          await this._markInboxResponseApplied(existingReceipt.responseId, recovery.result);
+          await markInboxResponseApplied(this._pendingInteractionsPort(), existingReceipt.responseId, recovery.result);
           const receipt =
             getOwnRecordValue(this._record.inboxResponseReceipts, existingReceipt.responseId) ?? existingReceipt;
-          return this._inboxReceiptResult(receipt, true);
+          return inboxReceiptResult(this._pendingInteractionsPort(), receipt, true);
         }
         if (recovery.status === 'stale') {
           throw new ResumeRecoveryStaleError();
         }
         if (
           this._currentTurnAbortController === undefined &&
-          this._queuedItemIdForPendingResume(pending) === undefined &&
-          Date.now() >= this._pendingInteractionDueAt(pending)
+          queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending) === undefined &&
+          Date.now() >= pendingInteractionDueAt(this._pendingInteractionsPort(), pending)
         ) {
           const stale = new ResumeRecoveryStaleError();
-          if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
+          if (
+            await recoverStaleResumeAdmission(
+              this._pendingInteractionsPort(),
+              this._pendingInteractionGeneration(pending),
+            )
+          )
+            throw stale;
         }
-        return this._inboxReceiptResult(existingReceipt, true);
+        return inboxReceiptResult(this._pendingInteractionsPort(), existingReceipt, true);
       }
       const recovery = await this._maybeRecoverStaleQueuedResume();
       if (recovery.status === 'completed') {
@@ -16202,7 +14312,7 @@ export class Session {
       // still cached and a pending admission exists, re-drive the settlement
       // and the remaining durable bookkeeping from it instead of re-running
       // the provider.
-      const settled = await this._maybeFinalizeRetriedResumedTerminal(pending, resumeData, {
+      const settled = await maybeFinalizeRetriedResumedTerminal(this._pendingInteractionsPort(), pending, resumeData, {
         expectedKind,
         responseMode,
         responseId,
@@ -16210,11 +14320,17 @@ export class Session {
       if (settled !== undefined) return settled;
       if (
         this._currentTurnAbortController === undefined &&
-        this._queuedItemIdForPendingResume(pending) === undefined &&
-        Date.now() >= this._pendingInteractionDueAt(pending)
+        queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending) === undefined &&
+        Date.now() >= pendingInteractionDueAt(this._pendingInteractionsPort(), pending)
       ) {
         const stale = new ResumeRecoveryStaleError();
-        if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
+        if (
+          await recoverStaleResumeAdmission(
+            this._pendingInteractionsPort(),
+            this._pendingInteractionGeneration(pending),
+          )
+        )
+          throw stale;
       }
       throw new HarnessValidationError(
         `respond[${expectedKind}]`,
@@ -16222,7 +14338,7 @@ export class Session {
       );
     }
 
-    const pendingQueuedItemId = this._queuedItemIdForPendingResume(pending);
+    const pendingQueuedItemId = queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending);
     if (pendingQueuedItemId !== undefined) {
       this._ensureQueuedItemContext(pendingQueuedItemId);
     }
@@ -16235,15 +14351,16 @@ export class Session {
     // check catches the pending-record path.
     const modeFlipTarget =
       expectedKind === 'plan-approval'
-        ? this._resolvePlanApprovalModeFlipTarget(
+        ? resolvePlanApprovalModeFlipTarget(
+            this._pendingInteractionsPort(),
             pending,
             resumeData as { approved: boolean; transitionToMode?: string },
           )
         : undefined;
 
     const previousModeId = this._record.modeId;
-    const resumeModeId = this._modeIdForPendingResume(pending);
-    const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
+    const resumeModeId = modeIdForPendingResume(this._pendingInteractionsPort(), pending);
+    const resumeRuntimeDependencies = runtimeDependenciesForPendingResume(this._pendingInteractionsPort(), pending);
     const resumeMode = this._harness._getMode(resumeModeId);
     let resumeToolSurface = this._buildToolSurface(resumeMode);
     if (pending.toolSurfaceFence !== undefined) {
@@ -16271,7 +14388,8 @@ export class Session {
       let thrown = err;
       if (responseId !== undefined) {
         try {
-          await this._recordInboxResponsePreDispatchFailure(
+          await recordInboxResponsePreDispatchFailure(
+            this._pendingInteractionsPort(),
             {
               responseId,
               responseHash: responseHash!,
@@ -16342,7 +14460,8 @@ export class Session {
         // registers that version.
         if (responseId !== undefined && !(resumeRefusal instanceof HarnessTerminalFinalizationPendingError)) {
           try {
-            await this._recordInboxResponsePreDispatchFailure(
+            await recordInboxResponsePreDispatchFailure(
+              this._pendingInteractionsPort(),
               {
                 responseId,
                 responseHash: responseHash!,
@@ -16411,7 +14530,7 @@ export class Session {
       const retryableReceipt =
         currentReceipt?.status === 'failed' && currentReceipt.retryable === true ? currentReceipt : undefined;
       if (currentReceipt !== undefined && retryableReceipt === undefined) {
-        this._assertMatchingInboxReceipt(currentReceipt, {
+        assertMatchingInboxReceipt(this._pendingInteractionsPort(), currentReceipt, {
           kind: expectedKind,
           itemId,
           responseId: currentReceipt.responseId,
@@ -16438,7 +14557,7 @@ export class Session {
       }
 
       const admissionAt = Date.now();
-      if (admissionAt >= this._pendingInteractionExpiresAt(currentPending)) {
+      if (admissionAt >= pendingInteractionExpiresAt(this._pendingInteractionsPort(), currentPending)) {
         expiredBeforeAdmission = currentPending;
         return prev;
       }
@@ -16511,7 +14630,7 @@ export class Session {
       this._emitter.emit({ type: 'permission_granted', toolName: grantedToolAfterAdmission });
     }
     if (discardedBeforeAdmission !== undefined) {
-      throw this._discardedErrorForReceipt(discardedBeforeAdmission);
+      throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardedBeforeAdmission);
     }
     if (cancelledBeforeResume !== undefined) {
       throw new HarnessSessionCancelledError(this.id, cancelledBeforeResume.reason);
@@ -16521,7 +14640,7 @@ export class Session {
     }
     // The admission lost to a `discardPendingInteraction` claim that
     // committed after this answer's pre-admission checks: report the discard.
-    if (resumedAt === undefined) this._throwIfPendingGenerationDiscarded(pending);
+    if (resumedAt === undefined) throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), pending);
     if (expiredBeforeAdmission !== undefined) {
       const expired = expiredBeforeAdmission;
       await this._expirePendingInteraction({
@@ -16530,18 +14649,18 @@ export class Session {
         runId: expired.runId,
         toolCallId: expired.toolCallId,
         requestedAt: expired.requestedAt,
-        expiresAt: this._pendingInteractionExpiresAt(expired),
+        expiresAt: pendingInteractionExpiresAt(this._pendingInteractionsPort(), expired),
       });
-      this._throwIfPendingGenerationDiscarded(expired);
+      throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), expired);
       throw new HarnessPendingInteractionExpiredError(
         this.id,
         expired.itemId ?? expired.toolCallId,
-        this._pendingInteractionExpiresAt(expired),
+        pendingInteractionExpiresAt(this._pendingInteractionsPort(), expired),
       );
     }
     if (duplicateReceiptAfterAdmission !== undefined) {
-      this._throwStoredInboxResponseFailure(duplicateReceiptAfterAdmission);
-      return this._inboxReceiptResult(duplicateReceiptAfterAdmission, true);
+      throwStoredInboxResponseFailure(this._pendingInteractionsPort(), duplicateReceiptAfterAdmission);
+      return inboxReceiptResult(this._pendingInteractionsPort(), duplicateReceiptAfterAdmission, true);
     }
     if (pendingAlreadyResumedAfterAdmission) {
       const recovery = await this._maybeRecoverStaleQueuedResume();
@@ -16719,7 +14838,7 @@ export class Session {
         this._emitAbortedToolEnds({ force: true });
       }
       full = this._materializeHarnessRunOutput(pending.runId, full);
-      const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
+      const resumedQueuedItemId = queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
           this._markQueuedTurnCompleted(resumedQueuedItemId, full, { modeId: modeFlipTarget }),
@@ -16945,7 +15064,7 @@ export class Session {
     if (responseMode === 'inbox-receipt') {
       const receipt =
         responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
-      if (receipt) return this._inboxReceiptResult(receipt, false);
+      if (receipt) return inboxReceiptResult(this._pendingInteractionsPort(), receipt, false);
     }
     return full as AgentResult;
   }
@@ -17000,7 +15119,8 @@ export class Session {
         : undefined;
     const suspendedPending =
       suspendedPayload !== undefined
-        ? this._pendingResumeFromSuspendedOutput(
+        ? pendingResumeFromSuspendedOutput(
+            this._pendingInteractionsPort(),
             full,
             suspendedPayload,
             pendingQueuedItemId,
@@ -17011,7 +15131,7 @@ export class Session {
         : undefined;
     const suspendedTokenUsageDelta =
       full.finishReason === 'suspended'
-        ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage)
+        ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, pending.accountedTokenUsage)
         : undefined;
     if (full.finishReason === 'suspended') this._captureTurnRunId(full);
     // `_recordTurnCompletion` mutates the live counter immediately (unlike the
@@ -17038,7 +15158,7 @@ export class Session {
       // Arm the durable fence: the live counter already holds this delta, so
       // every flush until the pending clears must persist the advanced
       // baseline alongside it — a cold retry then computes a zero delta.
-      const runUsage = this._tokenUsageDeltaFromFullOutput(full);
+      const runUsage = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
       if (runUsage !== undefined) {
         this._resumeUsageFence.arm(resumeAccountingKey, runUsage);
       }
@@ -17081,7 +15201,11 @@ export class Session {
         let tokenUsageDelta: TokenUsage | undefined;
         try {
           this._captureTurnRunId(full);
-          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
+          tokenUsageDelta = tokenUsageDeltaFromFullOutput(
+            this._pendingInteractionsPort(),
+            full,
+            pending.accountedTokenUsage,
+          );
           alreadyAccounted = true;
           this._messageTokenLedger.markAccounted(pending.runId);
           await Promise.race([
@@ -17116,7 +15240,8 @@ export class Session {
     // pending and recoverable only while a retry of the same responseId can
     // still reach this settlement.
     if (full.finishReason !== 'suspended') {
-      await this._settleResumedTerminalHandoff(
+      await settleResumedTerminalHandoff(
+        this._pendingInteractionsPort(),
         pending,
         full,
         { modeId: resumeModeId, modelId: resumeModelId },
@@ -17266,7 +15391,7 @@ export class Session {
     // fenced out of the pending write must not announce a suspension that
     // durable state never recorded.
     if (suspendedPending !== undefined && this._record.pendingResume === suspendedPending) {
-      this._emitPendingEvent(suspendedPending);
+      emitPendingEvent(this._pendingInteractionsPort(), suspendedPending);
     }
 
     // If the record size budget expired the re-suspension during the park
@@ -17362,7 +15487,9 @@ export class Session {
     const { pending, resumedAt, responseId, queuedItemId, modeFlipTarget, previousModeId, full, error } = input;
     const failedAt = Date.now();
     const projectedError = projectHarnessPublicError(error);
-    const usageDelta = full ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage) : undefined;
+    const usageDelta = full
+      ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, pending.accountedTokenUsage)
+      : undefined;
     let terminalized = false;
     let usageDeltaToPersist: TokenUsage | undefined;
     let failedQueueReceipt: QueueAdmissionReceipt | undefined;
@@ -17507,187 +15634,6 @@ export class Session {
     return true;
   }
 
-  private _resolveStoredInboxResponse(
-    expectedKind: PendingResume['kind'],
-    resumeData: unknown,
-    responseOptions: InboxResponseOptions,
-  ): InboxResponseResult | undefined {
-    const responseId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'responseId');
-    if (typeof responseId !== 'string') return undefined;
-    const receipt = getOwnRecordValue(this._record.inboxResponseReceipts, responseId);
-    if (receipt === undefined) return undefined;
-    if (receipt.kind !== expectedKind) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    const requestedItemId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'itemId');
-    if (requestedItemId !== undefined && typeof requestedItemId !== 'string') {
-      throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'itemId must be a string');
-    }
-    if (requestedItemId !== undefined && receipt.itemId !== requestedItemId) {
-      throw new HarnessInboxItemNotFoundError(
-        this.id,
-        requestedItemId,
-        expectedKind === 'sandbox-access' ? undefined : expectedKind,
-      );
-    }
-    const requestedRunId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'runId');
-    const requestedToolCallId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'toolCallId');
-    const requestedPendingRequestedAt = getOwnRecordValue(
-      responseOptions as Record<string, unknown>,
-      'pendingRequestedAt',
-    );
-    if (
-      receipt.runId !== requestedRunId ||
-      receipt.toolCallId !== requestedToolCallId ||
-      receipt.pendingRequestedAt !== requestedPendingRequestedAt
-    ) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    // A retried answer reusing the responseId of a `discardPendingInteraction`
-    // replays the discard outcome rather than a payload conflict.
-    if (receipt.discardedAt !== undefined) {
-      throw this._discardedErrorForReceipt(receipt);
-    }
-    const attemptedHash = this._computeInboxResponseHash({
-      kind: expectedKind,
-      itemId: receipt.itemId,
-      runId: receipt.runId,
-      pendingRequestedAt: receipt.pendingRequestedAt,
-      response: resumeData,
-      ...(expectedKind === 'tool-approval' ? { approvalScope: responseOptions.approvalScope ?? 'once' } : {}),
-    });
-    if (attemptedHash !== receipt.responseHash) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    this._throwStoredInboxResponseFailure(receipt);
-    return this._inboxReceiptResult(receipt, true);
-  }
-
-  private _assertMatchingInboxReceipt(
-    receipt: InboxResponseReceipt,
-    input: { kind: PendingResume['kind']; itemId: string; responseId: string; responseHash: string },
-  ): void {
-    if (receipt.kind !== input.kind || receipt.itemId !== input.itemId || receipt.responseHash !== input.responseHash) {
-      throw new HarnessInboxResponseConflictError(this.id, input.itemId, input.responseId);
-    }
-  }
-
-  private _inboxReceiptResult(receipt: InboxResponseReceipt, duplicate: boolean): InboxResponseResult {
-    return {
-      itemId: receipt.itemId,
-      kind: receipt.kind,
-      status: receipt.status === 'applied' ? 'applied' : 'accepted',
-      responseId: receipt.responseId,
-      duplicate,
-    };
-  }
-
-  private _throwStoredInboxResponseFailure(receipt: InboxResponseReceipt): void {
-    if (receipt.status !== 'failed' && receipt.status !== 'dead') return;
-    if (receipt.status === 'failed' && receipt.retryable === true) return;
-    throw publicErrorProjectionToError(
-      receipt.error ?? { code: 'harness.inbox_response_failed', message: 'inbox response failed' },
-    );
-  }
-
-  private async _applyInboxReceiptFromCompletedQueue(
-    receipt: InboxResponseReceipt,
-  ): Promise<InboxResponseReceipt | undefined> {
-    if (receipt.queuedItemId === undefined) return undefined;
-    const completed = this._record.queueAdmissionReceipts?.[receipt.queuedItemId];
-    if (completed?.status !== 'completed' || completed.runId !== receipt.runId || completed.result === undefined) {
-      return undefined;
-    }
-    await this._markInboxResponseApplied(receipt.responseId, completed.result as AgentResult);
-    return getOwnRecordValue(this._record.inboxResponseReceipts, receipt.responseId) ?? receipt;
-  }
-
-  private async _markInboxResponseApplied(responseId: string, result: AgentResult): Promise<void> {
-    const appliedAt = Date.now();
-    await this._flushUpdate(prev => {
-      const receipt = getOwnRecordValue(prev.inboxResponseReceipts, responseId);
-      if (!receipt || receipt.status === 'applied' || receiptGenerationDiscarded(prev, receipt)) return prev;
-      return {
-        ...prev,
-        inboxResponseReceipts: {
-          ...(prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'applied',
-            result,
-            appliedAt: receipt.appliedAt ?? appliedAt,
-            updatedAt: appliedAt,
-          },
-        },
-      };
-    });
-  }
-
-  private async _recordInboxResponsePreDispatchFailure(
-    input: {
-      responseId: string;
-      responseHash: string;
-      itemId: string;
-      queuedItemId?: string;
-      kind: PendingResume['kind'];
-      pending: PendingResume;
-      response: unknown;
-      approvalScope?: 'once' | 'always';
-    },
-    err: unknown,
-  ): Promise<void> {
-    const failedAt = Date.now();
-    await this._flushUpdate(prev => {
-      // Never persist a contrary refusal for a generation a discard owns.
-      if (
-        findDiscardReceiptIn(prev, {
-          kind: input.kind,
-          itemId: input.itemId,
-          runId: input.pending.runId,
-          toolCallId: input.pending.toolCallId,
-          pendingRequestedAt: input.pending.requestedAt,
-        }) !== undefined
-      ) {
-        return prev;
-      }
-      const currentReceipt = getOwnRecordValue(prev.inboxResponseReceipts, input.responseId);
-      if (currentReceipt !== undefined) {
-        this._assertMatchingInboxReceipt(currentReceipt, {
-          kind: input.kind,
-          itemId: input.itemId,
-          responseId: input.responseId,
-          responseHash: input.responseHash,
-        });
-        return prev;
-      }
-      return {
-        ...prev,
-        inboxResponseReceipts: {
-          ...(prev.inboxResponseReceipts ?? {}),
-          [input.responseId]: {
-            responseId: input.responseId,
-            responseHash: input.responseHash,
-            resumeAttemptId: input.responseId,
-            itemId: input.itemId,
-            ...(input.queuedItemId !== undefined ? { queuedItemId: input.queuedItemId } : {}),
-            kind: input.kind,
-            runId: input.pending.runId,
-            toolCallId: input.pending.toolCallId,
-            pendingRequestedAt: input.pending.requestedAt,
-            response: input.response,
-            ...(input.approvalScope !== undefined ? { approvalScope: input.approvalScope } : {}),
-            status: 'failed',
-            error: projectHarnessPublicError(err),
-            retryable: false,
-            acceptedAt: failedAt,
-            failedAt,
-            updatedAt: failedAt,
-          } satisfies InboxResponseReceipt,
-        },
-      };
-    });
-  }
-
   private async _markInboxResponseFailed(responseId: string, err: unknown): Promise<void> {
     const failedAt = Date.now();
     await this._flushUpdate(prev => {
@@ -17726,38 +15672,13 @@ export class Session {
     response: unknown;
     approvalScope?: 'once' | 'always';
   }): string {
-    return sha256CanonicalJson(input);
-  }
-
-  private _queuedItemIdForPendingResume(pending: PendingResume): string | undefined {
-    if (pending.queuedItemId !== undefined) return pending.queuedItemId;
-    if (this._queueHead.currentId !== undefined) return this._queueHead.currentId;
-    return (this._record.pendingQueue ?? []).find(item => {
-      const receipt = this._record.queueAdmissionReceipts?.[item.id];
-      return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === pending.runId;
-    })?.id;
-  }
-
-  private _modeIdForPendingResume(pending: PendingResume): string {
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
-    const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    return pending.modeId ?? receipt?.modeId ?? queuedItem?.mode ?? this._record.modeId;
+    return computeInboxResponseHash(this._pendingInteractionsPort(), input);
   }
 
   private _modelIdForQueuedItem(queuedItemId: string | undefined): string {
     const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
     const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
     return queuedItem?.model ?? receipt?.runtimeDependencies?.modelId ?? this._record.modelId;
-  }
-
-  private _runtimeDependenciesForPendingResume(pending: PendingResume): HarnessRuntimeDependencyRefs {
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
-    const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    const modeId = this._modeIdForPendingResume(pending);
-    const modelId = queuedItem?.model ?? this._record.modelId;
-    return pending.runtimeDependencies ?? receipt?.runtimeDependencies ?? { modeId, ...(modelId ? { modelId } : {}) };
   }
 
   /**
@@ -17839,97 +15760,10 @@ export class Session {
     return reverted;
   }
 
-  private async _maybeRecoverStaleQueuedResume({
+  private _maybeRecoverStaleQueuedResume({
     kickDrainOnStale = true,
   }: { kickDrainOnStale?: boolean } = {}): Promise<QueueResumeRecoveryResult> {
-    if (this._currentTurnAbortController !== undefined) return { status: 'none' };
-    const pending = this._record.pendingResume;
-    if (pending?.resumedAt === undefined) return { status: 'none' };
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    if (queuedItemId === undefined) return { status: 'none' };
-    // §10.2: no queue_item_replayed event on crash-recovery — the recovered
-    // turn flows through normal drain/agent_start; settlement evidence stays durable.
-    this._ensureQueuedItemContext(queuedItemId);
-
-    const currentReceipt = this._record.queueAdmissionReceipts?.[queuedItemId];
-    if (currentReceipt?.status === 'completed') {
-      const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
-      const shouldRunPostRunSideEffects = queuedItem !== undefined && currentReceipt.postRunFinalizedAt === undefined;
-      let alreadyAccounted = false;
-      if (shouldRunPostRunSideEffects) {
-        let tokenUsageDelta: TokenUsage | undefined;
-        try {
-          const full = currentReceipt.result as FullOutput<unknown>;
-          this._captureTurnRunId(full);
-          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
-          alreadyAccounted = true;
-          this._messageTokenLedger.markAccounted(pending.runId);
-          await this._markQueuedPostRunFinalized(queuedItemId, { tokenUsageDelta });
-        } catch (err) {
-          this._deferQueuedTurnRetry(
-            new QueuePostRunFinalizationPendingError(Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS, err),
-          );
-          return { status: 'none' };
-        }
-      }
-      await this._flushUpdate(prev => {
-        const current = prev.pendingResume;
-        if (
-          !current ||
-          current.runId !== pending.runId ||
-          current.toolCallId !== pending.toolCallId ||
-          current.resumedAt !== pending.resumedAt
-        ) {
-          return prev;
-        }
-        const next: SessionRecord = {
-          ...prev,
-          pendingQueue: (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId),
-        };
-        delete next.pendingResume;
-        return next;
-      });
-      if (shouldRunPostRunSideEffects && queuedItem) {
-        await this._finalizeQueuedRunCompletion(
-          queuedItem,
-          currentReceipt.result as FullOutput<unknown>,
-          pending.modeId ?? currentReceipt.modeId ?? queuedItem.mode ?? this._record.modeId,
-          undefined,
-          { skipTokenAccounting: alreadyAccounted },
-        );
-      }
-      this._queueHead.release();
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.resolve(currentReceipt.result as AgentResult);
-      }
-      this._notifyMaybeIdle();
-      void this._maybeDrainQueue();
-      return { status: 'completed', result: currentReceipt.result as AgentResult };
-    }
-
-    const retryAt = pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    if (Date.now() < retryAt) {
-      if (this._queuedResumeRecoveryTimer === undefined) {
-        const delayMs = Math.max(0, retryAt - Date.now());
-        this._queuedResumeRecoveryTimer = setTimeout(() => {
-          this._queuedResumeRecoveryTimer = undefined;
-          void this._maybeDrainQueue();
-        }, delayMs);
-        this._queuedResumeRecoveryTimer.unref?.();
-      }
-      return { status: 'none' };
-    }
-
-    if (this._queuedResumeRecoveryTimer !== undefined) {
-      clearTimeout(this._queuedResumeRecoveryTimer);
-      this._queuedResumeRecoveryTimer = undefined;
-    }
-
-    const recovered = await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending), {
-      drainQueue: kickDrainOnStale,
-    });
-    return recovered ? { status: 'stale' } : { status: 'none' };
+    return maybeRecoverStaleQueuedResume(this._pendingInteractionsPort(), { kickDrainOnStale });
   }
 
   // -------------------------------------------------------------------------
@@ -19409,7 +17243,7 @@ export class Session {
       let tokenUsageDelta: TokenUsage | undefined;
       try {
         this._captureTurnRunId(full);
-        tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+        tokenUsageDelta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
         alreadyAccounted = true;
         if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
         await this._raceActiveTurnWaiter(
@@ -19543,7 +17377,7 @@ export class Session {
     const tokenUsageDelta = opts.skipTokenAccounting
       ? undefined
       : full.finishReason === 'suspended'
-        ? this._tokenUsageDeltaFromFullOutput(full)
+        ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full)
         : this._recordTurnCompletion(full, { persist: false });
     await this._raceActiveTurnWaiter(
       this._maybeCaptureSuspend(full, item.id, modeId ?? item.mode ?? this._record.modeId, undefined, {
@@ -19725,17 +17559,6 @@ export class Session {
   }
 
   /**
-   * [PF-7749] Whether a tool's interaction pre-registration belongs to this
-   * session's active run. A nested agent-as-tool run inherits this session's
-   * Harness slot but is not this session's run; its interaction stays with
-   * the suspend capture of the run that owns it. A registration without a run
-   * id targets the active run.
-   */
-  private _ownsPreRegistrationRun(runId: string | undefined): boolean {
-    return runId === undefined || runId === this._currentRunId;
-  }
-
-  /**
    * [PF-8221] Record the signal that owns `runId`. A concurrent `signal()` that
    * joins a run another signal already dispatched leaves that owner in place.
    */
@@ -19745,241 +17568,22 @@ export class Session {
     }
   }
 
-  /**
-   * [PF-8058] The origin a tool pre-registration stamps on its pending: the
-   * owned `signal()` turn's signal, when `runId` is the run that turn
-   * dispatched. This is the `originSignalId` the suspend capture would add.
-   */
-  private _preRegistrationOrigin(runId: string): { originSignalId?: string } {
-    const origin = this._ownedSignalTurnOrigin;
-    return origin !== undefined && origin.runId === runId ? { originSignalId: origin.signalId } : {};
-  }
-
-  private async _registerQuestion(
+  private _registerQuestion(
     params: RegisterQuestionParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerQuestion');
-    if (typeof params.questionId !== 'string' || params.questionId.length === 0) {
-      throw new HarnessValidationError('ctx.registerQuestion.questionId', 'must be a non-empty string');
-    }
-    if (typeof params.question !== 'string' || params.question.length === 0) {
-      throw new HarnessValidationError('ctx.registerQuestion.question', 'must be a non-empty string');
-    }
-    if (
-      params.selectionMode !== undefined &&
-      params.selectionMode !== 'single_select' &&
-      params.selectionMode !== 'multi_select'
-    ) {
-      throw new HarnessValidationError('ctx.registerQuestion.selectionMode', 'must be single_select or multi_select');
-    }
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.questionId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerQuestion.runId', 'active run id is required');
-    }
-    if (!this._ownsPreRegistrationRun(params.runId)) return;
-    const pending: PendingResume = {
-      kind: 'question',
-      itemId: params.questionId,
-      runId,
-      toolCallId,
-      toolName: ASK_USER_TOOL_NAME,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('question'),
-      modeId: params.modeId ?? this._record.modeId,
-      // §4.2e — carry the active turn's yolo so a later tool approval on the
-      // resumed run is still auto-granted (pre-registered pendings win over the
-      // suspend-capture merge, so yolo must be stamped here too).
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        params.modeId ?? this._record.modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        question: params.question,
-        ...(params.options ? { options: params.options } : {}),
-        ...(params.selectionMode ? { selectionMode: params.selectionMode } : {}),
-      },
-    };
-    let registered = false;
-    let occupied = false;
-    await this._flushUpdate(prev => {
-      const slot = preRegistrationSlot(prev.pendingResume, 'question', runId, toolCallId);
-      registered = slot === 'free';
-      occupied = slot === 'occupied';
-      return registered ? { ...prev, pendingResume: pending } : prev;
-    });
-    if (occupied) return;
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerQuestion(this._pendingInteractionsPort(), params);
   }
 
-  private async _registerSandboxAccess(
+  private _registerSandboxAccess(
     params: RegisterSandboxAccessParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerSandboxAccess');
-    if (typeof params.requestId !== 'string' || params.requestId.length === 0) {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.requestId', 'must be a non-empty string');
-    }
-    const validSemanticTypes = new Set(['file', 'command', 'network', 'mcp', 'custom']);
-    if (!validSemanticTypes.has(params.semanticType)) {
-      throw new HarnessValidationError(
-        'ctx.registerSandboxAccess.semanticType',
-        "must be one of 'file' | 'command' | 'network' | 'mcp' | 'custom'",
-      );
-    }
-    if (params.reason !== undefined && typeof params.reason !== 'string') {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.reason', 'must be a string when provided');
-    }
-    const sanitizedPayload =
-      params.payload !== undefined ? assertJsonValue(params.payload, 'ctx.registerSandboxAccess.payload') : undefined;
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.requestId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.runId', 'active run id is required');
-    }
-    const modeId = params.modeId ?? this._record.modeId;
-    const pending: PendingResume = {
-      kind: 'sandbox-access',
-      itemId: params.requestId,
-      runId,
-      toolCallId,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('sandbox-access'),
-      modeId,
-      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        sandboxAccess: {
-          semanticType: params.semanticType,
-          ...(params.reason !== undefined ? { reason: params.reason } : {}),
-          ...(sanitizedPayload !== undefined ? { payload: sanitizedPayload } : {}),
-        },
-      },
-    };
-    let registered = false;
-    await this._flushUpdate(prev => {
-      const current = prev.pendingResume;
-      if (current) {
-        const currentSandboxAccess = current.payload?.sandboxAccess;
-        if (
-          current.kind === 'sandbox-access' &&
-          current.runId === runId &&
-          current.toolCallId === toolCallId &&
-          current.itemId === params.requestId &&
-          currentSandboxAccess?.semanticType === params.semanticType &&
-          currentSandboxAccess?.reason === params.reason &&
-          jsonValuesEqual(currentSandboxAccess?.payload, sanitizedPayload)
-        ) {
-          return prev;
-        }
-        throw new HarnessValidationError('ctx.registerSandboxAccess', `pending resume is already "${current.kind}"`);
-      }
-      registered = true;
-      return { ...prev, pendingResume: pending };
-    });
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    // §10.2: sandbox/path-access has no dedicated event — it projects to
-    // question_pending via the captured pending resume.
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerSandboxAccess(this._pendingInteractionsPort(), params);
   }
 
-  private async _registerPlanApproval(
+  private _registerPlanApproval(
     params: RegisterPlanApprovalParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerPlanApproval');
-    if (typeof params.planId !== 'string' || params.planId.length === 0) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.planId', 'must be a non-empty string');
-    }
-    if (params.title !== undefined && typeof params.title !== 'string') {
-      throw new HarnessValidationError('ctx.registerPlanApproval.title', 'must be a string when provided');
-    }
-    if (typeof params.plan !== 'string' || params.plan.length === 0) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.plan', 'must be a non-empty string');
-    }
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.planId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.runId', 'active run id is required');
-    }
-    if (!this._ownsPreRegistrationRun(params.runId)) return;
-    const submittingModeId = params.modeId ?? this._record.modeId;
-    const submittingMode = this._harness._getMode(submittingModeId);
-    const pending: PendingResume = {
-      kind: 'plan-approval',
-      itemId: params.planId,
-      runId,
-      toolCallId,
-      toolName: SUBMIT_PLAN_TOOL_NAME,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('plan-approval'),
-      modeId: submittingModeId,
-      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        submittingModeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        ...(params.title !== undefined ? { title: params.title } : {}),
-        plan: params.plan,
-      },
-      ...(submittingMode.transitionsTo ? { transitionModeId: submittingMode.transitionsTo } : {}),
-    };
-    let registered = false;
-    let occupied = false;
-    await this._flushUpdate(prev => {
-      const slot = preRegistrationSlot(prev.pendingResume, 'plan-approval', runId, toolCallId);
-      registered = slot === 'free';
-      occupied = slot === 'occupied';
-      return registered ? { ...prev, pendingResume: pending } : prev;
-    });
-    if (occupied) return;
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerPlanApproval(this._pendingInteractionsPort(), params);
   }
 
   /**
@@ -20607,7 +18211,7 @@ export class Session {
                     requestedAt: parkedNow.requestedAt,
                   }),
           );
-          this._syncPendingInteractionExpiryTimer();
+          syncPendingInteractionExpiryTimer(this._pendingInteractionsPort());
           // §10.2 state_changed — emit only when durable `session.state` actually
           // changed, after the record is committed so subscribers reading state
           // see the post-write value.
@@ -20798,13 +18402,6 @@ export class Session {
       // this fence also restores in-place edits to a retained tool object.
       fence: createToolSurfaceFence(sourceTools),
     };
-  }
-
-  /** Retain the admission-time definition snapshot for a later same-process resume. */
-  private _retainCurrentReplacementToolSurface(runId: string): void {
-    const current = this._currentTurnReplacementToolSurface;
-    if (!current) return;
-    this._replacementToolSurface.retain(runId, current.fence);
   }
 
   /**
@@ -21058,11 +18655,6 @@ export class Session {
       this._currentAgentRequestContext = requestContext;
     }
     return requestContext;
-  }
-
-  private _currentToolSurfaceFenceSnapshot(runId: string): string[] | undefined {
-    const fence = readToolSurfaceFence(this._currentAgentRequestContext, runId);
-    return fence ? [...fence.allowedNames] : undefined;
   }
 
   /**
@@ -22175,84 +19767,6 @@ export class Session {
 }
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-
-function parseDiscardPendingInteractionOptions(opts: unknown): DiscardPendingInteractionOptions {
-  if (opts === null || typeof opts !== 'object') {
-    throw new HarnessValidationError('discardPendingInteraction()', 'options must be an object');
-  }
-  const read = (key: string): unknown => getOwnRecordValue(opts as Record<string, unknown>, key);
-  const requireString = (key: string, maxLength?: number): string => {
-    const value = read(key);
-    if (typeof value !== 'string' || value.length === 0) {
-      throw new HarnessValidationError(`discardPendingInteraction().${key}`, `${key} must be a non-empty string`);
-    }
-    if (maxLength !== undefined && value.length > maxLength) {
-      throw new HarnessValidationError(
-        `discardPendingInteraction().${key}`,
-        `${key} must be at most ${maxLength} characters`,
-      );
-    }
-    return value;
-  };
-  const kind = read('kind');
-  if (typeof kind !== 'string' || !DISCARD_PENDING_INTERACTION_KINDS.has(kind as PendingResume['kind'])) {
-    throw new HarnessValidationError('discardPendingInteraction().kind', 'kind must be a pending interaction kind');
-  }
-  const pendingRequestedAt = read('pendingRequestedAt');
-  if (typeof pendingRequestedAt !== 'number' || !Number.isSafeInteger(pendingRequestedAt) || pendingRequestedAt < 0) {
-    throw new HarnessValidationError(
-      'discardPendingInteraction().pendingRequestedAt',
-      'pendingRequestedAt must be a non-negative integer',
-    );
-  }
-  return {
-    kind: kind as PendingResume['kind'],
-    itemId: requireString('itemId'),
-    runId: requireString('runId'),
-    toolCallId: requireString('toolCallId'),
-    pendingRequestedAt,
-    responseId: requireString('responseId'),
-    reason: requireString('reason', MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH),
-  };
-}
-
-function discardGeneration(input: DiscardPendingInteractionOptions): DiscardGeneration {
-  return {
-    kind: input.kind,
-    itemId: input.itemId,
-    runId: input.runId,
-    toolCallId: input.toolCallId,
-    pendingRequestedAt: input.pendingRequestedAt,
-  };
-}
-
-function pendingMatchesDiscardGeneration(pending: PendingResume, generation: DiscardGeneration): boolean {
-  return (
-    pending.kind === generation.kind &&
-    (pending.itemId ?? pending.toolCallId) === generation.itemId &&
-    pending.runId === generation.runId &&
-    pending.toolCallId === generation.toolCallId &&
-    pending.requestedAt === generation.pendingRequestedAt
-  );
-}
-
-/**
- * The `discardPendingInteraction` receipt whose claim (`expiryStartedAt`) is
- * stamped on `pending` in `record`, if that generation is discard-owned.
- */
-function discardClaimReceipt(record: SessionRecord, pending: PendingResume): InboxResponseReceipt | undefined {
-  if (pending.expiryStartedAt === undefined) return undefined;
-  const generation: DiscardGeneration = {
-    kind: pending.kind,
-    itemId: pending.itemId ?? pending.toolCallId,
-    runId: pending.runId,
-    toolCallId: pending.toolCallId,
-    pendingRequestedAt: pending.requestedAt,
-  };
-  return Object.values(record.inboxResponseReceipts ?? {}).find(
-    receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
-  );
-}
 
 /**
  * Snapshot a caller-supplied terminal admission seed for hashing + persistence.
