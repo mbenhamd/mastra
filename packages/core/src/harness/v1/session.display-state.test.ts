@@ -918,4 +918,38 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
       await runB.catch(() => {});
     }
   });
+
+  // Known gap PF-8698: a run woken through the agent on the session's thread
+  // while the session is idle is stamped as the session's current run by the
+  // thread subscription, but no turn is opened for it, so nothing clears it
+  // when the run ends. Whether the session should adopt such a run or ignore
+  // it is undecided; either way it must not report the run once it has ended.
+  it.fails('reports no current run after a run woken through the agent on an idle session has ended', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // A first turn opens the session's thread subscription.
+    agent.enqueueRun({ finishReason: 'stop', text: 'first' });
+    await session.message({ content: 'first' });
+
+    agent.enqueueRun({
+      finishReason: 'stop',
+      text: 'woken',
+      chunks: [{ type: 'text-delta', payload: { id: 'm', text: 'woken' } }],
+    });
+    const sent = agent.sendSignal(
+      { type: 'user-message', contents: 'woken through the agent' },
+      { resourceId: 'u', threadId: session.threadId, ifIdle: { behavior: 'wake' } },
+    );
+    const accepted = await sent.accepted;
+    expect(accepted.action).toBe('wake');
+    if (accepted.action !== 'wake') return;
+    await accepted.output.getFullOutput();
+    // Let the thread subscription drain the run's last chunks.
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
+
+    const after = session.getDisplayState();
+    expect(after.isRunning).toBe(false);
+    expect(after.currentRunId).toBeUndefined();
+    expect(after.currentRun).toBeUndefined();
+  });
 });
