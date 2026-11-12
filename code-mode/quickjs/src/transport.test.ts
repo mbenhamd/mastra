@@ -224,6 +224,145 @@ describe('QuickJsCodeModeTransport', () => {
     });
   });
 
+  it('returns a SyntaxError result when a custom async transpile rejects', async () => {
+    const transport = new QuickJsCodeModeTransport({
+      transpile: async () => {
+        throw new Error('program.ts(1,9): error TS1005');
+      },
+    });
+    const result = await run(`return 1;`, { transport });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'program.ts(1,9): error TS1005', name: 'SyntaxError' },
+    });
+  });
+
+  it('times out a custom transpile that never settles', async () => {
+    const transport = new QuickJsCodeModeTransport({ transpile: () => new Promise<string>(() => {}) });
+    const result = await run(`return 1;`, { transport, timeout: 50 });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution timed out after 50ms', name: 'TimeoutError' },
+    });
+  });
+
+  it('evaluates the output of a custom transpile that returns a bare thenable', async () => {
+    // A JavaScript caller may return any thenable, not only a native Promise.
+    const thenable = {
+      then(resolve: (value: string) => void) {
+        resolve('(async () => { return 7; })');
+      },
+    };
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => thenable as unknown as Promise<string>,
+    });
+    const result = await run(`return 1;`, { transport });
+    expect(result).toEqual({ success: true, result: 7, logs: [] });
+  });
+
+  it('does not leave an unhandled rejection when a timed-out transpile rejects later', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const transport = new QuickJsCodeModeTransport({
+        transpile: () =>
+          new Promise<string>((_, reject) => setTimeout(() => reject(new Error('late transpile failure')), 60)),
+      });
+      const result = await run(`return 1;`, { transport, timeout: 20 });
+      expect(result).toEqual({
+        success: false,
+        logs: [],
+        error: { message: 'Code Mode execution timed out after 20ms', name: 'TimeoutError' },
+      });
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('does not call a custom transpile when the run is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const transport = new QuickJsCodeModeTransport({
+      transpile: async source => {
+        calls += 1;
+        return source;
+      },
+    });
+    const result = await run(`return 1;`, { transport, abortSignal: controller.signal });
+    expect(calls).toBe(0);
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+  });
+
+  it('returns an AbortError result when a custom transpile aborts the run synchronously', async () => {
+    const controller = new AbortController();
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => {
+        controller.abort();
+        return new Promise<string>(() => {});
+      },
+    });
+    const result = await run(`return 1;`, { transport, abortSignal: controller.signal, timeout: 5_000 });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+  });
+
+  it('times out before the program runs when a synchronous transpile spends the whole budget', async () => {
+    let ran = false;
+    const transport = new QuickJsCodeModeTransport({
+      transpile: source => {
+        const until = Date.now() + 80;
+        while (Date.now() < until) {
+          // spend the run's budget synchronously
+        }
+        return source;
+      },
+    });
+    const result = await run(`await external_mark({}); return 1;`, {
+      transport,
+      timeout: 40,
+      toolIds: ['mark'],
+      dispatch: async () => {
+        ran = true;
+        return null;
+      },
+    });
+    expect(ran).toBe(false);
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution timed out after 40ms', name: 'TimeoutError' },
+    });
+  });
+
+  it('returns an AbortError result when the run is aborted during a custom transpile', async () => {
+    const controller = new AbortController();
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => {
+        setTimeout(() => controller.abort(), 0);
+        return new Promise<string>(() => {});
+      },
+    });
+    const result = await run(`return 1;`, { transport, abortSignal: controller.signal });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+  });
+
   it('returns an error result for non-JSON-serializable results', async () => {
     const result = await run(`const a = {}; a.self = a; return a;`);
     expect(result.success).toBe(false);

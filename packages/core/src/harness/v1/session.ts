@@ -29,9 +29,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
+import type { z } from 'zod';
 
-import { Agent } from '../../agent';
+import type { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import {
   AGENT_EXECUTION_OPTION_COMPOSERS,
@@ -39,8 +39,8 @@ import {
   AGENT_RESPONSE_RECOVERY_STEP,
 } from '../../agent/merge-execution-options';
 import type { AgentExecutionOptionComposers } from '../../agent/merge-execution-options';
-import { normalizeLogicalMessageInputIdentity, normalizeLogicalMessageIdentity } from '../../agent/message-list';
-import type { LogicalMessageIdentity, LogicalMessageSignalIdentity } from '../../agent/message-list';
+import { normalizeLogicalMessageIdentity } from '../../agent/message-list';
+import type { LogicalMessageIdentity } from '../../agent/message-list';
 import { createSignal } from '../../agent/signals';
 import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
 import {
@@ -67,13 +67,9 @@ import {
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
-import { ModelRouterLanguageModel } from '../../llm/model/router';
-import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
-import { isObservationalMemoryEnabled } from '../../memory/types';
 import type { TracingContext } from '../../observability';
-import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
 import {
   HarnessStorageAdmissionConflictError,
@@ -140,15 +136,10 @@ import type {
   SessionRecord,
   SessionSummary,
 } from '../../storage/domains/harness';
-import {
-  assertObservationalMemorySourceWriteGuardSupported,
-  ObservationalMemorySourceWriteConflictError,
-} from '../../storage/domains/memory/base';
 import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
-import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
 import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
@@ -162,12 +153,7 @@ import type { Workspace } from '../../workspace';
 // always validates caller-reachable input, so the checked variant is bound to the local name.
 import { activityTimelineMessageReadBound, buildActivityTimeline } from './activity-timeline';
 import type { ActivityTimelineSessionInput } from './activity-timeline';
-import {
-  assertJsonValue,
-  canonicalJson,
-  jsonValuesEqual,
-  sha256CanonicalJsonChecked as sha256CanonicalJson,
-} from './canonical-json';
+import { assertJsonValue, jsonValuesEqual, sha256CanonicalJsonChecked as sha256CanonicalJson } from './canonical-json';
 // §5.1k / §6.4 plan-task session operations (TM-3/TM-4): the live session is the
 // serialized writer for its plan tree; these helpers own rollup/cycle/in-progress.
 // §4.4c caller request-context validation + the durable-DTO mapping used by admission hashing
@@ -202,12 +188,9 @@ import {
   HarnessStateConflictError,
   HarnessStateSerializationError,
   HarnessStorageError,
-  HarnessSkillArgsValidationError,
-  HarnessSkillNotFoundError,
   HarnessSubagentConcurrencyLimitError,
   HarnessSubagentDepthExceededError,
   HarnessValidationError,
-  HarnessWorkspaceLostError,
   redactPublicBoundaryRejection,
 } from './errors';
 import type { HarnessAbortReason, HarnessOutputGenerationReason } from './errors';
@@ -246,7 +229,6 @@ import type {
   DecomposeChildInput,
   DelegatedSettlementNoticeMode,
   DelegatedSubagentOutcome,
-  DelegationNoticeClaim,
   PendingDelegationSettlementNotice,
   PlanTaskSessionPort,
   PlanTaskSummary,
@@ -256,9 +238,6 @@ import type {
 } from './plan-task-session';
 import {
   capturePlanTaskDelegationScope,
-  planTaskAcknowledgeDelegationSettlementNotice,
-  planTaskClaimDelegationSettlementNotice,
-  planTaskClearDelegationSettlementNoticeClaim,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
@@ -270,7 +249,6 @@ import {
   planTaskReset,
   planTaskUpdate,
   PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
-  PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
   readDelegationAttemptMetadata,
   readPendingDelegationSettlementNotice,
@@ -282,6 +260,134 @@ import {
   projectInheritedRequestContextAppBag,
   validateCallerRequestContext,
 } from './request-context-input';
+import {
+  admissionLost,
+  DELEGATED_SUBAGENT_CANCELLED_ERROR,
+  DELEGATED_SUBTREE_MAX_NODES,
+  DELEGATION_DEADLINE_REACHED,
+  DELEGATION_RECONCILE_RETRY_BASE_MS,
+  DELEGATION_RECONCILE_RETRY_MAX_MS,
+  delegationAdmissionId,
+  delegationSignalId,
+  isParentRequestedSubagentCancel,
+  owesRecoveredCompletion,
+  summarizeDelegationDeadline,
+  waitForDelegationResult,
+} from './session-delegation';
+import { MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS, pendingResumeForDisplay } from './session-display';
+import type { SessionDisplayState, SessionRunProjection } from './session-display';
+import {
+  clearSessionGoal,
+  createGoalJudgeAgent,
+  getGoalJudgeContext,
+  getSessionGoal,
+  pauseSessionGoal,
+  resumeSessionGoal,
+  runGoalJudge,
+  setSessionGoal,
+  updateGoalJudgeDefaults,
+} from './session-goal-judge';
+import type { GoalJudgeSessionPort } from './session-goal-judge';
+import {
+  currentMode,
+  currentModeId,
+  deleteSessionAttachment,
+  modeAgentId,
+  modelsCurrent,
+  modelsCurrentAuthStatus,
+  modelsGetSubagent,
+  modelsHasSelected,
+  modelsSetSubagent,
+  modelsSwitch,
+  setSessionThreadSetting,
+  switchSessionMode,
+  uploadSessionAttachment,
+} from './session-mode-model-config';
+import type { ModeModelConfigSessionPort } from './session-mode-model-config';
+import {
+  hasUnsupportedObservationalMemoryIntent,
+  omClearOverride,
+  omObservationThreshold,
+  omObserverModelId,
+  omReflectionThreshold,
+  omReflectorModelId,
+  omSwitchObserverModel,
+  omSwitchReflectorModel,
+} from './session-observational-memory';
+import type { ObservationalMemorySessionPort } from './session-observational-memory';
+import {
+  ASK_USER_TOOL_NAME,
+  cancelledPendingAudit,
+  compactJsonObject,
+  DISCARD_PENDING_INTERACTION_KINDS,
+  discardReceiptResult,
+  MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH,
+  preRegistrationSlot,
+  SUBMIT_PLAN_TOOL_NAME,
+} from './session-pending-interactions';
+import type {
+  InboxReceiptResponseOptions,
+  LegacyInboxResponseOptions,
+  PendingExpiryOutcome,
+  QueueResumeRecoveryResult,
+} from './session-pending-interactions';
+import {
+  ASSISTANT_DRAFT_FLUSH_DELAY_MS,
+  ASSISTANT_DRAFT_TEXT_DECODER,
+  ASSISTANT_DRAFT_TEXT_ENCODER,
+  isPlainStateObject,
+  MAX_ASSISTANT_DRAFT_FIELD_BYTES,
+  MAX_PENDING_FAILED_EVENT_APPENDS,
+  MAX_PERSISTED_ASSISTANT_DRAFT_BYTES,
+  MAX_PERSISTED_ASSISTANT_DRAFTS,
+  queueReceiptRecency,
+  safeSerializedSize,
+  SESSION_RECORD_SIZE_BUDGET_BYTES,
+  STATE_ROOT_SENTINEL,
+  topRecordFieldSizes,
+  UNSUSPENDED_AGENTIC_LOOP_STATUSES,
+} from './session-persistence';
+import { QueueHead } from './session-queue-head';
+import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
+import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
+import {
+  DelegationNoticeWakeNotSentError,
+  WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS,
+  WAKE_TERMINAL_COMMIT_RETRY_BASE_MS,
+  WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
+} from './session-settlement-notices';
+import type {
+  DelegationNoticeOutcome,
+  NoticeDelivery,
+  NoticeFence,
+  NoticeFenceSite,
+  WakeReminderRowOrigin,
+} from './session-settlement-notices';
+import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
+import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
+import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
+import { TerminalStagingLedger } from './session-terminal-staging-ledger';
+import {
+  assertPolicy,
+  assertToolCategory,
+  assertToolName,
+  UNGATED_HARNESS_BUILTIN_TOOL_IDS,
+} from './session-tool-surface';
+import {
+  assertCallerGrantKeyNotReserved,
+  boundInboxReceiptResult,
+  HarnessResponseRecoveryAlreadyPreparedError,
+  normalizeSessionLogicalMessageInputIdentity,
+} from './session-turn-options';
+import type {
+  HarnessExecutionHookErrorReporter,
+  HarnessIterationCompleteHandler,
+  HarnessPrepareStep,
+  ResumeAnswerProgress,
+} from './session-turn-options';
+import { WakeAdmissions } from './session-wake-admissions';
+import { SessionWorkspace } from './session-workspace';
+import type { WorkspaceSessionPort } from './session-workspace';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
@@ -317,20 +423,12 @@ import type {
   DiscardPendingInteractionOptions,
   DiscardPendingInteractionResult,
   GoalOptions,
-  HarnessActionCatalogEntry,
-  HarnessActionCatalogListOptions,
-  HarnessActionCatalogSourceKind,
-  HarnessActionCatalogUnavailableReason,
-  HarnessMcpServerDescriptor,
-  HarnessMcpToolDescriptor,
   HarnessMessage,
   HarnessMode,
   InboxResponseOptions,
   InboxResponseResult,
   HarnessCustomEventInput,
   HarnessRequestContext,
-  HarnessSkill,
-  HarnessSkillActionMetadata,
   UseSkillOptions,
   ListMessagesOptions,
   MessageAdmissionResult,
@@ -356,6 +454,13 @@ import type {
   SessionActivityTimeline,
   MessageAdmissionPhase,
 } from './types';
+
+export type {
+  HarnessRunStatus,
+  SessionDisplayPending,
+  SessionDisplayState,
+  SessionRunProjection,
+} from './session-display';
 
 type MessageAdmissionIdentity = {
   signalId: string;
@@ -419,20 +524,6 @@ function normalizeObservationalMemorySourceWriteGuard(
   };
 }
 
-/** True when the memory's OM requires every source write to carry a captured guard. */
-function requiresObservationalMemorySourceWriteGuard(memory: MastraMemory): boolean {
-  const config = memory.getMergedThreadConfig().observationalMemory;
-  return isObservationalMemoryEnabled(config) && typeof config === 'object' && config.sourceWriteFencing === 'required';
-}
-
-/** PF-8034: the store refused a guarded write because the guard no longer holds. */
-function isObservationalMemorySourceWriteConflict(error: unknown): boolean {
-  return (
-    error instanceof ObservationalMemorySourceWriteConflictError ||
-    (error instanceof Error && error.name === 'ObservationalMemorySourceWriteConflictError')
-  );
-}
-
 function sameObservationalMemorySourceWriteGuard(
   left: ObservationalMemorySourceWriteGuard | undefined,
   right: ObservationalMemorySourceWriteGuard | undefined,
@@ -494,28 +585,7 @@ type MessageAdmissionHashes = {
   legacyCompatible: readonly string[];
 };
 
-type QueueResumeRecoveryResult =
-  | { status: 'none' }
-  | { status: 'completed'; result: AgentResult }
-  | { status: 'stale' };
-
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
-type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
-type LegacyInboxResponseOptions = Extract<InboxResponseOptions, { responseId?: undefined }>;
-type ActionCatalogSkillDescriptor = Pick<
-  HarnessSkill,
-  'name' | 'description' | 'filePath' | 'category' | 'action' | 'metadata'
->;
-type ActionCatalogMcpCacheEntry = {
-  entries: HarnessActionCatalogEntry[];
-  expiresAt?: number;
-  successful?: boolean;
-};
-type ActionCatalogMcpTimedOutWork = {
-  work: Promise<HarnessActionCatalogEntry[]>;
-  retryAfter: number;
-  retryCount: number;
-};
 
 /**
  * Tool IDs the harness translates from `tool-call-approval` /
@@ -542,9 +612,6 @@ const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 // (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
 // budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
 const HARNESS_SESSION_MAX_STEPS = 1000;
-type HarnessIterationCompleteHandler = NonNullable<AgentExecutionOptionsBase<unknown>['onIterationComplete']>;
-type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepareStep']>;
-type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepareStep', error: unknown) => void;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -839,94 +906,11 @@ function createHarnessEmptySynthesisOptions(
   };
 }
 
-class HarnessResponseRecoveryAlreadyPreparedError extends Error {
-  constructor() {
-    super('Harness response recovery has already admitted its one provider attempt');
-    this.name = 'HarnessResponseRecoveryAlreadyPreparedError';
-  }
-}
-
 class HarnessOrdinaryStepBudgetExhaustedError extends Error {
   constructor() {
     super(`Harness ordinary step budget exhausted at ${HARNESS_SESSION_MAX_STEPS} steps`);
     this.name = 'HarnessOrdinaryStepBudgetExhaustedError';
   }
-}
-
-/**
- * PF-7679: a settlement wake that did not dispatch, by reason. `claim_lost`:
- * the claim was not won (another claim holds the notice, the notice moved, or
- * the claim fence refused it). `slot_lost`: a caller turn took the idle slot
- * after the claim (the delivery clears its claim and waits again). `delivered`:
- * a run already loaded the reminder row into its context. `stale`: a Stop or
- * edit since the settlement. `lease_lost`: this owner no longer holds the
- * session lease at dispatch. `unconfirmed`: the dispatch was sent but the
- * runtime answered with neither a wake on the expected run nor a discard, so a
- * run may have started.
- */
-class DelegationNoticeWakeNotSentError extends Error {
-  constructor(readonly reason: 'claim_lost' | 'slot_lost' | 'delivered' | 'stale' | 'lease_lost' | 'unconfirmed') {
-    super(`Settlement notice wake not sent: ${reason}`);
-    this.name = 'DelegationNoticeWakeNotSentError';
-  }
-}
-
-/**
- * PF-7679: how one settlement notice delivery ended. `wake`: an accepted wake
- * turn. `history`: a row the parent's run loaded (or a `remind` row). `fenced`:
- * a Stop, edit or cancel removed it without a wake. `left_owed`: still owed
- * (closing, lease lost, a failure, or a claim given up); reconcile retries
- * while the parent is live. `lost`: dispatched without a confirmed wake run,
- * counted as delivered. `superseded`: no longer owed by this delivery.
- * `obsolete` (PF-8034): the memory requires OM source-write fencing and the
- * delegating run's guard is missing or revoked (its record was retracted, as
- * when the transcript is deleted). Acknowledged without a row or a wake.
- */
-type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded' | 'obsolete';
-type NoticeClaimResult = 'claimed' | 'claim_lost' | 'fenced' | 'left_owed';
-type NoticeFenceSite = 'owed_reread' | 'row_save' | 'quiescence' | 'claim' | 'dispatch' | 'restore';
-/** PF-7679: a struct, so every guarded notice transition decides on each part. */
-interface NoticeFence {
-  lifecycle: 'live' | 'closing' | 'closed' | 'deleted' | 'shutting_down';
-  /** A Stop or edit since the settlement (the pinned admission epoch is stale). */
-  stale: boolean;
-  cancelled: boolean;
-  /** This process holds the session lease, by its last known expiry. */
-  leaseHeld: boolean;
-}
-interface NoticeDelivery {
-  key: string;
-  notice: PendingDelegationSettlementNotice;
-  /** The admission epoch pinned for this notice's key. */
-  epoch: number;
-}
-
-/**
- * PF-7679: settlement-notice claims (`claimId`) each Harness instance holds and
- * has not resolved yet. A stored claim with that instance's `ownerId` whose id
- * is absent here belongs to an earlier tenure, a replaced session object, or a
- * delivery that gave it up, so it may be taken over.
- */
-const liveNoticeClaims = new WeakMap<Harness, Set<string>>();
-
-/** Record a notice claim as live in `harness`, before its write is queued. */
-function holdNoticeClaim(harness: Harness, claimId: string): void {
-  let held = liveNoticeClaims.get(harness);
-  if (held === undefined) {
-    held = new Set();
-    liveNoticeClaims.set(harness, held);
-  }
-  held.add(claimId);
-}
-
-/** The claim is resolved (cleared, delivered, refused, or given up). */
-function releaseNoticeClaim(harness: Harness, claimId: string): void {
-  liveNoticeClaims.get(harness)?.delete(claimId);
-}
-
-/** Whether a stored notice claim may be taken over by `harness`. */
-function noticeClaimTakeoverEligible(harness: Harness, claim: { claimId: string; ownerId: string }): boolean {
-  return claim.ownerId !== harness.ownerId || liveNoticeClaims.get(harness)?.has(claim.claimId) !== true;
 }
 
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
@@ -936,31 +920,6 @@ function noticeClaimTakeoverEligible(harness: Harness, claim: { claimId: string;
 // single applied receipt ~400KB and broke every later saveSession with an
 // HTTP 500).
 const MAX_INBOX_RESPONSE_RECEIPTS = 64;
-const MAX_INBOX_RECEIPT_RESULT_BYTES = 64_000;
-
-function boundInboxReceiptResult(full: unknown): unknown {
-  try {
-    const serialized = JSON.stringify(full);
-    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
-      return full;
-    }
-  } catch {
-    // Unserializable results cannot be persisted faithfully either way.
-  }
-  const source = (full ?? {}) as { finishReason?: unknown; text?: unknown; usage?: unknown };
-  return {
-    truncated: true,
-    ...(source.finishReason === undefined ? {} : { finishReason: source.finishReason }),
-    ...(typeof source.text === 'string' ? { text: source.text.slice(0, 8_000) } : {}),
-    ...(source.usage === undefined ? {} : { usage: source.usage }),
-  };
-}
-
-function queueReceiptRecency(receipt: QueueAdmissionReceipt): number {
-  return (
-    receipt.completedAt ?? receipt.failedAt ?? receipt.acceptedAt ?? receipt.admittingAt ?? receipt.enqueuedAt ?? 0
-  );
-}
 
 function pruneQueueAdmissionReceipts(
   receipts: Record<string, QueueAdmissionReceipt>,
@@ -969,26 +928,6 @@ function pruneQueueAdmissionReceipts(
   if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
   entries.sort((left, right) => queueReceiptRecency(right[1]) - queueReceiptRecency(left[1]));
   return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
-}
-
-// Just under Convex's ~1MiB document limit, leaving headroom for envelope
-// fields the adapter adds around the record.
-const SESSION_RECORD_SIZE_BUDGET_BYTES = 900_000;
-
-function safeSerializedSize(value: unknown): number {
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
-  } catch {
-    return Number.MAX_SAFE_INTEGER;
-  }
-}
-
-function topRecordFieldSizes(record: SessionRecord): Array<[string, number]> {
-  return Object.entries(record as unknown as Record<string, unknown>)
-    .map(([key, value]) => [key, safeSerializedSize(value)] as [string, number])
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, 5);
 }
 
 function pruneInboxResponseReceipts(
@@ -1013,8 +952,6 @@ function pruneInboxResponseReceipts(
 /** Discard receipts retained ahead of recency pruning (bounded). */
 const MAX_RETAINED_DISCARD_RECEIPTS = 8;
 
-const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
-const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 /** Backoff before the one retry of a failed provider-result stage. */
 const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
@@ -1024,7 +961,6 @@ const MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS = 15_000;
 const SIGNAL_DISPATCH_CLAIM_TTL_MS = 30_000;
 const SIGNAL_DISPATCH_CLAIM_RENEW_MS = 10_000;
 const SIGNAL_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS = 30_000;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
@@ -1036,74 +972,8 @@ const HARNESS_RUN_INTERRUPTED_MESSAGE =
   'The run was interrupted when the process that owned it stopped; it was not re-run.';
 /** Back-off before recovery retries a turn whose settlement did not commit. */
 const ORPHANED_DISPATCH_RETRY_MS = 1_000;
-/**
- * PF-7631: a settlement wake turn has no caller to retry its terminal commit,
- * so its owning turn re-drives it: at most this many attempts, backing off
- * from the base delay, doubling, capped at the max delay. After the last one
- * the admission is released to dispatch recovery (close or the next owner).
- */
-const WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS = 4;
-const WAKE_TERMINAL_COMMIT_RETRY_BASE_MS = 100;
-const WAKE_TERMINAL_COMMIT_RETRY_MAX_MS = 1_000;
-/**
- * §S4.1 — max transiently-failed event-ledger appends retained for retry before
- * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
- * the durable log: the failed slot is backlogged and retried (in order) ahead of any
- * later sequence on the next append, preserving ledger contiguity. Past this bound we
- * can no longer guarantee retry without unbounded memory, so we hard-latch and let a
- * reconnect recover via the §10.5 snapshot path.
- */
-const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
-/** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
-const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
-const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
-/** PF-8202: rounds a turn waits for `remind` notice saves before it loads history. */
-const REMIND_NOTICE_BARRIER_ROUNDS = 4;
-/** PF-8202: a stalled `remind` save must not hold every later turn; its row reaches the next one. */
-const REMIND_NOTICE_BARRIER_TIMEOUT_MS = 5_000;
-/**
- * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
- * already enforces this bound, so a normal delegated child never receives a
- * partial execution unit that the parent would later settle as complete.
- */
-const DELEGATED_SUBTREE_MAX_NODES = PLAN_TASK_MAX_NODES;
-const ACTION_CATALOG_DEFAULT_LIMIT = 100;
-const ACTION_CATALOG_MAX_LIMIT = 500;
-const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
 // Cap explicit extensions to one day so a lost worker cannot pin a session indefinitely.
 const MAX_LEASE_EXTENSION_MS = 24 * 60 * 60 * 1_000;
-const ACTION_CATALOG_MCP_SUCCESS_CACHE_MS = 5_000;
-const ACTION_CATALOG_MCP_FAILURE_CACHE_MS = 30_000;
-const ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES = 1;
-const ACTION_CATALOG_SOURCE_KINDS: readonly HarnessActionCatalogSourceKind[] = ['skill', 'mcp-server', 'mcp-tool'];
-const ACTION_CATALOG_SOURCE_ORDER: Record<HarnessActionCatalogSourceKind, number> = {
-  skill: 0,
-  'mcp-server': 1,
-  'mcp-tool': 2,
-};
-const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
-  'required',
-  'properties',
-  'type',
-  'enum',
-  'items',
-  'additionalProperties',
-]);
-const RESERVED_MCP_SERVER_KEYS = new Set([...Object.getOwnPropertyNames(Object.prototype), '__proto__']);
-
-function isPlainStateObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/**
- * §10.2 state_changed sentinel for a whole-root change. `session.state` is
- * `unknown` — it may legitimately be a scalar, array, or plain object root (see
- * `firstNonJsonStatePath`, which explicitly allows scalar/array roots). When
- * the root itself is not a plain object on both sides, there are no top-level
- * keys to diff, so a genuine root change is reported under this sentinel key,
- * matching the `$`-for-root path convention used elsewhere in this module.
- */
-const STATE_ROOT_SENTINEL = '$';
 
 /**
  * §10.2 state_changed: the keys whose value changed between two durable
@@ -1223,222 +1093,9 @@ function done(seen: Set<object>, obj: object, path: string): string {
   return path;
 }
 
-function cloneMcpCatalogValue(value: unknown): unknown | undefined {
-  if (value === undefined) return undefined;
-  try {
-    return structuredClone(value);
-  } catch {
-    try {
-      return JSON.parse(JSON.stringify(value)) as unknown;
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function isPlainMcpCatalogObject(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  if (Object.prototype.toString.call(value) !== '[object Object]') return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function cloneMcpCatalogRecord(value: unknown): Record<string, unknown> | undefined {
-  const cloned = cloneMcpCatalogValue(value);
-  return isPlainMcpCatalogObject(cloned) ? cloned : undefined;
-}
-
-function cloneMcpCatalogRecordArray(value: unknown): readonly Record<string, unknown>[] | undefined {
-  const cloned = cloneMcpCatalogValue(value);
-  if (!Array.isArray(cloned) || cloned.some(item => !isPlainMcpCatalogObject(item))) {
-    return undefined;
-  }
-  return cloned as Record<string, unknown>[];
-}
-
-function cloneMcpSchemaLike(value: unknown): unknown | undefined {
-  if (value && typeof value === 'object' && 'jsonSchema' in value) {
-    return cloneMcpCatalogValue((value as { jsonSchema?: unknown }).jsonSchema);
-  }
-  return cloneMcpCatalogValue(value);
-}
-
-function encodeActionCatalogIdPart(value: string): string {
-  return encodeURIComponent(value);
-}
-
-function compareActionCatalogIds(a: string, b: string): number {
-  if (a < b) return -1;
-  if (a > b) return 1;
-  return 0;
-}
-
-function cloneActionCatalogEntry(entry: HarnessActionCatalogEntry): HarnessActionCatalogEntry {
-  const cloned = cloneMcpCatalogValue(entry);
-  if (cloned === undefined) {
-    throw new HarnessValidationError(
-      'actions.list()',
-      `could not clone action catalog entry ${JSON.stringify(entry.id)}`,
-    );
-  }
-  return cloned as HarnessActionCatalogEntry;
-}
-
-function cloneActionCatalogStringArray(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.length === 0)) {
-    return undefined;
-  }
-  return [...value];
-}
-
-function cloneActionCatalogShortcuts(value: unknown): HarnessSkillActionMetadata['shortcuts'] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const shortcuts = value.map(item => {
-    if (!isPlainMcpCatalogObject(item) || typeof item.id !== 'string' || item.id.length === 0) return undefined;
-    const keys = cloneActionCatalogStringArray(item.keys);
-    if (item.keys !== undefined && !keys) return undefined;
-    if (item.label !== undefined && typeof item.label !== 'string') return undefined;
-    return {
-      id: item.id,
-      ...(item.label ? { label: item.label } : {}),
-      ...(keys ? { keys } : {}),
-    };
-  });
-  return shortcuts.some(shortcut => !shortcut) ? undefined : (shortcuts as HarnessSkillActionMetadata['shortcuts']);
-}
-
-function cloneActionCatalogPermissions(value: unknown): HarnessSkillActionMetadata['permissions'] | undefined {
-  if (!isPlainMcpCatalogObject(value)) return undefined;
-  const tools = cloneActionCatalogStringArray(value.tools);
-  const fileScopes = cloneActionCatalogStringArray(value.fileScopes);
-  const networkScopes = cloneActionCatalogStringArray(value.networkScopes);
-  const mcpScopes = cloneActionCatalogStringArray(value.mcpScopes);
-  if (
-    (value.tools !== undefined && !tools) ||
-    (value.fileScopes !== undefined && !fileScopes) ||
-    (value.networkScopes !== undefined && !networkScopes) ||
-    (value.mcpScopes !== undefined && !mcpScopes)
-  ) {
-    return undefined;
-  }
-  return {
-    ...(tools ? { tools } : {}),
-    ...(fileScopes ? { fileScopes } : {}),
-    ...(networkScopes ? { networkScopes } : {}),
-    ...(mcpScopes ? { mcpScopes } : {}),
-  };
-}
-
-function cloneActionMetadataLike(value: unknown): HarnessSkillActionMetadata | undefined {
-  if (!isPlainMcpCatalogObject(value)) return undefined;
-  if (value.displayName !== undefined && typeof value.displayName !== 'string') return undefined;
-  if (value.icon !== undefined && typeof value.icon !== 'string') return undefined;
-  const shortcuts = cloneActionCatalogShortcuts(value.shortcuts);
-  const inputSchema = cloneMcpCatalogRecord(value.inputSchema);
-  const outputSchema = cloneMcpCatalogRecord(value.outputSchema);
-  const artifactTypes = cloneActionCatalogStringArray(value.artifactTypes);
-  const permissions = cloneActionCatalogPermissions(value.permissions);
-  if (
-    (value.shortcuts !== undefined && !shortcuts) ||
-    (value.inputSchema !== undefined && !inputSchema) ||
-    (value.outputSchema !== undefined && !outputSchema) ||
-    (value.artifactTypes !== undefined && !artifactTypes) ||
-    (value.permissions !== undefined && !permissions)
-  ) {
-    return undefined;
-  }
-  return {
-    ...(value.displayName ? { displayName: value.displayName } : {}),
-    ...(value.icon ? { icon: value.icon } : {}),
-    ...(shortcuts ? { shortcuts } : {}),
-    ...(inputSchema ? { inputSchema } : {}),
-    ...(outputSchema ? { outputSchema } : {}),
-    ...(artifactTypes ? { artifactTypes } : {}),
-    ...(permissions ? { permissions } : {}),
-  };
-}
-
-class ActionCatalogMcpListTimeoutError extends Error {
-  constructor() {
-    super(`MCP tool catalog did not resolve within ${ACTION_CATALOG_MCP_LIST_TIMEOUT_MS}ms`);
-    this.name = 'ActionCatalogMcpListTimeoutError';
-  }
-}
-
-function startActionCatalogMcpListWithTimeout<T>(
-  run: (abortSignal: AbortSignal) => Promise<T>,
-  onTimeout?: (work: Promise<T>) => void,
-): {
-  pending: Promise<T>;
-  work: Promise<T>;
-  didTimeout: () => boolean;
-} {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-  const work = run(controller.signal);
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      const timeoutError = new ActionCatalogMcpListTimeoutError();
-      timedOut = true;
-      onTimeout?.(work);
-      controller.abort(timeoutError);
-      reject(timeoutError);
-    }, ACTION_CATALOG_MCP_LIST_TIMEOUT_MS);
-  });
-  const pending = Promise.race([work, timeout]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-  return {
-    pending,
-    work,
-    didTimeout: () => timedOut,
-  };
-}
-
-const DELEGATION_DEADLINE_REACHED = Symbol('delegation-deadline-reached');
-
-/** Race one durable delegation result against its persisted absolute deadline. */
-async function waitForDelegationResult<T>(
-  promise: Promise<T>,
-  deadlineAt: number,
-): Promise<T | typeof DELEGATION_DEADLINE_REACHED> {
-  const remainingMs = Math.max(0, deadlineAt - Date.now());
-  if (remainingMs === 0) return DELEGATION_DEADLINE_REACHED;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<typeof DELEGATION_DEADLINE_REACHED>(resolve => {
-    timer = setTimeout(() => resolve(DELEGATION_DEADLINE_REACHED), remainingMs);
-    if (typeof timer.unref === 'function') timer.unref();
-  });
-  try {
-    return await Promise.race([promise, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-/** The public error of a delegated task its parent cancelled (`cancelled` outcome). */
-const DELEGATED_SUBAGENT_CANCELLED_ERROR = {
-  code: 'harness.subagent_cancelled',
-  message: 'The delegated subagent was cancelled before it completed',
-} as const;
-
-function summarizeDelegationDeadline(deadlineAt: number): HarnessSubagentResultSummary {
-  const summary = summarizeHarnessSubagentEventResult(
-    summarizeHarnessSubagentResult(undefined, {
-      isError: true,
-      error: {
-        code: 'harness.delegation_timeout',
-        message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
-      },
-    }),
-  );
-  return { ...summary, outcome: 'failed' };
-}
-
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
-interface QueueBackpressureDrop {
+export interface QueueBackpressureDrop {
   queuedItemId: string;
   admissionId?: string;
   replacementQueuedItemId?: string;
@@ -1446,92 +1103,6 @@ interface QueueBackpressureDrop {
   maxQueueDepth: number;
   source: 'queue' | 'goal';
   goalId?: string;
-}
-
-/**
- * System prompt for the goal judge. Lifted verbatim from
- * mastracode/src/tui/goal-manager.ts so the harness-native judge produces
- * the same verdicts as the TUI implementation. The wording matters — the
- * "don't wait for yourself" rule and the asked-question-vs-checkpoint
- * distinction prevent the loop from flip-flopping.
- */
-const JUDGE_SYSTEM_PROMPT = `You are the goal judge. Your decision directly controls whether the assistant continues working toward the goal.
-
-Given a goal and the assistant's latest response, reason about whether the goal's requirements have been satisfied. Compare what the goal asks for against what the assistant has actually produced. Focus on substance, not phrasing.
-
-Use "done" when the goal is fully achieved.
-Use "waiting" only when the goal explicitly requires a user checkpoint, user feedback, human verification, human confirmation, or another external event outside the goal-judge loop before the assistant should continue, and the assistant has correctly stopped at that checkpoint. Do not use "waiting" merely because the assistant asked a question or could benefit from user input.
-Use "continue" when the goal is not done and the assistant should keep working autonomously, including when it asked for input that the goal did not explicitly require.
-If your previous decision was "waiting" for an explicit user checkpoint, keep choosing "waiting" when the user's latest response asks a question, requests clarification, or otherwise does not satisfy the checkpoint. Do not continue until the required user feedback/confirmation/verification has actually been provided.
-If the goal says to wait for the goal judge, judge, evaluator, or you to respond, approve, verify, validate, tell the assistant to continue, or otherwise provide the next signal, treat your own decision as that judge response. Verification can be performed by you unless the goal explicitly says it needs human/user verification. Choose "continue" when the assistant should proceed to the next step. Do not choose "waiting" for judge-controlled checkpoints, because that would mean waiting for yourself.
-
-Your "reason" field is sent back to the assistant as guidance when the goal is not yet done — be specific about what still needs to be accomplished. When choosing "continue", write the reason as an instruction for what the assistant should do next. When choosing "waiting", explain what specific user checkpoint is still outstanding.`;
-
-/** Structured-output schema used by the goal judge call (§4.7). */
-const GoalJudgeSchema = z.object({
-  decision: z
-    .enum(['done', 'continue', 'waiting'])
-    .describe(
-      'Whether the goal is done, should continue autonomously, or is at an explicit user checkpoint required by the goal',
-    ),
-  reason: z.string().describe('Brief explanation of what was accomplished or what remains to be done'),
-});
-
-/** Per-message cap on judge-context strings to keep judge latency bounded. */
-const JUDGE_TRUNCATE_LIMIT = 4000;
-
-// ---------------------------------------------------------------------------
-// Permission helpers (§4.2e). Tiny shape validators kept module-scoped so the
-// session methods stay focused on persistence + event emission.
-// ---------------------------------------------------------------------------
-
-const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mcp', 'other'];
-const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
-
-/**
- * Harness-owned control tools that must remain callable for the protocol itself
- * to make progress. `ask_user` / `submit_plan` are the suspension boundary and
- * `report_subagent_outcome` is the child session's mandatory terminal envelope.
- *
- * Plan mutation/check/delegation tools and `spawn_subagent` are intentionally
- * absent: they mutate durable state or expand execution capability, so they obey
- * the same permission policy and subagent capability allowlist as application
- * tools. Kept in sync with `_buildToolSurface`.
- */
-const UNGATED_HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
-  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
-  ASK_USER_TOOL_ID,
-  SUBMIT_PLAN_TOOL_ID,
-]);
-
-function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
-  if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
-    throw new HarnessValidationError(method, `unknown ToolCategory ${JSON.stringify(value)}`);
-  }
-}
-
-function assertToolName(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'toolName must be a non-empty string');
-  }
-}
-
-function assertAgentType(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'agentType must be a non-empty string');
-  }
-}
-
-function assertModelId(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'model must be a non-empty string');
-  }
-}
-
-function assertPolicy(method: string, value: unknown): asserts value is PermissionPolicy {
-  if (typeof value !== 'string' || !PERMISSION_POLICIES.includes(value as PermissionPolicy)) {
-    throw new HarnessValidationError(method, `policy must be one of ${PERMISSION_POLICIES.join(' | ')}`);
-  }
 }
 
 function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorageAttachmentUnavailableError {
@@ -1542,40 +1113,6 @@ function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorag
     typeof (err as { sessionId?: unknown }).sessionId === 'string' &&
     typeof (err as { attachmentId?: unknown }).attachmentId === 'string'
   );
-}
-
-function truncateForJudge(value: string): string {
-  return value.length > JUDGE_TRUNCATE_LIMIT ? value.slice(0, JUDGE_TRUNCATE_LIMIT) + '\n...[truncated]' : value;
-}
-
-function escapeGoalXml(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-
-/**
- * Continuation prompts. The wording matters — these are lifted verbatim
- * from `mastracode/src/tui/goal-manager.ts` + `commands/goal.ts` so the
- * harness-native goal API produces byte-identical kickoff/resume/judge-
- * continue messages.
- */
-
-/** Kickoff sent by `setGoal` (parity with TUI's `createGoalReminderXml`). */
-function buildKickoffContinuation(objective: string): string {
-  return `<system-reminder type="goal">${escapeGoalXml(objective)}</system-reminder>`;
-}
-
-/** Continuation sent by `resumeGoal` (parity with TUI's `/goal resume`). */
-function buildResumeContinuation(objective: string): string {
-  return `Continue working toward the goal: ${objective}`;
-}
-
-/**
- * Continuation sent after a judge `continue` verdict (parity with TUI's
- * `GoalManager.buildContinuationPrompt`).
- */
-function buildJudgeContinuation(opts: { turn: number; max: number; objective: string; judgeReason: string }): string {
-  const message = `[Goal attempt ${opts.turn}/${opts.max}] The goal is not yet complete. Judge feedback: ${opts.judgeReason}\n\nContinue working toward the goal: ${opts.objective}`;
-  return `<system-reminder type="goal-judge">${escapeGoalXml(message)}</system-reminder>`;
 }
 
 /**
@@ -1652,16 +1189,6 @@ function assertCallerAdmissionIdNotReserved(field: string, admissionId: string |
   }
 }
 
-function assertCallerGrantKeyNotReserved(field: string, grant: { key: string } | undefined): void {
-  if (grant !== undefined && isHarnessWakeReservedKey(grant.key)) {
-    throw new HarnessTerminalHandoffValidationError(field, 'uses the Harness-reserved wake namespace');
-  }
-}
-
-function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
-  return `Delegated plan task ${JSON.stringify(notice.taskId)} settled with outcome "${notice.outcome}". Call ${TASK_CHECK_TOOL_ID} with rootTaskId ${JSON.stringify(notice.taskId)} to read its result before continuing that work.`;
-}
-
 /**
  * Defensive cap on `inProgressTaskIds` in the lazily-seeded plan-task summary
  * (§5.1k / TM-5). The single-in-progress-per-root rule keeps this naturally
@@ -1692,6 +1219,8 @@ export interface ActiveToolState {
 export interface ReturnedInlineSubagentState {
   startedAt: number;
   agentType: string;
+  /** When its spawn_subagent call returned. */
+  returnedAt: number;
 }
 
 export interface ActiveSubagentState {
@@ -1745,43 +1274,7 @@ interface ActiveTurnWaiter {
   cleanup: () => void;
 }
 
-/**
- * Point-in-time snapshot returned by `getDisplayState()` (§4.2). Reads off
- * the in-memory `SessionRecord` plus a few transient run-only fields.
- *
- * Persistent thread-level aggregates (task lists, modified-file ledgers, OM
- * progress) deliberately live in `session.state`, not here — see the
- * `getDisplayState()` doc-comment for the split rationale. All `Record<>`
- * collections returned here are fresh on every call; do not mutate them.
- */
-// ---------------------------------------------------------------------------
-// Run projection (§5.1b SessionRunProjection). A bounded read-model view of the
-// active run for the session list/detail UI — NOT the durable
-// HarnessRunOperationalState recovery record. Populated from live session state;
-// `getDisplayState().currentRun` is present only while a run is in flight.
-// ---------------------------------------------------------------------------
-export type HarnessRunStatus = 'starting' | 'running' | 'waiting' | 'resuming' | 'completed' | 'failed' | 'interrupted';
-
 export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 'use-skill' | 'inbox-response';
-
-export interface SessionRunProjection {
-  runId: string;
-  traceId?: string;
-  status: HarnessRunStatus;
-  operation: {
-    kind: HarnessRunOperationRefKind;
-    signalId?: string;
-    queuedItemId?: string;
-    itemId?: string;
-    responseId?: string;
-    skillName?: string;
-  };
-  modeId: string;
-  modelId: string;
-  agentId: string;
-  startedAt: number;
-  updatedAt: number;
-}
 
 // ---------------------------------------------------------------------------
 // Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
@@ -1825,102 +1318,10 @@ interface OpenRunSpan {
 
 /** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
 const MAX_FINALIZED_RUN_IDS = 4096;
-const MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS = 4096;
 /** Bounded safe receipt evidence retained per run for subagent settlement. */
 const MAX_HARNESS_RUN_TOOL_RECEIPTS = 256;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES = 64 * 1024;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_SETS = 64;
-/**
- * Drafts share the parent SessionRecord with queues, receipts, policy and run
- * state. Bound both each streamed field and the whole draft projection in
- * UTF-8 bytes so multibyte output cannot silently exceed a storage adapter's
- * document limit (Convex, for example, caps a document at 1 MiB).
- */
-const MAX_ASSISTANT_DRAFT_FIELD_BYTES = 128_000;
-const MAX_PERSISTED_ASSISTANT_DRAFT_BYTES = 384 * 1024;
-const MAX_PERSISTED_ASSISTANT_DRAFTS = 8;
-const ASSISTANT_DRAFT_FLUSH_DELAY_MS = 250;
-const ASSISTANT_DRAFT_TEXT_ENCODER = new TextEncoder();
-const ASSISTANT_DRAFT_TEXT_DECODER = new TextDecoder();
-
-export interface SessionDisplayState {
-  // Identity
-  sessionId: string;
-  threadId: string;
-  resourceId: string;
-  parentSessionId?: string;
-  lifecycleState: SessionLifecycleState;
-  modeId: string;
-  modelId: string;
-  createdAt: number;
-  lastActivityAt: number;
-
-  // Run
-  isRunning: boolean;
-  currentRunId?: string;
-  currentMessageId?: string;
-  currentTraceId?: string;
-  // §5.1b structured projection of the in-flight run (present only while a run
-  // is active). Consolidates the loose currentRun* fields above into the spec
-  // SessionRunProjection shape for the session list/detail UI.
-  currentRun?: SessionRunProjection;
-
-  // Activity
-  activeTools: Record<string, ActiveToolState>;
-  toolInputBuffers: Record<string, { toolName: string; text: string }>;
-  activeSubagents: Record<string, ActiveSubagentState>;
-  assistantDrafts?: Record<string, HarnessAssistantDraft>;
-
-  // Tokens
-  tokenUsage: TokenUsage;
-
-  // Pending interrupt (full UX payload, not recovery-only metadata)
-  pending: SessionDisplayPending | null;
-
-  // Queue
-  queueDepth: number;
-  currentQueuedItemId?: string;
-
-  // Goal
-  goal?: SessionRecord['goal'];
-
-  // Plan tasks (§5.1k / TM-5): a BOUNDED summary — counts + active in_progress
-  // ids + root count — NOT the full tree. UIs drive detail off the
-  // `papersflow.plan_task.updated` event deltas + the bounded `plan_task_check`
-  // read. Absent until the session has observed its plan tree.
-  planTasks?: PlanTaskSummary;
-}
-
-export type SessionDisplayPending = Omit<
-  NonNullable<SessionRecord['pendingResume']>,
-  | 'runtimeDependencies'
-  | 'requestContext'
-  | 'toolSurfaceFence'
-  | 'toolReceipts'
-  | 'toolReceiptsOverflow'
-  | 'subagentBudgetSpent'
-  | 'expiresAt'
-> & { expiresAt: number };
-
-function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
-  if (!pending) return null;
-  // Strip storage-internal recovery fields and the caller app bag. Receipt
-  // identities authenticate a terminal report after restart; they are not the
-  // UI's activity feed (tool events already provide that public projection).
-  const {
-    runtimeDependencies: _runtimeDependencies,
-    requestContext: _requestContext,
-    toolSurfaceFence: _toolSurfaceFence,
-    toolReceipts: _toolReceipts,
-    toolReceiptsOverflow: _toolReceiptsOverflow,
-    subagentBudgetSpent: _subagentBudgetSpent,
-    ...displayPending
-  } = pending;
-  return {
-    ...displayPending,
-    expiresAt: pending.expiresAt,
-  };
-}
 
 /**
  * Internal handle the Harness uses to construct + tear down a Session
@@ -1977,38 +1378,6 @@ function normalizeSessionLogicalMessageIdentity(
   }
 }
 
-function normalizeSessionLogicalMessageInputIdentity(
-  value: LogicalMessageSignalIdentity | undefined,
-  methodName: string,
-): LogicalMessageSignalIdentity | undefined {
-  try {
-    return normalizeLogicalMessageInputIdentity(value);
-  } catch (error) {
-    throw new HarnessValidationError(
-      `${methodName}.logicalMessageIdentity`,
-      error instanceof Error ? error.message : 'must contain a valid input id',
-    );
-  }
-}
-
-/** The deterministic admission id of a parent's `task_delegate` signal to its child. */
-function delegationAdmissionId(parentSessionId: string, taskId: string): string {
-  return `harness-delegate:${parentSessionId}:${taskId}`;
-}
-
-/** The child's signal evidence id for one admitted delegation signal. */
-function delegationSignalId(child: SessionRecord, admissionId: string): string {
-  const digest = sha256CanonicalJson({
-    kind: 'channel-signal-admission',
-    harnessName: child.harnessName,
-    sessionId: child.id,
-    resourceId: child.resourceId,
-    threadId: child.threadId,
-    admissionId,
-  });
-  return `harness-channel-signal-${digest.slice(0, 32)}`;
-}
-
 /**
  * @internal — whether a delegated child still owes a recovered completion: a
  * delegation its parent's plan links to it settled (`completed`, or
@@ -2048,62 +1417,6 @@ export async function delegatedChildOwesRecoveredCompletion(
   }
 }
 
-/**
- * Settled evidence recovery publishes (as message recovery does): a completed
- * result that was not erased, or an interruption. Other failures were
- * reported by the run that failed.
- */
-function owesRecoveredCompletion(
-  evidence: AgentSignalResultEvidence,
-): evidence is AgentSignalResultEvidence & { runId: string } {
-  return (
-    evidence.runId !== undefined &&
-    ((evidence.status === 'completed' && evidence.erased !== true) ||
-      (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE))
-  );
-}
-
-/**
- * PF-7631: where a settlement notice's reminder row was saved: the agent whose
- * memory saved it, that memory instance, the mode it was resolved for, and the
- * session's mode-switch epoch taken before resolution.
- */
-type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
-
-/**
- * [PF-7749] `agentic-loop` row statuses that mean the run is not parked on a
- * suspension: it was still executing when its owner died (an executing run's
- * row reads `pending` or `running`), or it finished.
- */
-const UNSUSPENDED_AGENTIC_LOOP_STATUSES: ReadonlySet<string> = new Set([
-  'pending',
-  'running',
-  'success',
-  'failed',
-  'tripwire',
-  'canceled',
-  'bailed',
-  'skipped',
-]);
-
-/**
- * [PF-7749] The pending-interaction slot as seen by a tool pre-registration:
- * `free` (nothing parked), `held` (this same call is already parked, so the
- * registration is a no-op), or `occupied` (another interaction holds it — a
- * second suspending call in the same step, or the answered interaction a
- * resumed run is still parked on). An occupied slot is left to the suspend
- * capture, which parks the call exactly as an unregistered one.
- */
-function preRegistrationSlot(
-  current: PendingResume | undefined,
-  kind: PendingResume['kind'],
-  runId: string,
-  toolCallId: string,
-): 'free' | 'held' | 'occupied' {
-  if (current === undefined) return 'free';
-  return current.kind === kind && current.runId === runId && current.toolCallId === toolCallId ? 'held' : 'occupied';
-}
-
 export class Session {
   /** Stable identity. Frozen at construction. */
   readonly id: string;
@@ -2129,19 +1442,8 @@ export class Session {
    */
   private readonly _displayRefreshListeners = new Set<() => void>();
 
-  /**
-   * Queue resolvers indexed by `queuedItem.id`. Set in `queue()` so the
-   * caller's promise settles when the head turn completes (or rejects on
-   * permanent failure). Cleared after settle. Items recovered from
-   * `pendingQueue` on hydration have no resolver — `queue_item_replayed` is
-   * emitted instead and the turn runs purely for its side-effects.
-   */
-  private readonly _queueResolvers = new Map<
-    string,
-    { promise: Promise<AgentResult>; resolve: (result: AgentResult) => void; reject: (err: unknown) => void }
-  >();
-  /** `queuedItem.id` of the turn currently running (live or suspended). */
-  private _currentQueuedItemId?: string;
+  /** PF-8365: the queue head (current queued item, its source, the `queue()` resolvers). */
+  private readonly _queueHead = new QueueHead();
   /**
    * `yolo` of the turn currently running. Set at drain-begin from the queued
    * item so suspend-capture can persist it onto `pendingResume` and a resumed
@@ -2150,9 +1452,6 @@ export class Session {
   private _currentTurnYolo = false;
   /** Captured native OM source-write fence for the live turn, if supplied. */
   private _currentTurnSourceWriteGuard?: ObservationalMemorySourceWriteGuard;
-  /** `queuedItem.source` of the turn currently running. Used by the goal
-   *  judge loop to skip re-judging on goal-driven continuation turns. */
-  private _currentQueuedItemSource?: 'user' | 'goal';
   /** Fresh remote queue admissions have no local promise resolver but are not crash replays. */
   private readonly _liveAdmittedQueuedItemIds = new Set<string>();
   /** True while `_maybeDrainQueue` is running so re-entrant kicks are no-ops. */
@@ -2312,19 +1611,24 @@ export class Session {
   private _returnedInlineRunId: string | undefined;
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
+  /**
+   * Delegated children this process is settling: from the moment the driver
+   * drops the active entry, or a recovery or cancel reconcile starts, until the
+   * settlement commits or the attempt gives up. Their durable link is still
+   * live, so they read as running.
+   */
+  private readonly _settlingDelegations = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
-  private readonly _delegatedSettlementListeners = new Set<() => void>();
-  /** Settlement notices (child id + digest) this process is delivering right now. */
-  private readonly _delegationNoticesInFlight = new Set<string>();
+  private readonly _delegatedSettlementListeners = new Set<(subagentSessionId: string) => void>();
+  /** PF-8326: settlement-notice delivery, with its own state; it reaches this session through its port. */
+  private readonly _settlementNoticeDelivery = new SessionSettlementNoticeDelivery(
+    this._settlementNoticeDeliveryPort(),
+  );
+  private get _delegationNoticesInFlight(): Set<string> {
+    return this._settlementNoticeDelivery._delegationNoticesInFlight;
+  }
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
   private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
-  /**
-   * PF-8202 — `remind` deliveries in flight. A turn waits for them before its
-   * run loads history, so a row being saved is in that history and is not
-   * acknowledged behind the turn's back. `remind` never waits for the parent
-   * to go idle, so this cannot wait on the turn itself.
-   */
-  private readonly _remindDeliveries = new Set<Promise<void>>();
   /**
    * PF-8202 — `remind` settlements between their commit (which emits
    * `delegate_settled`) and the start of their notice delivery. A turn begun
@@ -2333,19 +1637,6 @@ export class Session {
    * plan-task write chain.
    */
   private readonly _remindSettlementsStarting = new Set<Promise<void>>();
-  /**
-   * PF-8202 — whether the one drain of the two sets above is running, and each
-   * waiting turn's wake-up with the drain rounds it still waits for. Every turn
-   * gets its own rounds from the point it joins, and leaves at its own
-   * deadline, so a save that never settles holds one drain and no waiters.
-   */
-  private _remindNoticeDraining = false;
-  private readonly _remindNoticeDrainWaiters = new Map<() => void, number>();
-  /**
-   * First admission epoch seen for each owed notice in this process, so a retry
-   * or a later reconcile pass cannot launder a Stop that happened in between.
-   */
-  private readonly _delegationNoticeEpochs = new Map<string, number>();
   /**
    * PF-7679: the history-load watch on each owed notice's reminder row, kept
    * across delivery attempts until the notice is resolved or the session tears
@@ -2431,36 +1722,19 @@ export class Session {
    */
   private _flushChain: Promise<void> = Promise.resolve();
 
-  /** Cached workspace handle. Resolves lazily on first `getWorkspace()` call. */
-  private _workspace?: Workspace;
-  /** Dedup promise so concurrent `getWorkspace()` calls share one provision attempt. */
-  private _workspaceResolving?: Promise<Workspace>;
   /**
-   * True when a non-resumable per-session workspace was found in storage on
-   * rehydrate. Set by `_publish` via {@link _markWorkspaceLost}. The first
-   * `getWorkspace()` call throws {@link HarnessWorkspaceLostError}; callers
-   * can drop the marker and reprovision by calling `clearWorkspaceLost()`.
+   * Cached workspace handle, its single-flight resolution and the lost marker
+   * live in `SessionWorkspace` (session-workspace.ts), which reaches this
+   * session only through `_workspacePort()`.
    */
-  private _workspaceLost = false;
+  private readonly _sessionWorkspace = new SessionWorkspace(this._workspacePort());
 
   // -------------------------------------------------------------------------
-  // Skill discovery cache (§4.6).
-  //
-  // Workspace skill discovery is async and lazy. We cache the merged code +
-  // workspace catalog for the lifetime of this in-memory Session instance.
-  // Concurrent `skills.list` / `skills.get` calls during a generation build
-  // share the same in-flight promise (single-flight), avoiding duplicate
-  // discovery work. `skills.refresh()` clears the cache so the next read
-  // re-runs discovery through the workspace skill source.
+  // Skill discovery cache (§4.6) and the action catalog caches live in
+  // `SessionSkillsMcpActions` (session-skills-mcp-actions.ts), which reaches
+  // this session only through `_skillsMcpActionsPort()`.
   // -------------------------------------------------------------------------
-  private _skillsCache?: HarnessSkill[];
-  private _skillsResolving?: Promise<HarnessSkill[]>;
-  private _actionsSkillEntriesCache?: HarnessActionCatalogEntry[];
-  private _actionsSkillEntriesResolving?: Promise<HarnessActionCatalogEntry[]>;
-  private _actionsMcpEntriesCacheByServer = new Map<string, ActionCatalogMcpCacheEntry>();
-  private _actionsMcpEntriesResolvingByServer = new Map<string, Promise<HarnessActionCatalogEntry[]>>();
-  private _actionsMcpTimedOutWorkByServer = new Map<string, ActionCatalogMcpTimedOutWork>();
-  private _actionsMcpCatalogGeneration = 0;
+  private readonly _skillsMcpActions = new SessionSkillsMcpActions(this._skillsMcpActionsPort());
 
   // -------------------------------------------------------------------------
   // Thread subscription — §4.2 signal routing.
@@ -2545,23 +1819,14 @@ export class Session {
   private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
   /** PF-7631: the wrapped wake finalizer settlement wake turns admit under. */
   private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
-  /**
-   * PF-7631: admission ids of settlement wake turns between their pending
-   * reservation and dispatch, so recovery never interrupts one in flight here.
-   */
-  private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
-  /**
-   * PF-7631: wake admissions this process admitted and then gave up on before
-   * their terminal commit (a Stop, delete or eviction during admission or
-   * dispatch, or an exhausted commit re-drive). No run of theirs is live here,
-   * so dispatch recovery settles them at once rather than waiting out a
-   * dispatch claim this process stamped itself.
-   */
-  private readonly _releasedWakeAdmissions = new Set<string>();
+  /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
+  private readonly _wakeAdmissions = new WakeAdmissions();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
-  /** Pending native completions whose usage has joined the durable session counter. */
-  private readonly _terminalTokenAccountedRunIds = new Set<string>();
-  private readonly _stagedTerminalRunIds = new Set<string>();
+  /**
+   * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
+   * native admission mark, cached pending admission).
+   */
+  private readonly _terminalStagingLedger = new TerminalStagingLedger();
   /**
    * Runs whose terminal agent_end this Session already emitted through
    * recovered publication. A live owner finishing the same run afterwards
@@ -2571,14 +1836,6 @@ export class Session {
   private readonly _recoveredAgentEndRunIds = new Set<string>();
   /** In-flight recovered completion publications, one per run. */
   private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
-  /** Runs this process admitted under native terminal handoff. */
-  private readonly _nativeTerminalRunIds = new Set<string>();
-  /**
-   * Pending terminal admissions known to this process, by run id, so staging a
-   * run's output is one storage transaction. Storage re-validates identity and
-   * status under its locks, so a stale entry only yields `not_pending`.
-   */
-  private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -2674,7 +1931,7 @@ export class Session {
       };
     }
     for (const runId of internals.record.accountedTerminalRunIds ?? []) {
-      this._terminalTokenAccountedRunIds.add(runId);
+      this._terminalStagingLedger.markAccounted(runId);
     }
     if (this._record.closedAt !== undefined) {
       this._state = 'closed';
@@ -3197,7 +2454,7 @@ export class Session {
 
   /**
    * Emit an event that belongs to a turn (agent_*, message_*, tool_*,
-   * suspension_*). Auto-stamps `queuedItemId` from `_currentQueuedItemId`
+   * suspension_*). Auto-stamps `queuedItemId` from `_queueHead.currentId`
    * when a queued turn is running so subscribers can correlate every event
    * back to its `queue()` item.
    */
@@ -3215,8 +2472,8 @@ export class Session {
     // the same value. Returns the (possibly enriched) event to emit.
     const toEmit = this._trackRunSpanPreEmit(event);
     let emitted: HarnessEvent;
-    if (this._currentQueuedItemId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
-      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    if (this._queueHead.currentId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
+      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._queueHead.currentId } as EmitInput);
     } else {
       emitted = this._emitter.emit(toEmit);
     }
@@ -3353,10 +2610,10 @@ export class Session {
     const identity: RunSpanIdentity = {
       resourceId: rec.resourceId,
       threadId: rec.threadId,
-      agentId: this._modeAgentId(modeId),
+      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
       modeId,
       modelId: this._currentRunModelId ?? rec.modelId,
-      operationKind: this._currentQueuedItemId !== undefined ? 'queue' : 'signal',
+      operationKind: this._queueHead.currentId !== undefined ? 'queue' : 'signal',
     };
     if (rec.parentSessionId !== undefined) identity.parentSessionId = rec.parentSessionId;
     if (this._currentTraceId !== undefined) identity.traceId = this._currentTraceId;
@@ -3518,7 +2775,7 @@ export class Session {
    * `subagent_*` event (§10.6).
    *
    * Auto-stamps `parentId` (this session's id) and `queuedItemId` from
-   * `_currentQueuedItemId` so a subscriber can correlate every nested
+   * `_queueHead.currentId` so a subscriber can correlate every nested
    * event back to the parent's `queue()` item that spawned it. Callers
    * supply `depth` (child's depth in the subagent tree) and the rest of
    * the event payload.
@@ -3534,8 +2791,8 @@ export class Session {
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
   ): HarnessEvent {
     const stamped = { ...event, parentId: this.id } as EmitInput;
-    if (this._currentQueuedItemId !== undefined && (stamped as { queuedItemId?: string }).queuedItemId === undefined) {
-      return this._emitter.emit({ ...stamped, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    if (this._queueHead.currentId !== undefined && (stamped as { queuedItemId?: string }).queuedItemId === undefined) {
+      return this._emitter.emit({ ...stamped, queuedItemId: this._queueHead.currentId } as EmitInput);
     }
     return this._emitter.emit(stamped);
   }
@@ -3673,6 +2930,7 @@ export class Session {
     this._returnedInlineSubagentsOf(runId).set(state.subagentSessionId, {
       startedAt: state.startedAt,
       agentType: state.agentType,
+      returnedAt: Date.now(),
     });
   }
 
@@ -3962,7 +3220,7 @@ export class Session {
       resourceId: this.resourceId,
       threadId: this.threadId,
       ...(this._currentRunSignalId !== undefined ? { signalId: this._currentRunSignalId } : {}),
-      ...(this._currentQueuedItemId !== undefined ? { queuedItemId: this._currentQueuedItemId } : {}),
+      ...(this._queueHead.currentId !== undefined ? { queuedItemId: this._queueHead.currentId } : {}),
       ...((opts.messageId ?? previous?.messageId) ? { messageId: opts.messageId ?? previous?.messageId } : {}),
       text: text.text,
       status: previousIsTerminal ? previous.status : 'streaming',
@@ -4682,7 +3940,7 @@ export class Session {
     };
     // Released wake admissions this full scan still lists as pending. Only ids
     // released before the scan began can be judged by it.
-    const releasedAtScanStart = [...this._releasedWakeAdmissions];
+    const releasedAtScanStart = this._wakeAdmissions.releasedSnapshot();
     const releasedStillPending = new Set<string>();
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
@@ -4697,7 +3955,7 @@ export class Session {
       });
       for (const admission of page.items) {
         const { evidence } = admission;
-        if (evidence.admissionId !== undefined && this._releasedWakeAdmissions.has(evidence.admissionId)) {
+        if (evidence.admissionId !== undefined && this._wakeAdmissions.isReleased(evidence.admissionId)) {
           releasedStillPending.add(evidence.admissionId);
         }
         if (
@@ -4720,7 +3978,7 @@ export class Session {
     // another owner, or a settlement below) leaves the set, so it stays bounded
     // by the wakes still pending here.
     for (const admissionId of releasedAtScanStart) {
-      if (!releasedStillPending.has(admissionId)) this._releasedWakeAdmissions.delete(admissionId);
+      if (!releasedStillPending.has(admissionId)) this._wakeAdmissions.forgetReleased(admissionId);
     }
     for (const evidence of orphaned) {
       const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
@@ -4741,7 +3999,7 @@ export class Session {
         block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
         continue;
       }
-      if (settled && wakeAdmission) this._releasedWakeAdmissions.delete(evidence.admissionId!);
+      if (settled && wakeAdmission) this._wakeAdmissions.forgetReleased(evidence.admissionId!);
       const latest = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -4808,7 +4066,7 @@ export class Session {
     // A run in flight here is live (or settling) in this process.
     if (
       this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._wakeTerminalAdmissionsInFlight.has(evidence.admissionId) ||
+      this._wakeAdmissions.isInFlight(evidence.admissionId) ||
       this._runCompletionPromises.has(runId)
     ) {
       return 'active';
@@ -4821,7 +4079,7 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
-    if (this._releasedWakeAdmissions.has(evidence.admissionId)) return 'orphaned';
+    if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
     const completed = this._completedRuns.get(runId);
     if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
@@ -4870,9 +4128,7 @@ export class Session {
     // A lost CAS means the dispatch changed or the lease moved: its new owner
     // settles and reports the turn.
     if (swapped.applied) {
-      this._terminalTokenAccountedRunIds.delete(runId);
-      this._stagedTerminalRunIds.delete(runId);
-      this._terminalStagingAdmissions.delete(runId);
+      this._terminalStagingLedger.forgetStaging(runId);
     }
     return swapped.applied;
   }
@@ -4927,7 +4183,7 @@ export class Session {
     const { event, status, reconstructed } = this._buildRunCompletedEvent(runId, finishReason, usage, Date.now(), {
       resourceId: this.resourceId,
       threadId: this.threadId,
-      agentId: this._modeAgentId(modeId),
+      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
       modeId,
       modelId: evidence.modelId ?? this._record.modelId,
       operationKind: 'signal',
@@ -5000,9 +4256,12 @@ export class Session {
     // run consumed. Persist its staged usage before any terminal evidence
     // rewrite, using the same durable per-run accounting fence.
     let staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
-    if (staged === undefined && admission.status !== 'pending') {
-      // The scan may predate staging; staging needs a pending admission, so
-      // the evidence read after observing it settled is final.
+    if (admission.status !== 'pending') {
+      // The scan may predate staging, or predate another owner's settlement,
+      // which counted the staged usage before rewriting the evidence and then
+      // retired its fence. Staging needs a pending admission, so the evidence
+      // read after observing it settled is final: only output it still holds
+      // pending is counted here.
       const current = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -5010,7 +4269,8 @@ export class Session {
         threadId: this.threadId,
         signalId: evidence.signalId,
       });
-      if (current !== null && 'status' in current && current.status === 'pending') staged = current.stagedResult;
+      staged =
+        current !== null && 'status' in current && current.status === 'pending' ? current.stagedResult : undefined;
     }
     if (staged !== undefined) await this._accountStagedTerminalUsage(runId, staged as FullOutput<unknown>);
     if (admission.status !== 'pending') {
@@ -5018,9 +4278,7 @@ export class Session {
       // fence until the canonical evidence is terminal, or a restart would
       // account the still-staged output again.
       if (admission.status === 'committed') {
-        this._terminalTokenAccountedRunIds.delete(runId);
-        this._stagedTerminalRunIds.delete(runId);
-        this._terminalStagingAdmissions.delete(runId);
+        this._terminalStagingLedger.forgetStaging(runId);
       }
       return 'unowned';
     }
@@ -5105,9 +4363,7 @@ export class Session {
       recovery: { expectedDispatch: evidence.dispatch ?? null, leaseOwner },
     });
     if (receipt.status === 'committed') {
-      this._terminalTokenAccountedRunIds.delete(runId);
-      this._stagedTerminalRunIds.delete(runId);
-      this._terminalStagingAdmissions.delete(runId);
+      this._terminalStagingLedger.forgetStaging(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -5328,15 +4584,11 @@ export class Session {
           error: projectedError,
         });
       }
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(expiryError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
     }
 
     if (expiredPending.originSignalId !== undefined) {
@@ -5399,6 +4651,7 @@ export class Session {
     // the abort above makes that path finish. A parked suspension has no live
     // owner, so expiry closes its run here.
     if (activeController === undefined) {
+      this._releaseParkedRun(expiredPending);
       this._emitAgentEnd({ runId: expiredPending.runId, finishReason: 'error' });
     }
     this._notifyMaybeIdle();
@@ -5633,12 +4886,11 @@ export class Session {
     if (!recoveryStarted || recoveringPending === undefined) {
       if (
         expectedQueuedItemId !== undefined &&
-        this._currentQueuedItemId === expectedQueuedItemId &&
+        this._queueHead.currentId === expectedQueuedItemId &&
         this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
         !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
       ) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
+        this._queueHead.release();
         this._notifyMaybeIdle();
       }
       return false;
@@ -5705,15 +4957,11 @@ export class Session {
         ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
         error: projectedError,
       });
-      const resolver = this._queueResolvers.get(recoveringQueuedItemId);
+      const resolver = this._queueHead.takeResolver(recoveringQueuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(recoveringQueuedItemId);
         resolver.reject(recoveryError);
       }
-      if (this._currentQueuedItemId === recoveringQueuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(recoveringQueuedItemId);
     }
     this._emitAbortedToolEnds({ force: true });
     this._emitTurnEvent({
@@ -6132,7 +5380,7 @@ export class Session {
     this._captureTurnRunId(full);
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalTokenAccountedRunIds.has(full.runId))
+      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
     ) {
       return { tokenUsageAccounted: true };
     }
@@ -6140,8 +5388,8 @@ export class Session {
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
       if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
-      if (full.runId && this._stagedTerminalRunIds.has(full.runId)) {
-        this._terminalTokenAccountedRunIds.add(full.runId);
+      if (full.runId && this._terminalStagingLedger.isStaged(full.runId)) {
+        this._terminalStagingLedger.markAccounted(full.runId);
       }
       if (opts.persist !== false) this._schedulePersistTokenUsage();
       return { tokenUsageDelta, tokenUsageAccounted: true };
@@ -6414,7 +5662,7 @@ export class Session {
   isBusy(): boolean {
     if (this._currentTurnAbortController !== undefined) return true;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
     if (this._record.pendingResume !== undefined && this._record.cancelRequest === undefined) return true;
     if (this._subagentExecutionsInFlight > 0) return true;
@@ -6445,7 +5693,7 @@ export class Session {
     if (this._currentTurnAbortController !== undefined) return true;
     if (this._activeWorkInvalidationsInFlight > 0) return true;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
     return this._record.pendingResume !== undefined && this._record.cancelRequest === undefined;
   }
@@ -6481,14 +5729,14 @@ export class Session {
     if (this._subagentExecutionsInFlight > 0) return true;
     if (this._record.pendingResume !== undefined) return false;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     return (this._record.pendingQueue?.length ?? 0) > 0;
   }
 
   /**
    * Number of items currently waiting in `pendingQueue` (excluding any
    * queued item already drained into a live turn — that one is tracked
-   * via `_currentQueuedItemId`). Cheap, synchronous, safe to poll from UI.
+   * via `_queueHead.currentId`). Cheap, synchronous, safe to poll from UI.
    */
   getQueueDepth(): number {
     return this._record.pendingQueue?.length ?? 0;
@@ -6975,13 +6223,20 @@ export class Session {
     }
   }
 
+  /** @internal — the delegated children this process is settling now (see `_settlingDelegations`). */
+  _internalSettlingDelegations(): ReadonlySet<string> {
+    return this._settlingDelegations;
+  }
+
   /**
-   * @internal — call `listener` each time this process durably settles one of
-   * this session's delegated tasks. A settlement written by another process is
+   * @internal — call `listener` with the child id each time this process
+   * durably settles one of this session's delegated tasks, after the commit and
+   * before the public `delegate_settled` event, from every settlement path
+   * (driver, recovery, cancel). A settlement written by another process is
    * not signalled; readers that must see it still poll storage. A listener
    * that throws is ignored. Returns the unsubscribe function.
    */
-  _internalOnDelegatedSettlement(listener: () => void): () => void {
+  _internalOnDelegatedSettlement(listener: (subagentSessionId: string) => void): () => void {
     this._delegatedSettlementListeners.add(listener);
     return () => {
       this._delegatedSettlementListeners.delete(listener);
@@ -7211,26 +6466,23 @@ export class Session {
     // observable effect is the rejected operation promises + cleared queue +
     // updated display snapshot below.
     for (const dropped of removedItems) {
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessSessionCancelledError(this.id, durableReason));
       }
     }
     for (const completed of completedItems) {
-      const resolver = this._queueResolvers.get(completed.queuedItemId);
+      const resolver = this._queueHead.takeResolver(completed.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(completed.queuedItemId);
         resolver.resolve(completed.result);
       }
     }
     if (
       this._currentTurnAbortController === undefined &&
-      this._currentQueuedItemId !== undefined &&
-      removedItems.some(item => item.queuedItemId === this._currentQueuedItemId)
+      this._queueHead.currentId !== undefined &&
+      removedItems.some(item => item.queuedItemId === this._queueHead.currentId)
     ) {
-      this._currentQueuedItemId = undefined;
-      this._currentQueuedItemSource = undefined;
+      this._queueHead.release();
     }
     // §6.2: the tool-visible abort reason is typed. A cancel cascaded from this
     // session's parent (harness-owned `parentOrigin`, matching this child's
@@ -7429,15 +6681,11 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._pendingReplacementToolSurfaces.delete(pending.runId);
     if (queuedItemId !== undefined) {
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(abortError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
       this._emit({
         type: 'queue_failed',
         queuedItemId,
@@ -7455,6 +6703,7 @@ export class Session {
       error: projectedError,
     });
     if (this._currentTurnAbortController === undefined) {
+      this._releaseParkedRun(pending);
       this._emitAgentEnd({ runId: pending.runId, finishReason: 'error' });
     }
     this._notifyMaybeIdle();
@@ -7509,7 +6758,7 @@ export class Session {
       const idx = queue.findIndex(item => item.id === targetId);
       const activeResumeId =
         prev.pendingResume !== undefined ? this._queuedItemIdForPendingResume(prev.pendingResume) : undefined;
-      if (idx <= 0 || this._currentQueuedItemId === targetId || activeResumeId === targetId) return prev;
+      if (idx <= 0 || this._queueHead.currentId === targetId || activeResumeId === targetId) return prev;
 
       const item = queue[idx]!;
       const receipts = prev.queueAdmissionReceipts ?? {};
@@ -7548,9 +6797,8 @@ export class Session {
 
     // §10.2: queue-item cancellation is not a public event — the observable
     // effect is the rejected operation promise below + the cleared queue.
-    const resolver = this._queueResolvers.get(removed.queuedItemId);
+    const resolver = this._queueHead.takeResolver(removed.queuedItemId);
     if (resolver) {
-      this._queueResolvers.delete(removed.queuedItemId);
       resolver.reject(new HarnessSessionCancelledError(this.id, reason));
     }
     if ((this._record.pendingQueue?.length ?? 0) > 0) {
@@ -7691,9 +6939,8 @@ export class Session {
    * decide whether to surface the error or call `clearWorkspaceLost()` and
    * try again with a fresh workspace.
    */
-  async getWorkspace(): Promise<Workspace | undefined> {
-    this._assertLive('getWorkspace()');
-    return this._getWorkspaceUnchecked();
+  getWorkspace(): Promise<Workspace | undefined> {
+    return this._sessionWorkspace.getWorkspace();
   }
 
   // ---------------------------------------------------------------------------
@@ -7710,7 +6957,7 @@ export class Session {
   /** §6.1: is a workspace CONFIGURED for this harness (regardless of whether it
    * has been materialized)? Sync, non-materializing. */
   hasWorkspace(): boolean {
-    return this._harness._workspaceKind !== undefined;
+    return this._sessionWorkspace.hasWorkspace();
   }
 
   /** §6.1: is a usable workspace handle already materialized (warm/cached)? Sync,
@@ -7718,87 +6965,25 @@ export class Session {
    * resolved" (or lost). A workspace marked lost is NOT ready even if a stale
    * handle lingers. */
   isWorkspaceReady(): boolean {
-    return this._workspace !== undefined && !this._workspaceLost;
+    return this._sessionWorkspace.isWorkspaceReady();
   }
 
   /** §6.1: the already-materialized workspace handle, or `undefined` if it has not
    * been resolved yet (or was lost). Sync and NON-materializing — never triggers a
    * cold start and never throws; `resolveWorkspace()` surfaces a lost workspace. */
   peekWorkspace(): Workspace | undefined {
-    return this._workspaceLost ? undefined : this._workspace;
+    return this._sessionWorkspace.peekWorkspace();
   }
 
   /** §6.1: explicitly materialize/resume the workspace (a cloud sandbox cold start
    * may happen here). Throws `HarnessWorkspaceLostError` if the workspace was lost
    * across restart, or a validation error if no workspace is configured. */
-  async resolveWorkspace(): Promise<Workspace> {
-    const workspace = await this.getWorkspace();
-    if (workspace === undefined) {
-      throw new HarnessValidationError(
-        'resolveWorkspace()',
-        'no workspace is configured for this harness (set `workspace.kind` in HarnessConfig)',
-      );
-    }
-    return workspace;
+  resolveWorkspace(): Promise<Workspace> {
+    return this._sessionWorkspace.resolveWorkspace();
   }
 
-  private async _getWorkspaceUnchecked(): Promise<Workspace | undefined> {
-    if (this._workspace) return this._workspace;
-    if (this._workspaceResolving) return this._workspaceResolving;
-
-    const kind = this._harness._workspaceKind;
-    if (!kind) return undefined;
-
-    if (this._workspaceLost) {
-      throw new HarnessWorkspaceLostError(this.id, {
-        reason: 'restart',
-        providerId: this._harness._workspaceRegistry.providerId,
-      });
-    }
-
-    const resolve = async (): Promise<Workspace> => {
-      if (kind === 'shared') {
-        return this._harness._workspaceRegistry.acquireShared();
-      }
-      if (kind === 'per-resource') {
-        return this._harness._workspaceRegistry.acquirePerResource({ resourceId: this.resourceId });
-      }
-      // kind === 'per-session'
-      // Subagent sessions with `workspace: 'inherit'` reuse the parent's entry.
-      // The spawn tool flips `_subagentFreshWorkspace` for the `fresh` case so
-      // we don't accidentally inherit when a fresh workspace is requested.
-      if (this.parentSessionId && this._subagentInheritWorkspace) {
-        // §6.2 strict-lazy: a lazy parent turn may not have materialized its
-        // workspace yet, but inheriting requires the parent's entry to exist.
-        // Resolve the (live) parent's workspace first (idempotent).
-        await this._harness._internalEnsureParentWorkspaceForInherit(this.parentSessionId);
-        return this._harness._workspaceRegistry.inheritPerSession({
-          parentSessionId: this.parentSessionId,
-          childSessionId: this.id,
-          resourceId: this.resourceId,
-        });
-      }
-      const storedProviderId = this._record.workspace?.providerId;
-      const storedState = this._record.workspace?.state;
-      return this._harness._workspaceRegistry.acquirePerSession({
-        resourceId: this.resourceId,
-        sessionId: this.id,
-        ...(this.parentSessionId ? { parentSessionId: this.parentSessionId } : {}),
-        ...(storedProviderId ? { storedProviderId } : {}),
-        ...(storedState !== undefined ? { storedState } : {}),
-        onStateUpdate: async state => {
-          await this._persistWorkspaceState(state);
-        },
-      });
-    };
-
-    this._workspaceResolving = resolve();
-    try {
-      this._workspace = await this._workspaceResolving;
-      return this._workspace;
-    } finally {
-      this._workspaceResolving = undefined;
-    }
+  private _getWorkspaceUnchecked(): Promise<Workspace | undefined> {
+    return this._sessionWorkspace._getWorkspaceUnchecked();
   }
 
   /**
@@ -7806,7 +6991,34 @@ export class Session {
    * carries workspace state but the configured provider is non-resumable.
    */
   _markWorkspaceLost(): void {
-    this._workspaceLost = true;
+    this._sessionWorkspace._markWorkspaceLost();
+  }
+
+  /** Build the small port the workspace needs. */
+  private _workspacePort(): WorkspaceSessionPort {
+    const session = this;
+    return {
+      get id() {
+        return session.id;
+      },
+      get resourceId() {
+        return session.resourceId;
+      },
+      get parentSessionId() {
+        return session.parentSessionId;
+      },
+      get harness() {
+        return session._harness;
+      },
+      get record() {
+        return session._record;
+      },
+      get subagentInheritWorkspace() {
+        return session._subagentInheritWorkspace;
+      },
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+    };
   }
 
   /**
@@ -7860,32 +7072,11 @@ export class Session {
    */
   _subagentTracingContext?: TracingContext;
 
-  /** @internal — writes the latest opaque workspace state into the session record. */
-  private async _persistWorkspaceState(state: unknown): Promise<void> {
-    const providerId = this._harness._workspaceRegistry.providerId;
-    if (!providerId) return;
-    await this._flushUpdate(record => ({
-      ...record,
-      workspace: { providerId, state },
-    }));
-  }
-
   // -------------------------------------------------------------------------
-  // Skills — §4.6.
+  // Skills — §4.6, MCP catalog — PF-562, action catalog — PF-576.
   //
-  // Code-registered skills are merged ahead of workspace-discovered skills.
-  // Workspace-discovered entries are projected from the configured
-  // `WorkspaceSkills` source into `HarnessSkill` descriptors. Discovery runs
-  // asynchronously on the first `list` / `get` / `use` call per in-memory
-  // Session instance and the merged result is cached for the session's
-  // lifetime. Concurrent calls during a generation share a single-flight
-  // promise. `refresh()` drops the cache so the next call re-runs discovery.
-  //
-  // `use(ref, opts?)` resolves a code-registered or workspace skill by name
-  // or relative path, validates declared args, appends a JSON code block
-  // carrying the validated args to the skill body, and delegates to the
-  // signal-driven message path. The returned `AgentResult` is the underlying
-  // turn's result.
+  // Implemented by `SessionSkillsMcpActions` (session-skills-mcp-actions.ts);
+  // the facade objects below are the same frozen objects it builds.
   // -------------------------------------------------------------------------
 
   /**
@@ -7900,1034 +7091,41 @@ export class Session {
    * promise. `refresh()` drops the cache so the next call re-runs
    * discovery.
    */
-  readonly skills = Object.freeze({
-    /**
-     * List skills available to this session.
-     *
-     * Returns code-registered skills plus workspace-discovered skills.
-     * If the session has no workspace configured, only code-registered
-     * skills are returned.
-     */
-    list: (): Promise<HarnessSkill[]> => this._skillsList(),
-    /**
-     * Look up a skill by name. Returns `undefined` when the name does not
-     * resolve in the code or workspace catalogues.
-     */
-    get: (name: string): Promise<HarnessSkill | undefined> => this._skillsGet(name),
-    /**
-     * Drop the cached workspace-discovery result. The next `list` / `get`
-     * / `use` call re-runs discovery through the configured workspace
-     * skill source. Local-only — absent from `RemoteSession` (§13.5).
-     */
-    refresh: (): Promise<void> => this._skillsRefresh(),
-    /**
-     * Resolve a code-registered skill by name, or a workspace skill by name
-     * or relative path, optionally validate provided arguments against the
-     * skill's declared args schema, append a JSON code block of the validated
-     * args to the skill instructions, and dispatch the result
-     * through the signal-driven message path as a single turn. Resolves
-     * to the underlying turn's `AgentResult`.
-     *
-     * Throws {@link HarnessSkillNotFoundError} when `ref` does not match
-     * any skill, and {@link HarnessSkillArgsValidationError} when declared
-     * args are invalid.
-     */
-    use: (ref: string, opts?: UseSkillOptions): Promise<AgentResult> => this._skillsUse(ref, opts),
-  });
+  readonly skills = this._skillsMcpActions.skills;
 
-  // -------------------------------------------------------------------------
-  // MCP catalog — PF-562 / PF-552 desktop integration inventory.
-  //
-  // This is an inventory snapshot over MCP servers registered on the Harness
-  // Mastra instance. Tool descriptors use MCPServerBase.getToolListInfo() so
-  // lazy MCP client proxies can populate remote tool catalogs on demand.
-  // Execution permission remains enforced by the MCP tool runtime; this
-  // catalog only lets desktop hosts render integrations.
-  // -------------------------------------------------------------------------
+  /** MCP servers registered on the Harness Mastra instance and their tool descriptors (PF-562). */
+  readonly mcp = this._skillsMcpActions.mcp;
 
-  readonly mcp = Object.freeze({
-    /** List MCP servers registered on the Harness Mastra instance. */
-    listServers: (): HarnessMcpServerDescriptor[] => this._mcpListServers(),
-    /** Look up one MCP server by Mastra registration key. */
-    getServer: (key: string): HarnessMcpServerDescriptor | undefined => this._mcpGetServer(key),
-    /** List MCP tool descriptors for one registered server key. */
-    listTools: (key: string): Promise<HarnessMcpToolDescriptor[] | undefined> => {
-      this._assertLive('mcp.listTools()');
-      this._assertMcpServerKey('mcp.listTools()', key);
-      return this._mcpListTools(key);
-    },
-  });
+  /** Read-only desktop action catalog over skill action metadata and MCP tools (PF-576). */
+  readonly actions = this._skillsMcpActions.actions;
 
-  // -------------------------------------------------------------------------
-  // Action catalog — PF-576 / PF-552 desktop palette inventory.
-  //
-  // This is a read-only aggregate over skill action metadata and MCP tool
-  // descriptors. It intentionally exposes no execution or lifecycle controls;
-  // callers use the source surfaces referenced by each entry.
-  // -------------------------------------------------------------------------
-
-  readonly actions = Object.freeze({
-    /** List/search local desktop action catalog entries. */
-    list: (options?: HarnessActionCatalogListOptions): Promise<HarnessActionCatalogEntry[]> =>
-      this._actionsList(options),
-    /** Convenience wrapper for `list({ query, ...options })`. */
-    search: (
-      query: string,
-      options?: Omit<HarnessActionCatalogListOptions, 'query'>,
-    ): Promise<HarnessActionCatalogEntry[]> => this._actionsSearch(query, options),
-    /** Refresh already-materialized workspace skills and clear cached action catalog discovery. */
-    refresh: (): Promise<void> => this._actionsRefresh(),
-  });
-
-  private _mcpListServers(): HarnessMcpServerDescriptor[] {
-    this._assertLive('mcp.listServers()');
-    return this._harness._listMcpServers().map(([key, server]) => this._projectMcpServer(key, server));
-  }
-
-  private _mcpGetServer(key: string): HarnessMcpServerDescriptor | undefined {
-    this._assertLive('mcp.getServer()');
-    this._assertMcpServerKey('mcp.getServer()', key);
-    const server = this._harness._getMcpServer(key);
-    return server ? this._projectMcpServer(key, server) : undefined;
-  }
-
-  private async _mcpListTools(
-    key: string,
-    abortSignal: AbortSignal = new AbortController().signal,
-    opts: { resolveWorkspace?: boolean } = {},
-  ): Promise<HarnessMcpToolDescriptor[] | undefined> {
-    const server = this._harness._getMcpServer(key);
-    if (!server) return undefined;
-    const requestContext = await this._buildRequestContext({
-      modeId: this._record.modeId,
-      modelId: this._record.modelId,
-      abortSignal,
-      resolveWorkspace: opts.resolveWorkspace,
-    });
-    const toolList = await server.getToolListInfo(requestContext);
-    const convertedTools = server.tools();
-    return toolList.tools.map(toolInfo => {
-      const infoWithId = toolInfo as typeof toolInfo & { id?: unknown };
-      const toolName = typeof infoWithId.id === 'string' && infoWithId.id.length > 0 ? infoWithId.id : toolInfo.name;
-      const convertedTool = convertedTools[toolName];
-      const inputSchema = cloneMcpSchemaLike(toolInfo.inputSchema ?? convertedTool?.parameters);
-      const outputSchema = cloneMcpSchemaLike(toolInfo.outputSchema ?? convertedTool?.outputSchema);
-      const meta = cloneMcpCatalogRecord(toolInfo._meta ?? convertedTool?.mcp?._meta);
-      const toolType = toolInfo.toolType ?? convertedTool?.mcp?.toolType;
-      return {
-        serverKey: key,
-        name: toolName,
-        ...(toolInfo.description ? { description: toolInfo.description } : {}),
-        ...(inputSchema !== undefined ? { inputSchema } : {}),
-        ...(outputSchema !== undefined ? { outputSchema } : {}),
-        ...(toolType ? { toolType } : {}),
-        ...(meta ? { meta } : {}),
-        ...(convertedTool?.strict !== undefined ? { strict: convertedTool.strict } : {}),
-      };
-    });
-  }
-
-  private _assertMcpServerKey(method: string, key: unknown): asserts key is string {
-    if (typeof key !== 'string' || key.length === 0) {
-      throw new HarnessValidationError(method, 'key must be a non-empty string');
-    }
-    if (RESERVED_MCP_SERVER_KEYS.has(key)) {
-      throw new HarnessValidationError(method, 'key must not be a reserved object property name');
-    }
-  }
-
-  private _projectMcpServer(
-    key: string,
-    server: NonNullable<ReturnType<Harness['_getMcpServer']>>,
-  ): HarnessMcpServerDescriptor {
-    const repository = cloneMcpCatalogRecord(server.repository);
-    const packages = cloneMcpCatalogRecordArray(server.packages);
-    const remotes = cloneMcpCatalogRecordArray(server.remotes);
+  /** Build the small port the skills/MCP/actions catalog needs. */
+  private _skillsMcpActionsPort(): SkillsMcpActionsSessionPort {
+    const session = this;
     return {
-      key,
-      id: server.id,
-      name: server.name,
-      version: server.version,
-      ...(server.description ? { description: server.description } : {}),
-      ...(server.instructions ? { instructions: server.instructions } : {}),
-      releaseDate: server.releaseDate,
-      isLatest: server.isLatest,
-      ...(repository ? { repository } : {}),
-      ...(server.packageCanonical ? { packageCanonical: server.packageCanonical } : {}),
-      ...(packages ? { packages } : {}),
-      ...(remotes ? { remotes } : {}),
-    };
-  }
-
-  private async _actionsSearch(
-    query: string,
-    options?: Omit<HarnessActionCatalogListOptions, 'query'>,
-  ): Promise<HarnessActionCatalogEntry[]> {
-    this._assertLive('actions.search()');
-    if (typeof query !== 'string') {
-      throw new HarnessValidationError('actions.search()', 'query must be a string');
-    }
-    if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options))) {
-      throw new HarnessValidationError('actions.search()', 'options must be an object');
-    }
-    return this._actionsList({ ...options, query });
-  }
-
-  private async _actionsList(options?: HarnessActionCatalogListOptions): Promise<HarnessActionCatalogEntry[]> {
-    this._assertLive('actions.list()');
-    const normalized = this._normalizeActionCatalogOptions(options);
-    if (normalized.limit === 0) return [];
-    const entries = await this._buildActionCatalogEntries(normalized.source);
-    const filtered = entries.filter(entry => this._matchesActionCatalogOptions(entry, normalized));
-    return filtered
-      .sort((a, b) => {
-        const sourceOrder = ACTION_CATALOG_SOURCE_ORDER[a.source.kind] - ACTION_CATALOG_SOURCE_ORDER[b.source.kind];
-        return sourceOrder === 0 ? compareActionCatalogIds(a.id, b.id) : sourceOrder;
-      })
-      .slice(normalized.offset, normalized.offset + normalized.limit)
-      .map(entry => cloneActionCatalogEntry(entry));
-  }
-
-  private async _actionsRefresh(): Promise<void> {
-    this._assertLive('actions.refresh()');
-    this._clearSkillAndActionCatalogCaches();
-    try {
-      await this._workspace?.skills?.refresh();
-    } finally {
-      this._clearSkillAndActionCatalogCaches();
-    }
-  }
-
-  private _clearSkillAndActionCatalogCaches(): void {
-    this._skillsCache = undefined;
-    this._skillsResolving = undefined;
-    this._actionsSkillEntriesCache = undefined;
-    this._actionsSkillEntriesResolving = undefined;
-    this._actionsMcpEntriesCacheByServer.clear();
-    this._actionsMcpEntriesResolvingByServer.clear();
-    this._actionsMcpTimedOutWorkByServer.clear();
-    this._actionsMcpCatalogGeneration++;
-  }
-
-  private _normalizeActionCatalogOptions(options?: HarnessActionCatalogListOptions): {
-    query: string;
-    source?: HarnessActionCatalogSourceKind;
-    limit: number;
-    offset: number;
-  } {
-    if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options))) {
-      throw new HarnessValidationError('actions.list()', 'options must be an object');
-    }
-    const query = options?.query ?? '';
-    if (typeof query !== 'string') {
-      throw new HarnessValidationError('actions.list()', 'query must be a string');
-    }
-    const source = options?.source;
-    if (source !== undefined && !ACTION_CATALOG_SOURCE_KINDS.includes(source)) {
-      throw new HarnessValidationError(
-        'actions.list()',
-        `source must be one of ${ACTION_CATALOG_SOURCE_KINDS.join(' | ')}`,
-      );
-    }
-    const limit = options?.limit ?? ACTION_CATALOG_DEFAULT_LIMIT;
-    if (!Number.isInteger(limit) || limit < 0 || limit > ACTION_CATALOG_MAX_LIMIT) {
-      throw new HarnessValidationError(
-        'actions.list()',
-        `limit must be an integer between 0 and ${ACTION_CATALOG_MAX_LIMIT}`,
-      );
-    }
-    const offset = options?.offset ?? 0;
-    if (!Number.isInteger(offset) || offset < 0) {
-      throw new HarnessValidationError('actions.list()', 'offset must be a non-negative integer');
-    }
-    return { query: query.trim().toLowerCase(), source, limit, offset };
-  }
-
-  private _matchesActionCatalogOptions(
-    entry: HarnessActionCatalogEntry,
-    options: { query: string; source?: HarnessActionCatalogSourceKind; limit: number; offset: number },
-  ): boolean {
-    if (options.source !== undefined && entry.source.kind !== options.source) return false;
-    if (options.query.length === 0) return true;
-    const haystack = this._actionCatalogSearchText(entry).toLowerCase();
-    return haystack.includes(options.query);
-  }
-
-  private _actionCatalogSearchText(entry: HarnessActionCatalogEntry): string {
-    const parts = [entry.id, entry.label, entry.description, entry.category, entry.status, entry.statusReason];
-    if (entry.source.kind === 'skill') {
-      parts.push(entry.source.skillName, entry.source.filePath);
-    } else if (entry.source.kind === 'mcp-server') {
-      parts.push(entry.source.serverKey, entry.mcp?.serverName);
-    } else {
-      parts.push(entry.source.serverKey, entry.source.toolName, entry.mcp?.serverName);
-    }
-    if (entry.shortcuts) {
-      for (const shortcut of entry.shortcuts) {
-        parts.push(shortcut.id, shortcut.label, ...(shortcut.keys ?? []));
-      }
-    }
-    return parts.filter((part): part is string => typeof part === 'string' && part.length > 0).join('\n');
-  }
-
-  private async _buildActionCatalogEntries(
-    source?: HarnessActionCatalogSourceKind,
-  ): Promise<HarnessActionCatalogEntry[]> {
-    const skillEntries =
-      source === 'mcp-tool' || source === 'mcp-server' ? [] : await this._resolveSkillActionCatalogEntries();
-    const mcpEntries: HarnessActionCatalogEntry[] = [];
-    if (source !== 'skill') {
-      mcpEntries.push(...(await this._resolveMcpActionCatalogEntries()));
-    }
-    return [...skillEntries, ...mcpEntries];
-  }
-
-  private async _resolveSkillActionCatalogEntries(): Promise<HarnessActionCatalogEntry[]> {
-    if (this._actionsSkillEntriesCache) return this._actionsSkillEntriesCache;
-    if (this._actionsSkillEntriesResolving) return this._actionsSkillEntriesResolving;
-
-    const build = async (): Promise<HarnessActionCatalogEntry[]> => {
-      const codeSkills = this._harness._listCodeSkills();
-      const entries: ActionCatalogSkillDescriptor[] = [...codeSkills];
-      let workspace: Workspace | undefined;
-      try {
-        workspace = await this.getWorkspace();
-      } catch (error) {
-        if (!(error instanceof HarnessWorkspaceLostError)) {
-          throw error;
-        }
-      }
-      const workspaceSkills = workspace?.skills;
-      if (workspaceSkills) {
-        const workspaceEntries = await workspaceSkills.list();
-        const codeActionNames = new Set(
-          codeSkills.filter(skill => this._projectSkillActionCatalogEntry(skill).length > 0).map(skill => skill.name),
-        );
-        for (const meta of workspaceEntries) {
-          if (codeActionNames.has(meta.name) && !meta.path) continue;
-          entries.push({
-            name: meta.name,
-            description: meta.description,
-            ...(meta.path ? { filePath: meta.path } : {}),
-            ...(meta.metadata ? { metadata: meta.metadata } : {}),
-          });
-        }
-      }
-      return entries.flatMap(skill => this._projectSkillActionCatalogEntry(skill));
-    };
-
-    const pending = build();
-    this._actionsSkillEntriesResolving = pending;
-    try {
-      const result = await pending;
-      if (this._actionsSkillEntriesResolving === pending) {
-        this._actionsSkillEntriesCache = result;
-      }
-      return result;
-    } finally {
-      if (this._actionsSkillEntriesResolving === pending) {
-        this._actionsSkillEntriesResolving = undefined;
-      }
-    }
-  }
-
-  private _projectSkillActionCatalogEntry(skill: ActionCatalogSkillDescriptor): HarnessActionCatalogEntry[] {
-    const action = skill.action ?? cloneActionMetadataLike(skill.metadata?.action);
-    if (!action) return [];
-    const idSource = skill.filePath ?? skill.name;
-    return [
-      {
-        id: `skill:${encodeActionCatalogIdPart(idSource)}`,
-        source: {
-          kind: 'skill',
-          ref: skill.filePath ?? skill.name,
-          skillName: skill.name,
-          ...(skill.filePath ? { filePath: skill.filePath } : {}),
-        },
-        status: 'available',
-        label: action.displayName ?? skill.name,
-        description: skill.description,
-        ...(skill.category ? { category: skill.category } : {}),
-        ...(action.icon ? { icon: action.icon } : {}),
-        ...(action.shortcuts
-          ? { shortcuts: cloneMcpCatalogValue(action.shortcuts) as HarnessActionCatalogEntry['shortcuts'] }
-          : {}),
-        ...(action.inputSchema ? { inputSchema: cloneMcpCatalogValue(action.inputSchema) } : {}),
-        ...(action.outputSchema ? { outputSchema: cloneMcpCatalogValue(action.outputSchema) } : {}),
-        ...(action.artifactTypes ? { artifactTypes: [...action.artifactTypes] } : {}),
-        ...(action.permissions
-          ? { permissions: cloneMcpCatalogValue(action.permissions) as HarnessActionCatalogEntry['permissions'] }
-          : {}),
+      get id() {
+        return session.id;
       },
-    ];
-  }
-
-  private _projectMcpToolActionCatalogEntry(
-    server: HarnessMcpServerDescriptor,
-    tool: HarnessMcpToolDescriptor,
-  ): HarnessActionCatalogEntry {
-    return {
-      id: `mcp-tool:${encodeActionCatalogIdPart(server.key)}:${encodeActionCatalogIdPart(tool.name)}`,
-      source: { kind: 'mcp-tool', serverKey: server.key, toolName: tool.name },
-      status: 'available',
-      label: tool.name,
-      ...(tool.description ? { description: tool.description } : {}),
-      ...(tool.inputSchema !== undefined ? { inputSchema: cloneMcpCatalogValue(tool.inputSchema) } : {}),
-      ...(tool.outputSchema !== undefined ? { outputSchema: cloneMcpCatalogValue(tool.outputSchema) } : {}),
-      permissions: { mcpScopes: [server.key] },
-      mcp: {
-        serverName: server.name,
-        serverVersion: server.version,
-        ...(tool.toolType ? { toolType: tool.toolType } : {}),
-        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
-        ...(tool.meta ? { meta: cloneMcpCatalogValue(tool.meta) as Record<string, unknown> } : {}),
+      get harness() {
+        return session._harness;
       },
+      get record() {
+        return session._record;
+      },
+      get workspace() {
+        return session._sessionWorkspace.cachedWorkspace;
+      },
+      assertLive: method => session._assertLive(method),
+      isBusy: () => session.isBusy(),
+      busyReason: () => session._busyReason(),
+      buildRequestContext: turn => session._buildRequestContext(turn),
+      getWorkspace: () => session.getWorkspace(),
+      message: opts => session.message(opts),
     };
   }
 
-  private _projectUnavailableMcpActionCatalogEntry(
-    server: HarnessMcpServerDescriptor,
-    reason: HarnessActionCatalogUnavailableReason,
-  ): HarnessActionCatalogEntry {
-    const statusMessage =
-      reason === 'mcp_tool_catalog_timeout'
-        ? 'MCP tool catalog timed out'
-        : reason === 'mcp_tool_catalog_retry_suppressed'
-          ? 'MCP tool catalog retry delayed'
-          : 'MCP tool catalog unavailable';
-    return {
-      id: `mcp-server:${encodeActionCatalogIdPart(server.key)}`,
-      source: { kind: 'mcp-server', serverKey: server.key },
-      status: 'unavailable',
-      statusReason: reason,
-      statusMessage,
-      label: server.name,
-      ...(server.description ? { description: server.description } : {}),
-      permissions: { mcpScopes: [server.key] },
-      mcp: {
-        serverName: server.name,
-        serverVersion: server.version,
-      },
-    };
-  }
-
-  private _actionMcpCatalogCacheKey(server: HarnessMcpServerDescriptor, workspaceId: string): string {
-    // canonicalJson is NUL-/sentinel-safe: every byte (incl. the historical '\0'
-    // separator) is JSON-escaped, so distinct (serverKey, modeId, modelId,
-    // workspaceId) tuples — any of which can carry arbitrary strings — never
-    // collide the way a single-char `join` could.
-    return canonicalJson([server.key, this._record.modeId, this._record.modelId ?? null, workspaceId]);
-  }
-
-  private _currentMcpActionCatalogWorkspaceId(): string {
-    // MCP catalog reads pass `resolveWorkspace: false`; key only by a workspace
-    // that was already materialized so catalog reads never provision one.
-    return this._workspace?.id ?? '';
-  }
-
-  private _getCachedMcpActionCatalogEntries(cacheKey: string): HarnessActionCatalogEntry[] | undefined {
-    const cached = this._actionsMcpEntriesCacheByServer.get(cacheKey);
-    if (!cached) return undefined;
-    if (cached.expiresAt === undefined || cached.expiresAt > Date.now()) {
-      return cached.entries;
-    }
-    this._actionsMcpEntriesCacheByServer.delete(cacheKey);
-    return undefined;
-  }
-
-  private async _resolveMcpActionCatalogEntries(): Promise<HarnessActionCatalogEntry[]> {
-    const results = await Promise.all(
-      this._mcpListServers().map(server => this._resolveMcpActionCatalogEntriesForServer(server)),
-    );
-    return results.flat();
-  }
-
-  private _startMcpActionCatalogEntriesForServer(
-    server: HarnessMcpServerDescriptor,
-    cacheKey: string,
-    retryCount = 0,
-  ): Promise<HarnessActionCatalogEntry[]> {
-    const catalogGeneration = this._actionsMcpCatalogGeneration;
-    let pending: Promise<HarnessActionCatalogEntry[]>;
-    const started = startActionCatalogMcpListWithTimeout(
-      async abortSignal => {
-        const tools = await this._mcpListTools(server.key, abortSignal, { resolveWorkspace: false });
-        return (tools ?? []).map(tool => this._projectMcpToolActionCatalogEntry(server, tool));
-      },
-      work => {
-        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-          this._actionsMcpTimedOutWorkByServer.set(cacheKey, {
-            work,
-            retryAfter: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
-            retryCount,
-          });
-        }
-      },
-    );
-    pending = started.pending;
-    const { work, didTimeout } = started;
-    pending.catch(() => {
-      // `pending` is observed below for cache/single-flight cleanup; attach
-      // this noop handler immediately so timeout rejection is never unhandled.
-    });
-    this._actionsMcpEntriesResolvingByServer.set(cacheKey, pending);
-
-    pending
-      .then(entries => {
-        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) === pending) {
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-            entries,
-            expiresAt: Date.now() + ACTION_CATALOG_MCP_SUCCESS_CACHE_MS,
-            successful: true,
-          });
-          this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
-        }
-      })
-      .catch(error => {
-        if (this._actionsMcpEntriesResolvingByServer.get(cacheKey) !== pending) return;
-        const timeoutWorkStillTracked = this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work;
-        const didCatalogTimeout =
-          error instanceof ActionCatalogMcpListTimeoutError || (didTimeout() && timeoutWorkStillTracked);
-        const existingCache = this._actionsMcpEntriesCacheByServer.get(cacheKey);
-        const hasSuccessfulTimedOutResult = existingCache?.successful === true;
-        if ((!didCatalogTimeout || timeoutWorkStillTracked) && !hasSuccessfulTimedOutResult) {
-          const reason: HarnessActionCatalogUnavailableReason = didCatalogTimeout
-            ? 'mcp_tool_catalog_timeout'
-            : 'mcp_tool_catalog_failed';
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-            entries: [this._projectUnavailableMcpActionCatalogEntry(server, reason)],
-            expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
-          });
-        }
-        this._actionsMcpEntriesResolvingByServer.delete(cacheKey);
-      });
-
-    work
-      .then(entries => {
-        if (didTimeout() && this._actionsMcpCatalogGeneration === catalogGeneration) {
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-            entries,
-            expiresAt: Date.now() + ACTION_CATALOG_MCP_SUCCESS_CACHE_MS,
-            successful: true,
-          });
-        }
-      })
-      .catch(() => {
-        if (didTimeout() && this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work) {
-          this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-            entries: [this._projectUnavailableMcpActionCatalogEntry(server, 'mcp_tool_catalog_timeout')],
-            expiresAt: Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
-          });
-        }
-      })
-      .finally(() => {
-        if (didTimeout() && this._actionsMcpTimedOutWorkByServer.get(cacheKey)?.work === work) {
-          this._actionsMcpTimedOutWorkByServer.delete(cacheKey);
-        }
-      });
-
-    return pending;
-  }
-
-  private async _resolveMcpActionCatalogEntriesForServer(
-    server: HarnessMcpServerDescriptor,
-  ): Promise<HarnessActionCatalogEntry[]> {
-    const cacheKey = this._actionMcpCatalogCacheKey(server, this._currentMcpActionCatalogWorkspaceId());
-    const cached = this._getCachedMcpActionCatalogEntries(cacheKey);
-    if (cached) return cached;
-
-    const timedOutWork = this._actionsMcpTimedOutWorkByServer.get(cacheKey);
-    if (
-      timedOutWork &&
-      (timedOutWork.retryAfter > Date.now() || timedOutWork.retryCount >= ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES)
-    ) {
-      const entries = [this._projectUnavailableMcpActionCatalogEntry(server, 'mcp_tool_catalog_retry_suppressed')];
-      this._actionsMcpEntriesCacheByServer.set(cacheKey, {
-        entries,
-        expiresAt:
-          timedOutWork.retryAfter > Date.now()
-            ? timedOutWork.retryAfter
-            : Date.now() + ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
-      });
-      return entries;
-    }
-    if (timedOutWork) {
-      this._actionsMcpTimedOutWorkByServer.delete(cacheKey);
-    }
-
-    const pending =
-      this._actionsMcpEntriesResolvingByServer.get(cacheKey) ??
-      this._startMcpActionCatalogEntriesForServer(server, cacheKey, (timedOutWork?.retryCount ?? -1) + 1);
-    try {
-      return await pending;
-    } catch (error) {
-      const reason: HarnessActionCatalogUnavailableReason =
-        error instanceof ActionCatalogMcpListTimeoutError ? 'mcp_tool_catalog_timeout' : 'mcp_tool_catalog_failed';
-      return [this._projectUnavailableMcpActionCatalogEntry(server, reason)];
-    }
-  }
-
-  private async _skillsList(): Promise<HarnessSkill[]> {
-    this._assertLive('skills.list()');
-    return this._resolveSkills();
-  }
-
-  private async _skillsGet(name: string): Promise<HarnessSkill | undefined> {
-    this._assertLive('skills.get()');
-    if (typeof name !== 'string' || name.length === 0) {
-      throw new HarnessValidationError('skills.get()', 'name must be a non-empty string');
-    }
-    const codeSkill = this._harness._getCodeSkill(name);
-    if (codeSkill) return codeSkill;
-    const skills = await this._resolveSkills();
-    return skills.find(s => s.name === name);
-  }
-
-  private async _skillsRefresh(): Promise<void> {
-    this._assertLive('skills.refresh()');
-    this._clearSkillAndActionCatalogCaches();
-    try {
-      await this._workspace?.skills?.refresh();
-    } finally {
-      this._clearSkillAndActionCatalogCaches();
-    }
-  }
-
-  /**
-   * Resolve a code-registered skill by name, or a workspace skill by name or
-   * relative path, validate any declared args schema, inject the validated
-   * args as a JSON code block into the skill instructions, and dispatch the
-   * result through `message()` as a single turn. Returns the underlying
-   * `AgentResult`.
-   *
-   * Reference resolution mirrors Flue's workspace `session.skill(ref, ...)`
-   * behavior for explicit workspace paths, then checks the static code
-   * registry by name, then falls back to workspace skill names. A code skill
-   * owns its name, but does not hide an otherwise shadowed workspace skill's
-   * explicit path reference.
-   */
-  private _isExplicitWorkspaceSkillRef(ref: string): boolean {
-    return (
-      ref.includes('/') || ref.startsWith('./') || ref.startsWith('../') || /\.(?:md|mdx|txt|yaml|yml)$/i.test(ref)
-    );
-  }
-
-  private async _skillsUse(ref: string, opts?: UseSkillOptions): Promise<AgentResult> {
-    this._assertLive('skills.use()');
-    if (typeof ref !== 'string' || ref.length === 0) {
-      throw new HarnessValidationError('skills.use()', 'ref must be a non-empty string');
-    }
-    // §3: useSkill is a fail-fast operation — it must refuse on a busy session
-    // rather than interleaving/queuing like a default message.
-    if (this.isBusy()) {
-      throw new HarnessBusyError(this.id, this._busyReason());
-    }
-
-    // §4.4c: validate caller request context before skill resolution so a bad
-    // app bag fails fast (attributed to skills.use()); the normalized value is
-    // forwarded to the delegated message() turn (which re-validates idempotently).
-    const callerRequestContext = validateCallerRequestContext(opts?.requestContext, 'skills.use()');
-
-    const tryWorkspaceSkill = async () => {
-      const workspace = await this.getWorkspace();
-      const skills = workspace?.skills;
-      return skills ? skills.get(ref) : undefined;
-    };
-
-    if (this._isExplicitWorkspaceSkillRef(ref)) {
-      const skill = await tryWorkspaceSkill();
-      if (skill) {
-        const args = opts?.args;
-        this._validateSkillArgs(skill.name, skill.metadata, args);
-        const expandedContent = this._buildSkillPrompt(skill.instructions, args);
-        return this.message({
-          content: expandedContent,
-          ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
-          ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
-        });
-      }
-    }
-
-    const codeSkill = this._harness._getCodeSkill(ref);
-    if (codeSkill) {
-      this._validateSkillArgs(codeSkill.name, codeSkill.metadata, opts?.args);
-      const expandedContent = this._buildSkillPrompt(codeSkill.instructions, opts?.args);
-      return this.message({
-        content: expandedContent,
-        ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
-        ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
-      });
-    }
-
-    // Force workspace materialization. Unlike `list` / `get`, `use` must
-    // produce a definitive answer (start a turn or refuse with a typed
-    // not-found error).
-    const workspace = await this.getWorkspace();
-    const skills = workspace?.skills;
-    if (!skills) {
-      throw new HarnessSkillNotFoundError(ref, ['code-registered']);
-    }
-
-    // `WorkspaceSkills.get` accepts either the frontmatter `name` or a
-    // relative path under the configured skill source.
-    const skill = await skills.get(ref);
-    if (!skill) {
-      throw new HarnessSkillNotFoundError(ref, ['code-registered', 'workspace']);
-    }
-    const args = opts?.args;
-    this._validateSkillArgs(skill.name, skill.metadata, args);
-
-    // Build the expanded prompt: skill instructions + (optional) JSON
-    // code block carrying validated args. Skill authors reference the
-    // args naturally in Markdown.
-    const expandedContent = this._buildSkillPrompt(skill.instructions, args);
-
-    return this.message({
-      content: expandedContent,
-      ...(opts?.modelOverride ? { model: opts.modelOverride } : {}),
-      ...(callerRequestContext ? { requestContext: callerRequestContext } : {}),
-    });
-  }
-
-  /**
-   * Validate `metadata.args` as a small JSON-schema-ish object. The harness
-   * supports the common prompt-arg fields used by workspace frontmatter:
-   * `required`, `properties`, `type`, `enum`, `items`, and
-   * `additionalProperties`. Unsupported or malformed schema shapes fail
-   * before a skill turn starts.
-   */
-  private _validateSkillArgs(
-    skillName: string,
-    metadata: Record<string, unknown> | undefined,
-    args: Record<string, unknown> | undefined,
-  ): void {
-    if (args !== undefined && (!args || typeof args !== 'object' || Array.isArray(args))) {
-      throw new HarnessSkillArgsValidationError(skillName, ['args must be an object']);
-    }
-
-    const issues: string[] = [];
-    if (args !== undefined) {
-      this._validateJsonSerializableSkillArg('$', args, new WeakSet(), issues);
-    }
-    if (!metadata || typeof metadata !== 'object') {
-      if (issues.length > 0) throw new HarnessSkillArgsValidationError(skillName, issues);
-      return;
-    }
-    const argsField = (metadata as Record<string, unknown>).args;
-    if (argsField === undefined) {
-      if (issues.length > 0) throw new HarnessSkillArgsValidationError(skillName, issues);
-      return;
-    }
-    if (!this._isPlainRecord(argsField)) {
-      throw new HarnessSkillArgsValidationError(skillName, ['unsupported args schema: expected object']);
-    }
-
-    const issueCountBeforeSchemaShape = issues.length;
-    this._validateSkillArgSchemaShape('$', argsField, issues, new WeakSet());
-    if (issues.length > issueCountBeforeSchemaShape) {
-      throw new HarnessSkillArgsValidationError(skillName, issues);
-    }
-
-    this._validateSkillArgSchemaValue('$', args ?? {}, argsField, issues);
-    if (issues.length > 0) {
-      throw new HarnessSkillArgsValidationError(skillName, issues);
-    }
-  }
-
-  private _validateSkillArgSchemaShape(
-    path: string,
-    schema: Record<string, unknown>,
-    issues: string[],
-    seen: WeakSet<object>,
-  ): void {
-    if (seen.has(schema)) {
-      issues.push(`${path} must not contain circular args schema references`);
-      return;
-    }
-    seen.add(schema);
-
-    for (const key of Object.keys(schema)) {
-      if (!SUPPORTED_SKILL_ARG_SCHEMA_KEYS.has(key)) {
-        issues.push(`${path}.${key} is not a supported args schema field`);
-      }
-    }
-
-    const required = schema.required;
-    if (
-      required !== undefined &&
-      (!Array.isArray(required) || required.some(k => typeof k !== 'string' || k.length === 0))
-    ) {
-      issues.push(`${path}.required must be an array of non-empty strings`);
-    }
-
-    const enumValues = schema.enum;
-    if (enumValues !== undefined) {
-      if (!Array.isArray(enumValues)) {
-        issues.push(`${path}.enum must be an array`);
-      } else {
-        enumValues.forEach((candidate, index) => {
-          this._validateJsonSerializableSkillArg(`${path}.enum[${index}]`, candidate, new WeakSet(), issues);
-        });
-      }
-    }
-
-    const declaredType = schema.type;
-    if (declaredType !== undefined) {
-      this._validateSkillArgDeclaredType(path, declaredType, issues);
-    }
-
-    const properties = schema.properties;
-    if (properties !== undefined) {
-      if (!this._isPlainRecord(properties)) {
-        issues.push(`${path}.properties must be an object`);
-      } else {
-        for (const [key, childSchema] of Object.entries(properties)) {
-          if (!this._isPlainRecord(childSchema)) {
-            issues.push(`${path}.properties.${key} must be an object`);
-            continue;
-          }
-          this._validateSkillArgSchemaShape(path === '$' ? key : `${path}.${key}`, childSchema, issues, seen);
-        }
-      }
-    }
-
-    const additionalProperties = schema.additionalProperties;
-    if (additionalProperties !== undefined && additionalProperties !== true && additionalProperties !== false) {
-      issues.push(`${path}.additionalProperties must be boolean`);
-    }
-
-    const items = schema.items;
-    if (items !== undefined) {
-      if (!this._isPlainRecord(items)) {
-        issues.push(`${path}.items must be an object`);
-      } else {
-        this._validateSkillArgSchemaShape(`${path}[]`, items, issues, seen);
-      }
-    }
-
-    seen.delete(schema);
-  }
-
-  private _validateSkillArgSchemaValue(
-    path: string,
-    value: unknown,
-    schema: Record<string, unknown>,
-    issues: string[],
-  ): void {
-    const required = schema.required;
-    if (Array.isArray(required) && this._isPlainRecord(value)) {
-      for (const key of required) {
-        if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] === undefined) {
-          issues.push(`missing required arg: "${path === '$' ? key : `${path}.${key}`}"`);
-        }
-      }
-    }
-
-    const enumValues = schema.enum;
-    if (Array.isArray(enumValues) && !enumValues.some(candidate => this._skillArgValuesEqual(candidate, value))) {
-      issues.push(`${path} must be one of ${JSON.stringify(enumValues)}`);
-    }
-
-    const declaredType = schema.type;
-    if (declaredType !== undefined && !this._matchesSkillArgType(value, declaredType, path, issues)) return;
-
-    const properties = schema.properties;
-    const additionalProperties = schema.additionalProperties;
-    if (this._isPlainRecord(properties) && this._isPlainRecord(value)) {
-      for (const [key, childSchema] of Object.entries(properties)) {
-        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-        if (!this._isPlainRecord(childSchema)) continue;
-        this._validateSkillArgSchemaValue(path === '$' ? key : `${path}.${key}`, value[key], childSchema, issues);
-      }
-    }
-    if (additionalProperties === false && this._isPlainRecord(value)) {
-      const allowedKeys = this._isPlainRecord(properties) ? new Set(Object.keys(properties)) : new Set<string>();
-      for (const key of Object.keys(value)) {
-        if (!allowedKeys.has(key)) issues.push(`unsupported arg: "${path === '$' ? key : `${path}.${key}`}"`);
-      }
-    }
-
-    const items = schema.items;
-    if (this._isPlainRecord(items) && Array.isArray(value)) {
-      value.forEach((item, index) => {
-        this._validateSkillArgSchemaValue(`${path}[${index}]`, item, items, issues);
-      });
-    }
-  }
-
-  private _validateSkillArgDeclaredType(path: string, declaredType: unknown, issues: string[]): void {
-    const allowedTypes = Array.isArray(declaredType) ? declaredType : [declaredType];
-    const supported = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']);
-    if (allowedTypes.some(type => typeof type !== 'string' || !supported.has(type))) {
-      issues.push(`${path}.type must be a supported JSON schema type`);
-    }
-  }
-
-  private _matchesSkillArgType(value: unknown, declaredType: unknown, path: string, issues: string[]): boolean {
-    const allowedTypes = Array.isArray(declaredType) ? declaredType : [declaredType];
-    const supported = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']);
-    if (allowedTypes.some(type => typeof type !== 'string' || !supported.has(type))) {
-      issues.push(`${path}.type must be a supported JSON schema type`);
-      return false;
-    }
-
-    const actualMatches = allowedTypes.some(type => {
-      switch (type) {
-        case 'string':
-          return typeof value === 'string';
-        case 'number':
-          return typeof value === 'number' && Number.isFinite(value);
-        case 'integer':
-          return Number.isInteger(value);
-        case 'boolean':
-          return typeof value === 'boolean';
-        case 'object':
-          return this._isPlainRecord(value);
-        case 'array':
-          return Array.isArray(value);
-        case 'null':
-          return value === null;
-        default:
-          return false;
-      }
-    });
-    if (!actualMatches) {
-      issues.push(`${path} must be ${allowedTypes.join(' | ')}`);
-    }
-    return actualMatches;
-  }
-
-  private _isPlainRecord(value: unknown): value is Record<string, unknown> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-    const prototype = Object.getPrototypeOf(value);
-    return prototype === Object.prototype || prototype === null;
-  }
-
-  private _skillArgValuesEqual(left: unknown, right: unknown): boolean {
-    if (Object.is(left, right)) return true;
-    if (Array.isArray(left) && Array.isArray(right)) {
-      return (
-        left.length === right.length && left.every((value, index) => this._skillArgValuesEqual(value, right[index]))
-      );
-    }
-    if (this._isPlainRecord(left) && this._isPlainRecord(right)) {
-      const leftKeys = Object.keys(left);
-      const rightKeys = Object.keys(right);
-      if (leftKeys.length !== rightKeys.length) return false;
-      return leftKeys.every(
-        key => Object.prototype.hasOwnProperty.call(right, key) && this._skillArgValuesEqual(left[key], right[key]),
-      );
-    }
-    return false;
-  }
-
-  private _validateJsonSerializableSkillArg(
-    path: string,
-    value: unknown,
-    seen: WeakSet<object>,
-    issues: string[],
-  ): void {
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) issues.push(`${path} must be JSON-serializable`);
-      return;
-    }
-    if (value === undefined || typeof value === 'bigint' || typeof value === 'function' || typeof value === 'symbol') {
-      issues.push(`${path} must be JSON-serializable`);
-      return;
-    }
-    if (typeof value !== 'object') return;
-    if (
-      Object.prototype.hasOwnProperty.call(value, 'toJSON') &&
-      typeof (value as { toJSON?: unknown }).toJSON === 'function'
-    ) {
-      issues.push(`${path}.toJSON is not supported in skill args`);
-      return;
-    }
-    if (seen.has(value)) {
-      issues.push(`${path} must not contain circular references`);
-      return;
-    }
-    seen.add(value);
-    if (Array.isArray(value)) {
-      value.forEach((item, index) => this._validateJsonSerializableSkillArg(`${path}[${index}]`, item, seen, issues));
-    } else if (this._isPlainRecord(value)) {
-      for (const [key, child] of Object.entries(value)) {
-        this._validateJsonSerializableSkillArg(path === '$' ? key : `${path}.${key}`, child, seen, issues);
-      }
-    } else {
-      issues.push(`${path} must be JSON-serializable`);
-    }
-    seen.delete(value);
-  }
-
-  /**
-   * Compose the skill prompt body. When args are supplied, append a JSON
-   * code block carrying them. No delimiters beyond the Markdown fence —
-   * skill authors reference args inline in their instructions.
-   */
-  private _buildSkillPrompt(instructions: string, args: Record<string, unknown> | undefined): string {
-    if (!args || Object.keys(args).length === 0) return instructions;
-    const json = JSON.stringify(args, null, 2);
-    return `${instructions}\n\n\`\`\`json\n${json}\n\`\`\``;
-  }
-
-  /**
-   * Internal: resolve the skill catalog for this session, sharing a
-   * single-flight promise across concurrent callers.
-   */
-  private async _resolveSkills(): Promise<HarnessSkill[]> {
-    if (this._skillsCache) return this._skillsCache;
-    if (this._skillsResolving) return this._skillsResolving;
-
-    const build = async (): Promise<HarnessSkill[]> => {
-      const codeSkills = this._harness._listCodeSkills();
-      const workspace = await this.getWorkspace();
-      const workspaceSkills = workspace?.skills;
-      if (!workspaceSkills) {
-        // No workspace, or workspace has no skill source configured.
-        return codeSkills;
-      }
-      const entries = await workspaceSkills.list();
-      const codeNames = new Set(codeSkills.map(skill => skill.name));
-      const projected = await Promise.all(
-        entries
-          .filter(meta => !codeNames.has(meta.name))
-          .map(async meta => {
-            const skill = await workspaceSkills.get(meta.path ?? meta.name);
-            return {
-              name: meta.name,
-              description: meta.description,
-              instructions: skill?.instructions ?? '',
-              ...(meta.path ? { filePath: meta.path } : {}),
-              // Pass through arbitrary skill frontmatter metadata so callers can
-              // discover skill-level flags (e.g. `metadata.goal === true` for
-              // goal-mode skills). Workspace's `SkillMetadata.metadata` is
-              // typed `Record<string, unknown>` and is already JSON-serialisable.
-              ...(meta.metadata ? { metadata: meta.metadata } : {}),
-            };
-          }),
-      );
-      return [...codeSkills, ...projected];
-    };
-
-    const pending = build();
-    this._skillsResolving = pending;
-    try {
-      const result = await pending;
-      // Only populate the cache when our own promise is still the
-      // session-tracked one. If `skills.refresh()` ran while we were
-      // resolving, `_skillsResolving` was cleared (or replaced by a
-      // newer build) and we must not stomp it.
-      if (this._skillsResolving === pending) {
-        this._skillsCache = result;
-      }
-      return result;
-    } finally {
-      if (this._skillsResolving === pending) {
-        this._skillsResolving = undefined;
-      }
-    }
+  private _skillsUse(ref: string, opts?: UseSkillOptions): Promise<AgentResult> {
+    return this._skillsMcpActions._skillsUse(ref, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -9331,7 +7529,7 @@ export class Session {
 
   /** Whether this exact provider result is durably staged for the run. */
   private async _providerResultStagedDurably(runId: string, full: FullOutput<unknown>): Promise<boolean> {
-    const admission = this._terminalStagingAdmissions.get(runId);
+    const admission = this._terminalStagingLedger.admissionFor(runId);
     if (admission === undefined) return false;
     try {
       const evidence = await this._storage.loadMessageResultEvidence({
@@ -9362,7 +7560,7 @@ export class Session {
       ) {
         return false;
       }
-      this._stagedTerminalRunIds.add(runId);
+      this._terminalStagingLedger.markStaged(runId);
       return true;
     } catch {
       return false;
@@ -9393,7 +7591,7 @@ export class Session {
       return;
     }
     try {
-      const cached = this._terminalStagingAdmissions.get(runId);
+      const cached = this._terminalStagingLedger.admissionFor(runId);
       let admission: HarnessTerminalAdmissionRecord | null;
       if (cached !== undefined && cached.sessionIncarnation === sessionIncarnation) {
         admission = cached;
@@ -9406,10 +7604,10 @@ export class Session {
             runId,
           });
         } catch (error) {
-          if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+          if (opts.tolerateUnknownRun === true && !this._terminalStagingLedger.isNative(runId)) return;
           throw error;
         }
-        if (admission?.status === 'pending') this._terminalStagingAdmissions.set(runId, admission);
+        this._terminalStagingLedger.cachePending(runId, admission);
       }
       if (admission?.status === 'pending') {
         // A process may have died after settling a prior completion but
@@ -9417,7 +7615,9 @@ export class Session {
         // terminal canonical evidence retires a fence: a cancelled admission
         // can leave its staged evidence pending for recovery. A run already
         // staged here (its provider result) has run this sweep.
-        const fencesToSweep = this._stagedTerminalRunIds.has(runId) ? [] : this._terminalTokenAccountedRunIds;
+        const fencesToSweep = this._terminalStagingLedger.isStaged(runId)
+          ? []
+          : this._terminalStagingLedger.accountedRunIds;
         for (const accountedRunId of fencesToSweep) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
@@ -9437,11 +7637,11 @@ export class Session {
             });
             if (evidence !== null && 'status' in evidence && evidence.status === 'pending') continue;
           }
-          this._terminalTokenAccountedRunIds.delete(accountedRunId);
+          this._terminalStagingLedger.sweepFence(accountedRunId);
         }
         const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
-        if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
-        else this._terminalStagingAdmissions.delete(runId);
+        if (receipt.status === 'staged') this._terminalStagingLedger.markStaged(runId);
+        else this._terminalStagingLedger.forgetAdmission(runId);
       }
     } catch (error) {
       // A provisional stage has no observer of its own; the completed-output
@@ -12153,7 +10353,7 @@ export class Session {
     staged: FullOutput<unknown>,
     queuedItemId?: string,
   ): Promise<void> {
-    if (this._terminalTokenAccountedRunIds.has(runId)) {
+    if (this._terminalStagingLedger.isAccounted(runId)) {
       // Counted here before, but that save may have failed: settlement may
       // drop the staged output only once the fence and counter are durable.
       if (!this._record.accountedTerminalRunIds?.includes(runId) || !this._recordTokenUsageMatchesLive()) {
@@ -12192,8 +10392,7 @@ export class Session {
     } else {
       this._recordMessageTurnCompletion(staged, { persist: false });
     }
-    this._stagedTerminalRunIds.add(runId);
-    this._terminalTokenAccountedRunIds.add(runId);
+    this._terminalStagingLedger.markStagedAndAccounted(runId);
     await this._persistTokenUsageOrLatch();
   }
 
@@ -12776,10 +10975,9 @@ export class Session {
     };
     validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
     // Another attempt for this notice is admitting or running here.
-    if (this._wakeTerminalAdmissionsInFlight.has(identity.admissionId)) {
+    if (!this._wakeAdmissions.enter(identity.admissionId)) {
       throw new HarnessBusyError(this.id, 'in_flight');
     }
-    this._wakeTerminalAdmissionsInFlight.add(identity.admissionId);
     try {
       const reservation = await this._writeMessageResultEvidence(
         {
@@ -12821,7 +11019,7 @@ export class Session {
       if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
       return { identity, claimExpiresAt };
     } catch (error) {
-      this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+      this._wakeAdmissions.leave(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
       this._scheduleOrphanRecheck(Date.now());
       // The notice was acknowledged before this wake, so a refusal other than
@@ -12845,8 +11043,7 @@ export class Session {
    * the next recheck or close, or leaves it durable for the next owner.
    */
   private _releaseWakeTerminalAdmission(admissionId: string): void {
-    this._wakeTerminalAdmissionsInFlight.delete(admissionId);
-    this._releasedWakeAdmissions.add(admissionId);
+    this._wakeAdmissions.release(admissionId);
     this._scheduleOrphanRecheck(Date.now());
   }
 
@@ -12883,11 +11080,8 @@ export class Session {
             await this._settleCancelledTerminalMessage(receipt.admission ?? identity, reason.message);
             // Nothing ran under the cancelled grant: drop its per-run state, as
             // a terminal commit does.
-            this._terminalTokenAccountedRunIds.delete(identity.runId);
-            this._stagedTerminalRunIds.delete(identity.runId);
-            this._terminalStagingAdmissions.delete(identity.runId);
-            this._nativeTerminalRunIds.delete(identity.runId);
-            this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+            this._terminalStagingLedger.forgetRun(identity.runId);
+            this._wakeAdmissions.leave(identity.admissionId);
             return;
           }
         } catch {
@@ -13025,8 +11219,7 @@ export class Session {
         ),
       );
     }
-    this._nativeTerminalRunIds.add(identity.runId);
-    this._terminalStagingAdmissions.set(identity.runId, receipt.admission);
+    this._terminalStagingLedger.admitNative(identity.runId, receipt.admission);
   }
 
   /**
@@ -13200,10 +11393,7 @@ export class Session {
         admission,
         ...(intent !== null ? { intent } : {}),
       };
-      this._terminalTokenAccountedRunIds.delete(identity.runId);
-      this._stagedTerminalRunIds.delete(identity.runId);
-      this._terminalStagingAdmissions.delete(identity.runId);
-      this._nativeTerminalRunIds.delete(identity.runId);
+      this._terminalStagingLedger.forgetRun(identity.runId);
       try {
         options.onReceipt?.(receipt);
       } catch {
@@ -13371,10 +11561,7 @@ export class Session {
       return reportFailure(new HarnessTerminalHandoffFencedError(identity.sessionId));
     }
     if (receipt.status === 'committed' || receipt.status === 'duplicate') {
-      this._terminalTokenAccountedRunIds.delete(identity.runId);
-      this._stagedTerminalRunIds.delete(identity.runId);
-      this._terminalStagingAdmissions.delete(identity.runId);
-      this._nativeTerminalRunIds.delete(identity.runId);
+      this._terminalStagingLedger.forgetRun(identity.runId);
     }
     try {
       options.onReceipt?.(receipt);
@@ -15799,7 +13986,7 @@ export class Session {
           const admission = wakeAdmission;
           wakeAdmission = undefined;
           if (wakeSettled) {
-            this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal!.admissionId);
+            this._wakeAdmissions.leave(wakeTerminal!.admissionId);
           } else if (!wakeDispatchSent) {
             // A Stop, edit, delete or eviction refused the turn before its
             // dispatch: cancel the admission whenever it lands, as a grant
@@ -16219,7 +14406,7 @@ export class Session {
    */
   private async _maybeCaptureSuspend(
     full: FullOutput<unknown>,
-    queuedItemId = this._currentQueuedItemId,
+    queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
     opts: {
@@ -16378,7 +14565,7 @@ export class Session {
       suspendPayload?: unknown;
       approvalReasons?: string[];
     },
-    queuedItemId = this._currentQueuedItemId,
+    queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
     originSignalId?: string,
@@ -16494,16 +14681,37 @@ export class Session {
   // observe a stale value.
   // -------------------------------------------------------------------------
 
+  /** Build the small port the mode, model and session-configuration operations need. */
+  private _modeModelConfigPort(): ModeModelConfigSessionPort {
+    const session = this;
+    return {
+      id: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      emitter: this._emitter,
+      get modeSwitchEpoch() {
+        return session._modeSwitchEpoch;
+      },
+      set modeSwitchEpoch(value) {
+        session._modeSwitchEpoch = value;
+      },
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+    };
+  }
+
   /** §4.2a: the session's current mode id (the durable default modeId). */
   getCurrentModeId(): string {
-    this._assertLive('getCurrentModeId()');
-    return this._record.modeId;
+    return currentModeId(this._modeModelConfigPort());
   }
 
   /** Resolved active mode (per the session record). */
   getCurrentMode(): HarnessMode {
-    this._assertLive('getCurrentMode()');
-    return this._harness._getMode(this._record.modeId);
+    return currentMode(this._modeModelConfigPort());
   }
 
   /**
@@ -16511,25 +14719,8 @@ export class Session {
    * with the next `message()`/`queue()` call. Throws if the mode id is
    * unknown.
    */
-  async switchMode(opts: { mode: string }): Promise<void> {
-    this._assertLive('switchMode()');
-    // Validates and throws on unknown id.
-    this._harness._getMode(opts.mode);
-    const previousModeId = this._record.modeId;
-    if (previousModeId === opts.mode) return;
-    this._modeSwitchEpoch += 1;
-    // §4.2e — entering a mode re-establishes its base permission policy when it
-    // declares one (the mode owns the base; runtime grants/setPolicy overlay it).
-    // A mode that declares no `permissions` leaves the existing rules untouched.
-    const seededRules = this._harness._modePermissionRules(opts.mode);
-    await this._flushUpdate(prev => ({
-      ...prev,
-      modeId: opts.mode,
-      ...(seededRules !== undefined
-        ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
-        : {}),
-    }));
-    this._emitter.emit({ type: 'mode_changed', modeId: opts.mode, previousModeId });
+  switchMode(opts: { mode: string }): Promise<void> {
+    return switchSessionMode(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -16538,89 +14729,14 @@ export class Session {
    * and resolve only after the durable transition commits.
    */
   readonly models = Object.freeze({
-    current: (): string => this._modelsCurrent(),
-    hasSelected: (): boolean => this._modelsHasSelected(),
-    currentAuthStatus: (): Promise<ModelAuthStatus> => this._modelsCurrentAuthStatus(),
-    switch: (opts: { model: string }): Promise<void> => this._modelsSwitch(opts),
-    setSubagent: (opts: { agentType: string; model: string }): Promise<void> => this._modelsSetSubagent(opts),
-    getSubagent: (opts: { agentType: string }): string | null => this._modelsGetSubagent(opts),
+    current: (): string => modelsCurrent(this._modeModelConfigPort()),
+    hasSelected: (): boolean => modelsHasSelected(this._modeModelConfigPort()),
+    currentAuthStatus: (): Promise<ModelAuthStatus> => modelsCurrentAuthStatus(this._modeModelConfigPort()),
+    switch: (opts: { model: string }): Promise<void> => modelsSwitch(this._modeModelConfigPort(), opts),
+    setSubagent: (opts: { agentType: string; model: string }): Promise<void> =>
+      modelsSetSubagent(this._modeModelConfigPort(), opts),
+    getSubagent: (opts: { agentType: string }): string | null => modelsGetSubagent(this._modeModelConfigPort(), opts),
   });
-
-  /** Resolved model id for the next turn. Falls back to `''` when nothing has been selected. */
-  private _modelsCurrent(): string {
-    this._assertLive('models.current()');
-    return this._record.modelId;
-  }
-
-  /**
-   * True once any model has been chosen for this session — either an
-   * explicit `models.switch()` call or a `models.setSubagent()` pin. Useful
-   * for boot flows that want to gate UI on "has the user picked yet?"
-   * without inspecting raw record fields.
-   */
-  private _modelsHasSelected(): boolean {
-    this._assertLive('models.hasSelected()');
-    if (this._record.modelId && this._record.modelId.length > 0) return true;
-    if (Object.keys(this._record.subagentModelOverrides ?? {}).length > 0) return true;
-    return false;
-  }
-
-  /**
-   * Auth status for the currently resolved model. Routed through
-   * `harness.models.getAuthStatus()` when the current model is in the
-   * catalog; returns `'unknown'` when no model is selected or the model
-   * isn't registered (we don't want the auth-status check to throw on a
-   * free-form id the agent layer will accept anyway).
-   */
-  private async _modelsCurrentAuthStatus(): Promise<ModelAuthStatus> {
-    this._assertLive('models.currentAuthStatus()');
-    const modelId = this._record.modelId;
-    if (!modelId) return 'unknown';
-    const entry = await this._harness.models.get(modelId);
-    if (!entry) return 'unknown';
-    return this._harness.models.getAuthStatus(modelId);
-  }
-
-  /** Switch the session's default model id. Free-form string — validated by the agent layer. */
-  private async _modelsSwitch(opts: { model: string }): Promise<void> {
-    this._assertLive('models.switch()');
-    assertModelId('models.switch', opts.model);
-    const previousModelId = this._record.modelId;
-    if (previousModelId === opts.model) return;
-    await this._flushUpdate(prev => ({ ...prev, modelId: opts.model }));
-    this._emitter.emit({ type: 'model_changed', modelId: opts.model, previousModelId });
-  }
-
-  /**
-   * Pin a model for spawned subagents of a given `agentType`. Override is
-   * persisted in `SessionRecord.subagentModelOverrides` and read back by
-   * the spawn machinery via `models.getSubagent()`. Emits
-   * `model_override_set`. No-op when the same mapping is already set.
-   */
-  private async _modelsSetSubagent(opts: { agentType: string; model: string }): Promise<void> {
-    this._assertLive('models.setSubagent()');
-    assertAgentType('models.setSubagent', opts.agentType);
-    assertModelId('models.setSubagent', opts.model);
-    const previousModelId = this._record.subagentModelOverrides?.[opts.agentType] ?? null;
-    if (previousModelId === opts.model) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      subagentModelOverrides: {
-        ...(prev.subagentModelOverrides ?? {}),
-        [opts.agentType]: opts.model,
-      },
-    }));
-    // §10.2: subagent model overrides are not a public event — the override is
-    // reflected in `SessionRecord.subagentModelOverrides` and the display
-    // snapshot (the StateEvent set has only the session-level `model_changed`).
-  }
-
-  /** Read the pinned subagent model for an `agentType`, or `null` when unset. */
-  private _modelsGetSubagent(opts: { agentType: string }): string | null {
-    this._assertLive('models.getSubagent()');
-    assertAgentType('models.getSubagent', opts.agentType);
-    return this._record.subagentModelOverrides?.[opts.agentType] ?? null;
-  }
 
   // -------------------------------------------------------------------------
   // Custom state (§4.2 / §6.1).
@@ -16687,36 +14803,21 @@ export class Session {
    * `(byteLength, byteLength)` — the in-process upload completes atomically, so there is
    * no incremental progress to report.
    */
-  async uploadAttachment(opts: {
+  uploadAttachment(opts: {
     name: string;
     mimeType: string;
     data: Uint8Array;
     onProgress?: (loaded: number, total: number) => void;
   }): Promise<{ attachmentId: string }> {
-    this._assertLive('uploadAttachment()');
-    const ref = await this._harness.attachments.upload({
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      kind: 'file',
-      filename: opts.name,
-      contentType: opts.mimeType,
-      data: opts.data,
-    });
-    opts.onProgress?.(opts.data.byteLength, opts.data.byteLength);
-    return { attachmentId: ref.attachmentId };
+    return uploadSessionAttachment(this._modeModelConfigPort(), opts);
   }
 
   /**
    * §4.2e — delete a session-scoped attachment by id. A flat convenience over
    * {@link Harness.attachments}`.delete` that supplies this session's identity.
    */
-  async deleteAttachment(opts: { attachmentId: string }): Promise<void> {
-    this._assertLive('deleteAttachment()');
-    await this._harness.attachments.delete({
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      attachmentId: opts.attachmentId,
-    });
+  deleteAttachment(opts: { attachmentId: string }): Promise<void> {
+    return deleteSessionAttachment(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -16732,40 +14833,8 @@ export class Session {
    * (e.g. thread rename), this requires the session's thread to already exist in storage —
    * a brand-new thread is persisted on first activity; otherwise `HarnessThreadNotFoundError`.
    */
-  async setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void> {
-    this._assertLive('setThreadSetting()');
-    const { key } = opts;
-    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
-      throw new HarnessValidationError('setThreadSetting().key', 'must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$');
-    }
-    if (
-      key === '__proto__' ||
-      key === 'prototype' ||
-      key === 'constructor' ||
-      key.startsWith('__mastra') ||
-      key.startsWith('mastra__')
-    ) {
-      throw new HarnessValidationError(
-        'setThreadSetting().key',
-        `key "${key}" is reserved (prototype-pollution or Harness/Mastra namespace)`,
-      );
-    }
-    // Validate + normalize to canonical JSON before touching storage (drops undefined props).
-    const normalized = assertJsonValue(opts.value, 'setThreadSetting().value');
-    const settings = await this._harness._threadOps.getSettings({
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-    });
-    const rawApp = (settings as { app?: unknown }).app;
-    const currentApp =
-      rawApp !== null && typeof rawApp === 'object' && !Array.isArray(rawApp)
-        ? (rawApp as Record<string, JsonValue>)
-        : {};
-    await this._harness._threadOps.setSettings({
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      patch: { app: { ...currentApp, [key]: normalized } },
-    });
+  setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void> {
+    return setSessionThreadSetting(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -16913,7 +14982,7 @@ export class Session {
     if (this._currentRunId !== undefined) snapshot.currentRunId = this._currentRunId;
     if (this._currentMessageId !== undefined) snapshot.currentMessageId = this._currentMessageId;
     if (this._currentTraceId !== undefined) snapshot.currentTraceId = this._currentTraceId;
-    if (this._currentQueuedItemId !== undefined) snapshot.currentQueuedItemId = this._currentQueuedItemId;
+    if (this._queueHead.currentId !== undefined) snapshot.currentQueuedItemId = this._queueHead.currentId;
     if (rec.goal !== undefined) snapshot.goal = rec.goal;
     const currentRun = this._buildCurrentRunProjection();
     if (currentRun !== undefined) snapshot.currentRun = currentRun;
@@ -16964,7 +15033,7 @@ export class Session {
         operation,
         modeId,
         modelId: pending.runtimeDependencies?.modelId ?? rec.modelId,
-        agentId: this._modeAgentId(modeId),
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
         startedAt: pending.requestedAt,
         updatedAt: pending.resumedAt ?? pending.requestedAt,
       };
@@ -16974,7 +15043,7 @@ export class Session {
     // effective identity), captured by `_beginTurn`.
     if (this._currentRunId !== undefined) {
       const modeId = this._currentRunModeId ?? rec.modeId;
-      const queuedItemId = this._currentQueuedItemId;
+      const queuedItemId = this._queueHead.currentId;
       const projection: SessionRunProjection = {
         runId: this._currentRunId,
         status: 'running',
@@ -16987,7 +15056,7 @@ export class Session {
               },
         modeId,
         modelId: this._currentRunModelId ?? rec.modelId,
-        agentId: this._modeAgentId(modeId),
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
         startedAt: this._currentRunStartedAt ?? rec.lastActivityAt,
         updatedAt: rec.lastActivityAt,
       };
@@ -16995,16 +15064,6 @@ export class Session {
       return projection;
     }
     return undefined;
-  }
-
-  /** Resolve a mode's backing agentId for the run projection, tolerating a mode
-   * that has since been removed from config (fall back to the session default). */
-  private _modeAgentId(modeId: string): string {
-    try {
-      return this._harness._getMode(modeId).agentId;
-    } catch {
-      return this._harness._getMode(this._record.modeId).agentId;
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -17267,6 +15326,32 @@ export class Session {
   // terminate at task completion.
   // -------------------------------------------------------------------------
 
+  /** Build the small port the goal-judge operations need. */
+  private _goalJudgePort(): GoalJudgeSessionPort {
+    const session = this;
+    return {
+      parentSessionId: this.parentSessionId,
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      get currentTurnSourceWriteGuard() {
+        return session._currentTurnSourceWriteGuard;
+      },
+      get testJudge() {
+        return session.__testJudge;
+      },
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+      emit: event => session._emit(event),
+      currentCancelRequest: () => session._currentCancelRequest(),
+      applyQueueBackpressureForAppend: (prev, opts) => session._applyQueueBackpressureForAppend(prev, opts),
+      failBackpressureDroppedItems: droppedItems => session._failBackpressureDroppedItems(droppedItems),
+      maybeDrainQueue: () => session._maybeDrainQueue(),
+      listMessages: () => session.listMessages(),
+    };
+  }
+
   /**
    * Attach a goal to this session. Replaces any existing goal (emits
    * `goal_cleared` for the prior goal first, then `goal_set`). Resets the
@@ -17275,95 +15360,31 @@ export class Session {
    * When `kickoff` is `true` (default), an initial continuation turn is
    * enqueued so the agent starts working without an explicit `message()`.
    */
-  async setGoal(opts: GoalOptions): Promise<GoalState> {
-    this._assertLive('setGoal()');
-    if (this.parentSessionId !== undefined || this._record.origin === 'subagent-tool') {
-      throw new HarnessValidationError('setGoal', 'goals cannot be set on subagent sessions (parent owns the loop)');
-    }
-    if (typeof opts.objective !== 'string' || opts.objective.length === 0) {
-      throw new HarnessValidationError('setGoal.objective', 'must be a non-empty string');
-    }
-    if (opts.maxTurns !== undefined && (!Number.isInteger(opts.maxTurns) || opts.maxTurns < 1)) {
-      throw new HarnessValidationError('setGoal.maxTurns', 'must be a positive integer');
-    }
-
-    const defaults = this._harness._internalGoalDefaults;
-    const judgeModelId = opts.judgeModel ?? defaults.defaultJudgeModel;
-    if (typeof judgeModelId !== 'string' || judgeModelId.length === 0) {
-      throw new HarnessValidationError(
-        'setGoal.judgeModel',
-        'no judge model provided and `goals.defaultJudgeModel` is not configured',
-      );
-    }
-
-    const priorId = this._record.goal?.id;
-    const goal: GoalState = {
-      id: `goal-${randomUUID()}`,
-      objective: opts.objective,
-      status: 'active',
-      turnsUsed: 0,
-      maxTurns: opts.maxTurns ?? defaults.defaultMaxTurns,
-      judgeModelId,
-      createdAt: Date.now(),
-    };
-
-    await this._flushUpdate(prev => ({ ...prev, goal }));
-    if (priorId !== undefined) {
-      this._emit({ type: 'goal_cleared', goalId: priorId });
-    }
-    this._emit({ type: 'goal_set', goal });
-
-    if (opts.kickoff !== false) {
-      await this._enqueueGoalContinuation(goal, buildKickoffContinuation(opts.objective));
-    }
-
-    return goal;
+  setGoal(opts: GoalOptions): Promise<GoalState> {
+    return setSessionGoal(this._goalJudgePort(), opts);
   }
 
   /** Return the active goal, if any. */
   getGoal(): GoalState | undefined {
-    this._assertLive('getGoal()');
-    return this._record.goal;
+    return getSessionGoal(this._goalJudgePort());
   }
 
   /** Pause auto-continuations without losing the goal. Emits `goal_paused`. */
-  async pauseGoal(): Promise<GoalState | undefined> {
-    this._assertLive('pauseGoal()');
-    const goal = this._record.goal;
-    if (!goal || goal.status === 'paused') return goal;
-    const updated: GoalState = { ...goal, status: 'paused' };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    this._emit({ type: 'goal_paused', goalId: goal.id, reason: 'requested' });
-    return updated;
+  pauseGoal(): Promise<GoalState | undefined> {
+    return pauseSessionGoal(this._goalJudgePort());
   }
 
   /**
    * Resume an inactive goal. Re-emits `goal_resumed` and enqueues a fresh
    * continuation turn so the agent picks up where it left off.
    */
-  async resumeGoal(): Promise<GoalState | undefined> {
-    this._assertLive('resumeGoal()');
-    const goal = this._record.goal;
-    if (!goal) return undefined;
-    if (goal.status === 'active') return goal;
-    const updated: GoalState = { ...goal, status: 'active' };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    this._emit({ type: 'goal_resumed', goalId: goal.id });
-    await this._enqueueGoalContinuation(updated, buildResumeContinuation(updated.objective));
-    return updated;
+  resumeGoal(): Promise<GoalState | undefined> {
+    return resumeSessionGoal(this._goalJudgePort());
   }
 
   /** Drop the goal entirely. Emits `goal_cleared`. */
-  async clearGoal(): Promise<void> {
-    this._assertLive('clearGoal()');
-    const goal = this._record.goal;
-    if (!goal) return;
-    await this._flushUpdate(prev => {
-      const next = { ...prev };
-      delete next.goal;
-      return next;
-    });
-    this._emit({ type: 'goal_cleared', goalId: goal.id });
+  clearGoal(): Promise<void> {
+    return clearSessionGoal(this._goalJudgePort());
   }
 
   /**
@@ -17374,72 +15395,8 @@ export class Session {
    *
    * Returns the updated goal, or `undefined` if there's nothing to update.
    */
-  async updateJudgeDefaults(opts: { judgeModelId?: string; maxTurns?: number }): Promise<GoalState | undefined> {
-    this._assertLive('updateJudgeDefaults()');
-    const goal = this._record.goal;
-    if (!goal) return undefined;
-    if (opts.judgeModelId === undefined && opts.maxTurns === undefined) return goal;
-    if (opts.maxTurns !== undefined && (!Number.isFinite(opts.maxTurns) || opts.maxTurns <= 0)) {
-      throw new HarnessValidationError('maxTurns', 'maxTurns must be a positive number');
-    }
-    const updated: GoalState = {
-      ...goal,
-      ...(opts.judgeModelId !== undefined ? { judgeModelId: opts.judgeModelId } : {}),
-      ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
-    };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    return updated;
-  }
-
-  /**
-   * @internal — enqueue a goal-driven continuation turn. Caller is responsible
-   * for building the final prompt content (kickoff / resume / judge-continue
-   * each use a distinct template — see `buildKickoffContinuation` /
-   * `buildResumeContinuation` / `buildJudgeContinuation`). Marked with
-   * `source: 'goal'` so the judge loop knows to skip re-judging on the
-   * resulting turn (otherwise the loop would never terminate).
-   */
-  private async _enqueueGoalContinuation(goal: GoalState, content: string): Promise<void> {
-    if (this._currentCancelRequest() !== undefined) return;
-    const cap = this._harness._internalMaxQueueDepth;
-    const item: QueuedItem = {
-      id: `q-${randomUUID()}`,
-      enqueuedAt: Date.now(),
-      content,
-      attachments: [],
-      mode: this._record.modeId,
-      source: 'goal',
-      goalId: goal.id,
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-    };
-    const droppedItems: QueueBackpressureDrop[] = [];
-    let admitted = false;
-    await this._flushUpdate(prev => {
-      if (prev.cancelRequest !== undefined) return prev;
-      return this._applyQueueBackpressureForAppend(prev, {
-        item,
-        receipt: undefined,
-        maxQueueDepth: cap,
-        source: 'goal',
-        goalId: goal.id,
-        droppedItems,
-        onRejected: () => {
-          admitted = false;
-        },
-        onAdmitted: () => {
-          admitted = true;
-        },
-      });
-    });
-    this._failBackpressureDroppedItems(droppedItems);
-    if (!admitted) {
-      // §10.2: queue-full/backpressure is not a public event — the goal item is
-      // simply not admitted (rejected at the caller for direct queue()).
-      return;
-    }
-    void this._maybeDrainQueue();
+  updateJudgeDefaults(opts: { judgeModelId?: string; maxTurns?: number }): Promise<GoalState | undefined> {
+    return updateGoalJudgeDefaults(this._goalJudgePort(), opts);
   }
 
   /**
@@ -17451,193 +15408,8 @@ export class Session {
    * any check fails the verdict is discarded silently (no event, no state
    * change) — the user has already moved on.
    */
-  private async _runGoalJudge(turn: FullOutput<unknown>, wasGoalDriven: boolean): Promise<void> {
-    // Skip re-judging on goal-driven continuation turns to avoid a tight
-    // loop where every continuation triggers another judge call. The
-    // judge only runs after user-driven turns; continuations are auto-
-    // generated from the prior judge call.
-    if (wasGoalDriven) return;
-
-    const goal = this._record.goal;
-    if (!goal || goal.status !== 'active') return;
-
-    const evaluatedGoalId = goal.id;
-
-    // Suspended turns don't count toward the judge loop — wait for resume.
-    if (turn.finishReason === 'suspended') return;
-
-    // Gate 1 — re-read goal after the async context fetch. If it's been
-    // cleared / paused / replaced, drop this judge cycle silently.
-    const context = await this._getJudgeContext(turn);
-    if (this._record.goal?.id !== evaluatedGoalId || this._record.goal.status !== 'active') return;
-
-    // No-assistant-message fallback: parity with TUI's evaluateAfterTurn.
-    // The judge has nothing to score, but the agent still made some attempt
-    // (typically a tool call without a closing assistant message). Push a
-    // gentle nudge unless we've hit the budget.
-    if (!context.lastAssistantContent) {
-      if (goal.turnsUsed >= goal.maxTurns) {
-        await this._flushUpdate(prev =>
-          prev.goal && prev.goal.id === evaluatedGoalId
-            ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-            : prev,
-        );
-        this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'budget_exhausted' });
-        return;
-      }
-      await this._enqueueGoalContinuation(
-        goal,
-        buildJudgeContinuation({
-          turn: goal.turnsUsed,
-          max: goal.maxTurns,
-          objective: goal.objective,
-          judgeReason: 'No response yet, keep working.',
-        }),
-      );
-      return;
-    }
-
-    let decision: GoalJudgeDecision;
-    try {
-      decision = await this._callJudge(goal, turn);
-    } catch {
-      // Gate 2a — goal might have changed during the judge call.
-      if (this._record.goal?.id !== evaluatedGoalId) return;
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'judge_failed' });
-      return;
-    }
-
-    // Gate 2b — goal might have changed during the judge call.
-    if (this._record.goal?.id !== evaluatedGoalId) return;
-
-    const turnsUsed = decision.decision === 'waiting' ? goal.turnsUsed : goal.turnsUsed + 1;
-    const updated: GoalState = { ...goal, turnsUsed, lastDecision: decision };
-
-    await this._flushUpdate(prev =>
-      prev.goal && prev.goal.id === evaluatedGoalId ? { ...prev, goal: updated } : prev,
-    );
-
-    this._emit({
-      type: 'goal_judged',
-      goalId: evaluatedGoalId,
-      decision,
-      turnsUsed,
-      maxTurns: updated.maxTurns,
-    });
-
-    if (decision.decision === 'done') {
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'done' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_done', goalId: evaluatedGoalId, reason: decision.reason, turnsUsed });
-      return;
-    }
-
-    if (decision.decision === 'waiting') {
-      // §10.2: the judge parked the goal at an external checkpoint. Surface it
-      // as `goal_waiting` (turnsUsed is unchanged — see the computation above)
-      // so subscribers can distinguish a checkpoint pause from a budget/judge
-      // failure (`goal_paused`) or completion (`goal_done`).
-      this._emit({ type: 'goal_waiting', goalId: evaluatedGoalId, reason: decision.reason, turnsUsed });
-      return;
-    }
-
-    // decision.decision === 'continue'
-    if (turnsUsed >= updated.maxTurns) {
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'budget_exhausted' });
-      return;
-    }
-
-    // Gate 3 — final stale check before enqueueing.
-    if (this._record.goal?.id !== evaluatedGoalId || this._record.goal.status !== 'active') return;
-    await this._enqueueGoalContinuation(
-      updated,
-      buildJudgeContinuation({
-        turn: turnsUsed,
-        max: updated.maxTurns,
-        objective: updated.objective,
-        judgeReason: decision.reason,
-      }),
-    );
-  }
-
-  /**
-   * @internal — execute the judge model. Returns a `GoalJudgeDecision`.
-   *
-   * Test-injection hook: when `__testJudge` is set on this session, it
-   * runs in place of the real judge call so unit tests can drive verdicts
-   * deterministically without standing up a live model.
-   */
-  private async _callJudge(goal: GoalState, turn: FullOutput<unknown>): Promise<GoalJudgeDecision> {
-    const hook = this.__testJudge;
-    if (hook) {
-      const verdict = await hook(goal);
-      return { ...verdict, judgedAt: Date.now() };
-    }
-    // Real judge path. Mirrors the TUI's GoalManager.callJudge:
-    //   - dedicated `goal-judge` Agent with JUDGE_SYSTEM_PROMPT baked in
-    //   - input processor: ProviderHistoryCompat (history-shape parity
-    //     across providers, esp. Anthropic)
-    //   - error processors: StreamErrorRetryProcessor, PrefillErrorHandler,
-    //     ProviderHistoryCompat (retry flaky judge streams cleanly)
-    //   - dedicated memory thread `${sessionId}-${goalId}` so the judge
-    //     sees continuity across iterations (its own prior verdicts)
-    //   - structured output via the judge schema
-    //   - context: goal + last user content + assistantStepsSinceLastUser
-    //     + truncated last assistant content (4000-char cap)
-    const context = await this._getJudgeContext(turn);
-    const judgeAgent = this._createJudgeAgent(goal);
-    const memory = await judgeAgent.getMemory({ requestContext: new RequestContext() });
-    const judgeThreadId = `${this._record.id}-${goal.id}`;
-
-    if (memory) {
-      const existing = await memory.getThreadById({ threadId: judgeThreadId });
-      if (!existing) {
-        await memory.createThread({
-          threadId: judgeThreadId,
-          resourceId: this._record.resourceId,
-          title: `Goal judge: ${goal.objective.slice(0, 80)}`,
-          metadata: {
-            goalJudge: true,
-            parentSessionId: this._record.id,
-            goalId: goal.id,
-          },
-        });
-      }
-    }
-
-    const truncatedAssistant = truncateForJudge(context.lastAssistantContent ?? 'No response yet, keep working.');
-    const recentUser = context.lastUserContent
-      ? `\n\nLatest user message:\n${truncateForJudge(context.lastUserContent)}\n\nAssistant steps since that user message: ${context.assistantStepsSinceLastUser}`
-      : '';
-    const prompt = `Goal: ${goal.objective}${recentUser}\n\nLatest assistant message:\n${truncatedAssistant}`;
-
-    const stream = await judgeAgent.stream(prompt, {
-      ...(memory ? { memory: { thread: judgeThreadId, resource: this._record.resourceId } } : {}),
-      structuredOutput: { schema: GoalJudgeSchema },
-    } as never);
-
-    await (stream as { consumeStream: () => Promise<void> }).consumeStream();
-    const full = (await (stream as { getFullOutput: () => Promise<unknown> }).getFullOutput()) as {
-      object?: unknown;
-    };
-    const obj = full.object as { decision: 'done' | 'continue' | 'waiting'; reason: string } | undefined;
-    if (!obj || typeof obj !== 'object') {
-      throw new Error('judge returned no structured output');
-    }
-    return { decision: obj.decision, reason: obj.reason, judgedAt: Date.now() };
+  private _runGoalJudge(turn: FullOutput<unknown>, wasGoalDriven: boolean): Promise<void> {
+    return runGoalJudge(this._goalJudgePort(), turn, wasGoalDriven);
   }
 
   /** @internal — test-only hook used by `session.goal.test.ts`. */
@@ -17648,66 +15420,12 @@ export class Session {
    * how many assistant steps have happened since that user message, and the
    * latest assistant content. Mirrors `GoalManager.getRecentConversationContext`.
    */
-  private async _getJudgeContext(turn?: FullOutput<unknown>): Promise<{
+  private _getJudgeContext(turn?: FullOutput<unknown>): Promise<{
     lastUserContent: string | null;
     assistantStepsSinceLastUser: number;
     lastAssistantContent: string | null;
   }> {
-    let messages: HarnessMessage[] = [];
-    try {
-      messages = await this.listMessages();
-    } catch {
-      // listMessages can fail in ad-hoc-thread setups; we'll fall back to
-      // the in-memory turn text below.
-    }
-
-    let lastUserIndex = -1;
-    let lastAssistantContent: string | null = null;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i] as { role?: string; content?: unknown } | undefined;
-      if (!msg) continue;
-      if (!lastAssistantContent && msg.role === 'assistant') {
-        lastAssistantContent = this._extractTextContent(msg.content);
-      }
-      if (msg.role === 'user') {
-        lastUserIndex = i;
-        break;
-      }
-    }
-
-    // Storage may not have the assistant turn yet (depends on the agent
-    // wiring). Fall back to the in-memory `turn.text` we just produced.
-    if (!lastAssistantContent && turn) {
-      const text = (turn as { text?: string }).text;
-      if (typeof text === 'string' && text.length > 0) {
-        lastAssistantContent = text;
-      }
-    }
-
-    const lastUserContent =
-      lastUserIndex >= 0 ? this._extractTextContent((messages[lastUserIndex] as { content?: unknown }).content) : null;
-    const assistantStepsSinceLastUser =
-      lastUserIndex >= 0
-        ? messages.slice(lastUserIndex + 1).filter(m => (m as { role?: string }).role === 'assistant').length
-        : 0;
-
-    return {
-      lastUserContent,
-      assistantStepsSinceLastUser,
-      lastAssistantContent,
-    };
-  }
-
-  private _extractTextContent(content: unknown): string {
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      return content
-        .filter(part => (part as { type?: string })?.type === 'text')
-        .map(part => (part as { text?: string }).text ?? '')
-        .join('\n');
-    }
-    return String(content ?? '');
+    return getGoalJudgeContext(this._goalJudgePort(), turn);
   }
 
   /**
@@ -17719,16 +15437,7 @@ export class Session {
    * session so it inherits memory/storage wiring.
    */
   private _createJudgeAgent(goal: GoalState): Agent {
-    const model = new ModelRouterLanguageModel(goal.judgeModelId as never);
-    return new Agent({
-      id: 'goal-judge',
-      name: 'Goal Judge',
-      instructions: JUDGE_SYSTEM_PROMPT,
-      model,
-      mastra: this._harness.mastra,
-      inputProcessors: [new ProviderHistoryCompat()],
-      errorProcessors: [new StreamErrorRetryProcessor(), new PrefillErrorHandler(), new ProviderHistoryCompat()],
-    });
+    return createGoalJudgeAgent(this._goalJudgePort(), goal);
   }
 
   // -------------------------------------------------------------------------
@@ -18166,15 +15875,11 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._pendingReplacementToolSurfaces.delete(claimedPending.runId);
     if (queuedItemId !== undefined) {
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(discardError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
       this._emit({
         type: 'queue_failed',
         queuedItemId,
@@ -18188,6 +15893,7 @@ export class Session {
     // turn owns the interaction); close it here. Tool rows and agent_end
     // belong to a live turn when one is running, so leave those alone.
     const turnActive = this._currentTurnAbortController !== undefined;
+    if (!turnActive) this._releaseParkedRun(claimedPending);
     if (!turnActive) this._emitAbortedToolEnds({ force: true });
     this._emitTurnEvent({
       type: 'resume_failed',
@@ -18199,6 +15905,25 @@ export class Session {
     this._notifyMaybeIdle();
     if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
     return true;
+  }
+
+  /**
+   * PF-8122: a suspension settled with no live turn (discarded, expired or stopped)
+   * leaves its agent run parked on the thread, and a parked run holds the
+   * thread until the suspended-run TTL sweeps it, so the next message cannot
+   * start a fresh run. Abort that parked run so the thread is free again.
+   */
+  private _releaseParkedRun(pending: PendingResume): void {
+    try {
+      const { agent } = this._harness._resolveAgentForRuntimeDependencies(
+        this._runtimeDependenciesForPendingResume(pending),
+        'settled pending interaction release',
+      );
+      agent.abortRunStream(pending.runId);
+    } catch (err) {
+      // The interaction is already settled; the TTL sweep still releases the run.
+      console.error('[harness/v1] parked run release after a settled pending interaction failed:', err);
+    }
   }
 
   /** The discard receipt whose claim is stamped on `pending`, if any. */
@@ -18503,81 +16228,29 @@ export class Session {
   // -------------------------------------------------------------------------
 
   readonly om = Object.freeze({
-    getObserverModelId: (): string | null => this._omObserverModelId(),
-    getReflectorModelId: (): string | null => this._omReflectorModelId(),
-    getObservationThreshold: (): number => this._omObservationThreshold(),
-    getReflectionThreshold: (): number => this._omReflectionThreshold(),
-    switchObserverModel: (opts: { model: string }): Promise<void> => this._omSwitchObserverModel(opts),
-    switchReflectorModel: (opts: { model: string }): Promise<void> => this._omSwitchReflectorModel(opts),
-    clearOverride: (): Promise<void> => this._omClearOverride(),
+    getObserverModelId: (): string | null => omObserverModelId(this._observationalMemoryPort()),
+    getReflectorModelId: (): string | null => omReflectorModelId(this._observationalMemoryPort()),
+    getObservationThreshold: (): number => omObservationThreshold(this._observationalMemoryPort()),
+    getReflectionThreshold: (): number => omReflectionThreshold(this._observationalMemoryPort()),
+    switchObserverModel: (opts: { model: string }): Promise<void> =>
+      omSwitchObserverModel(this._observationalMemoryPort(), opts),
+    switchReflectorModel: (opts: { model: string }): Promise<void> =>
+      omSwitchReflectorModel(this._observationalMemoryPort(), opts),
+    clearOverride: (): Promise<void> => omClearOverride(this._observationalMemoryPort()),
   });
 
-  private _omDefaults() {
-    return this._harness._getObservationalMemoryDefaults();
-  }
-
-  private _omObserverModelId(): string | null {
-    this._assertLive('om.getObserverModelId()');
-    return this._record.observationalMemory?.observerModelId ?? this._omDefaults().observerModelId ?? null;
-  }
-
-  private _omReflectorModelId(): string | null {
-    this._assertLive('om.getReflectorModelId()');
-    return this._record.observationalMemory?.reflectorModelId ?? this._omDefaults().reflectorModelId ?? null;
-  }
-
-  /** Effective observation trigger threshold. `0` means "use the memory adapter default". */
-  private _omObservationThreshold(): number {
-    this._assertLive('om.getObservationThreshold()');
-    return this._record.observationalMemory?.observationThreshold ?? this._omDefaults().observationThreshold ?? 0;
-  }
-
-  /** Effective reflection trigger threshold. `0` means "use the memory adapter default". */
-  private _omReflectionThreshold(): number {
-    this._assertLive('om.getReflectionThreshold()');
-    return this._record.observationalMemory?.reflectionThreshold ?? this._omDefaults().reflectionThreshold ?? 0;
-  }
-
-  private async _omSwitchObserverModel(opts: { model: string }): Promise<void> {
-    this._assertLive('om.switchObserverModel()');
-    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
-      throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
-    }
-    throw new HarnessConfigError(
-      'observationalMemory',
-      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
-    );
-  }
-
-  private async _omSwitchReflectorModel(opts: { model: string }): Promise<void> {
-    this._assertLive('om.switchReflectorModel()');
-    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
-      throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
-    }
-    throw new HarnessConfigError(
-      'observationalMemory',
-      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
-    );
-  }
-
-  /** Remove unsupported intent persisted by an older Harness build. */
-  private async _omClearOverride(): Promise<void> {
-    this._assertLive('om.clearOverride()');
-    await this._flushUpdate(prev => {
-      if (prev.observationalMemory === undefined) return prev;
-      const next = { ...prev };
-      delete next.observationalMemory;
-      return next;
-    });
-    // Recovered queue work parks while a legacy override is present. Wake it
-    // only after the clearing CAS commits; a failed write leaves the durable
-    // poison authoritative. This mirrors the other fire-and-forget queue kicks
-    // and is idempotent when another drain already owns the session.
-    void this._maybeDrainQueue();
-  }
-
-  private _hasUnsupportedObservationalMemoryIntent(): boolean {
-    return this._harness._getObservationalMemoryDefaults().enabled || this._record.observationalMemory !== undefined;
+  /** Build the small port the Observational Memory operations need. */
+  private _observationalMemoryPort(): ObservationalMemorySessionPort {
+    const session = this;
+    return {
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+      maybeDrainQueue: () => session._maybeDrainQueue(),
+    };
   }
 
   // §9.2 PER-TURN OM ENABLEMENT — DEFERRED (BLOCKED ON @mastra/memory).
@@ -19147,8 +16820,7 @@ export class Session {
       // A pending native admission resumes here: its completed output must
       // stage fail-closed on every completion path.
       if (boundAdmission?.status === 'pending') {
-        this._nativeTerminalRunIds.add(pending.runId);
-        this._terminalStagingAdmissions.set(pending.runId, boundAdmission);
+        this._terminalStagingLedger.admitNative(pending.runId, boundAdmission);
       }
     }
 
@@ -19548,8 +17220,7 @@ export class Session {
           if (!terminalized) this._emitAbortedToolEnds({ force: true });
           finishResumedTurn();
           if (pendingQueuedItemId !== undefined) {
-            this._currentQueuedItemId = undefined;
-            this._currentQueuedItemSource = undefined;
+            this._queueHead.release();
             this._notifyMaybeIdle();
           }
         }
@@ -19666,8 +17337,7 @@ export class Session {
         // drain arms the existing stale-recovery timer instead of leaving the
         // queue parked until an unrelated external call arrives.
         if (pendingQueuedItemId !== undefined) {
-          this._currentQueuedItemId = undefined;
-          this._currentQueuedItemSource = undefined;
+          this._queueHead.release();
           this._notifyMaybeIdle();
         }
       }
@@ -20108,15 +17778,13 @@ export class Session {
       // resolver, remove the head item, clear current, then kick the drain
       // for the next item.
       if (firstFinalize) {
-        const wasGoalDriven = (this._currentQueuedItemSource ?? 'user') === 'goal';
+        const wasGoalDriven = (this._queueHead.currentSource ?? 'user') === 'goal';
         await Promise.race([this._runGoalJudge(full, wasGoalDriven), deletedTurnWaiter]);
       }
       if (completingQueuedItemId !== undefined) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-        const resolver = this._queueResolvers.get(completingQueuedItemId);
+        this._queueHead.release();
+        const resolver = this._queueHead.takeResolver(completingQueuedItemId);
         if (resolver) {
-          this._queueResolvers.delete(completingQueuedItemId);
           resolver.resolve(full as AgentResult);
         }
         this._notifyMaybeIdle();
@@ -20264,9 +17932,8 @@ export class Session {
         ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
         error: projectedError,
       });
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(publicErrorProjectionToError(projectedError));
       }
     }
@@ -20521,7 +18188,7 @@ export class Session {
 
   private _queuedItemIdForPendingResume(pending: PendingResume): string | undefined {
     if (pending.queuedItemId !== undefined) return pending.queuedItemId;
-    if (this._currentQueuedItemId !== undefined) return this._currentQueuedItemId;
+    if (this._queueHead.currentId !== undefined) return this._queueHead.currentId;
     return (this._record.pendingQueue ?? []).find(item => {
       const receipt = this._record.queueAdmissionReceipts?.[item.id];
       return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === pending.runId;
@@ -20688,11 +18355,9 @@ export class Session {
           { skipTokenAccounting: alreadyAccounted },
         );
       }
-      this._currentQueuedItemId = undefined;
-      this._currentQueuedItemSource = undefined;
-      const resolver = this._queueResolvers.get(queuedItemId);
+      this._queueHead.release();
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.resolve(currentReceipt.result as AgentResult);
       }
       this._notifyMaybeIdle();
@@ -20741,7 +18406,7 @@ export class Session {
   //      all flow with `queuedItemId` stamped automatically by
   //      `_emitTurnEvent`).
   //   3. If the turn suspends, the head item stays in `pendingQueue` and
-  //      `_currentQueuedItemId` stays set. The next `respondTo*` call calls
+  //      `_queueHead.currentId` stays set. The next `respondTo*` call calls
   //      into `_resume`; on terminal completion the resume path settles the
   //      resolver + removes the head + kicks drain again.
   //   4. If the turn completes without suspending, the queue receipt,
@@ -20791,7 +18456,7 @@ export class Session {
       return promise;
     }
 
-    this._queueResolvers.set(admission.queuedItemId, { promise, resolve: queued.resolve, reject: queued.reject });
+    this._queueHead.register(admission.queuedItemId, { promise, resolve: queued.resolve, reject: queued.reject });
     // Kick the drain — fire-and-forget. Drain handles its own errors and
     // settles the resolver via `_completeQueuedTurn` / `_failQueuedTurn`.
     void this._maybeDrainQueue();
@@ -21249,7 +18914,7 @@ export class Session {
         evidence.error ?? { code: 'harness.queue_exhausted', message: 'queued turn exhausted retry attempts' },
       );
     }
-    const resolver = this._queueResolvers.get(evidence.queuedItemId);
+    const resolver = this._queueHead.peekResolver(evidence.queuedItemId);
     if (resolver) return this._raceActiveTurnWaiter(resolver.promise, activeDeleted);
     void this._maybeDrainQueue();
     return this._awaitDurableQueueResult(evidence, activeDeleted);
@@ -21405,7 +19070,7 @@ export class Session {
     },
   ): SessionRecord {
     const policy = this._harness._internalQueueBackpressure;
-    const activeId = this._currentQueuedItemId ?? prev.pendingResume?.queuedItemId;
+    const activeId = this._queueHead.currentId ?? prev.pendingResume?.queuedItemId;
     const queue = [...(prev.pendingQueue ?? [])];
     const existingReceipts = prev.queueAdmissionReceipts ?? {};
     let nextReceipts: Record<string, QueueAdmissionReceipt> | undefined;
@@ -21484,9 +19149,8 @@ export class Session {
   // throws HarnessQueueFullError at the caller and admits nothing.)
   private _failBackpressureDroppedItems(droppedItems: QueueBackpressureDrop[]): void {
     for (const dropped of droppedItems) {
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessQueueFullDroppedError(dropped.queuedItemId));
       }
     }
@@ -21665,9 +19329,8 @@ export class Session {
     for (const dropped of expired) {
       // §10.2: no queue_item_expired event — the observable effect is the
       // rejected operation promise (HarnessQueueItemExpiredError) below.
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessQueueItemExpiredError(this.id, dropped.queuedItemId, dropped.deadline));
       }
     }
@@ -21689,7 +19352,7 @@ export class Session {
       const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
       if (recovery.status === 'none') return;
     }
-    if (this._currentQueuedItemId !== undefined) return;
+    if (this._queueHead.currentId !== undefined) return;
     // A manual `message()` turn is in flight — wait for it to settle.
     // `_recordTurnCompletion` will re-kick the drain on its way out.
     if (this._currentTurnAbortController !== undefined) return;
@@ -21712,14 +19375,13 @@ export class Session {
         this._clearQueueWakeTimer();
         const head = this._record.pendingQueue?.[0];
         if (!head) return;
-        this._currentQueuedItemId = head.id;
-        this._currentQueuedItemSource = head.source ?? 'user';
+        this._queueHead.claim(head.id, head.source ?? 'user');
         // §10.2: no queue_item_started / queue_item_replayed events — the closed
         // union has no queue-lifecycle family; the drained turn's `agent_start`
         // marks the boundary. We still clear the live-admission marker (only
         // when no live resolver is tracking the item, mirroring the prior
         // short-circuit) so `_liveAdmittedQueuedItemIds` does not leak.
-        if (!this._queueResolvers.has(head.id)) {
+        if (!this._queueHead.hasResolver(head.id)) {
           this._liveAdmittedQueuedItemIds.delete(head.id);
         }
 
@@ -22265,8 +19927,7 @@ export class Session {
     modeId: string,
     err: QueuePostRunFinalizationPendingError,
   ): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => {
@@ -22590,7 +20251,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         params.modeId ?? this._record.modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -22661,7 +20322,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -22745,7 +20406,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         submittingModeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -22787,9 +20448,8 @@ export class Session {
    */
   private async _completeQueuedTurn(itemId: string, result: AgentResult): Promise<void> {
     if (this.isClosed) {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (resolver) {
-        this._queueResolvers.delete(itemId);
         resolver.resolve(result);
       }
       return;
@@ -22822,8 +20482,7 @@ export class Session {
           : {}),
       };
     });
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     // §10.2 OperationEvent — `queue_completed` is the queue settlement boundary,
     // not `agent_end`. Requires the accepted-signal identities (`runId`,
     // `signalId`); skip if the receipt never crossed the agent boundary.
@@ -22840,9 +20499,8 @@ export class Session {
         });
       }
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       if (terminalFailure) {
         resolver.reject(terminalFailure);
       } else {
@@ -22860,9 +20518,8 @@ export class Session {
     // Eviction rejects local waiters and leaves durable queued work for its next
     // owner. Failure cleanup must not write through the lost lease.
     if (this.isClosed || this._state === 'evicted') {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (resolver) {
-        this._queueResolvers.delete(itemId);
         resolver.reject(err);
       }
       return;
@@ -22908,8 +20565,7 @@ export class Session {
       }
       throw flushError;
     }
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     // §10.2 OperationEvent — a late failure may race a completion that already
     // won (`completedResult`): emit `queue_completed` for that, else
     // `queue_failed`. `signalId`/`runId` are optional on the failed event.
@@ -22937,9 +20593,8 @@ export class Session {
         });
       }
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       if (completedResult !== undefined) {
         resolver.resolve(completedResult);
       } else {
@@ -22987,12 +20642,10 @@ export class Session {
       return next;
     });
 
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     for (const itemId of queuedIds) {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (!resolver) continue;
-      this._queueResolvers.delete(itemId);
       const completed = completedResults.get(itemId);
       if (completed !== undefined) {
         resolver.resolve(completed);
@@ -23004,8 +20657,7 @@ export class Session {
   }
 
   private _parkQueuedTurn(itemId: string, err: unknown): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     if (err instanceof QueueRecoveryPendingError || err instanceof HarnessQueuedTurnDeferredError) {
       const delayMs = Math.max(0, err.retryAt - Date.now());
@@ -23013,23 +20665,20 @@ export class Session {
       this._unrefQueueTimerIfBackgroundOnly(timer);
       return;
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       resolver.reject(err);
     }
   }
 
   private _ensureQueuedItemContext(queuedItemId: string): void {
-    if (this._currentQueuedItemId !== undefined) return;
+    if (this._queueHead.currentId !== undefined) return;
     const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
-    this._currentQueuedItemId = queuedItemId;
-    this._currentQueuedItemSource = queuedItem?.source ?? 'user';
+    this._queueHead.claim(queuedItemId, queuedItem?.source ?? 'user');
   }
 
   private _deferQueuedTurnRetry(err: QueuePostRunFinalizationPendingError): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => void this._maybeDrainQueue(), delayMs);
@@ -23085,7 +20734,7 @@ export class Session {
   }
 
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
-    if (this._queueResolvers.size === 0) {
+    if (this._queueHead.resolverCount === 0) {
       timer.unref?.();
     }
   }
@@ -23135,7 +20784,7 @@ export class Session {
     // engine never honored. Recovered work must park before scheduling, expiry,
     // receipt admission, or failure settlement mutates durable queue state.
     // `session.om.clearOverride()` commits recovery and then re-kicks the drain.
-    if (this._hasUnsupportedObservationalMemoryIntent()) return false;
+    if (hasUnsupportedObservationalMemoryIntent(this._observationalMemoryPort())) return false;
     if (this._record.cancelRequest !== undefined) return this._hasCompletedQueuedItemsAfterCancellation();
     if (this._state === 'live') return true;
     if (!this.isClosing) return false;
@@ -23290,8 +20939,7 @@ export class Session {
           // construction and post-save assignment are not lost — we re-overlay
           // from the live counter below.
           tokenUsage: { ...tokenUsageForSave },
-          accountedTerminalRunIds:
-            this._terminalTokenAccountedRunIds.size > 0 ? [...this._terminalTokenAccountedRunIds] : undefined,
+          accountedTerminalRunIds: this._terminalStagingLedger.accountedSnapshot(),
           lastActivityAt: Date.now(),
         };
         // Resume-usage fence: while armed, any write that persists the bumped
@@ -23674,7 +21322,7 @@ export class Session {
      */
     yolo?: boolean;
   }): Promise<RequestContext> {
-    if (this._hasUnsupportedObservationalMemoryIntent()) {
+    if (hasUnsupportedObservationalMemoryIntent(this._observationalMemoryPort())) {
       throw new HarnessConfigError(
         'observationalMemory',
         'Harness per-session Observational Memory is not supported until @mastra/memory can select an OM engine from the per-turn memory config. Configure OM on the Agent Memory instance and omit HarnessConfig.observationalMemory.',
@@ -24149,12 +21797,8 @@ export class Session {
     }
     this._clearQueueWakeTimer();
     this._clearDelegationReconcileTimers();
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
-    for (const [queuedItemId, resolver] of this._queueResolvers) {
-      this._queueResolvers.delete(queuedItemId);
-      resolver.reject(err);
-    }
+    this._queueHead.release();
+    this._queueHead.rejectAll(err);
     this._tearDownThreadSubscription(err);
   }
 
@@ -24201,12 +21845,8 @@ export class Session {
     }
     this._clearQueueWakeTimer();
     this._clearDelegationReconcileTimers();
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
-    for (const [queuedItemId, resolver] of this._queueResolvers) {
-      this._queueResolvers.delete(queuedItemId);
-      resolver.reject(err);
-    }
+    this._queueHead.release();
+    this._queueHead.rejectAll(err);
   }
 
   /** @internal — update local lease metadata after the owning Harness renews storage. */
@@ -24378,56 +22018,8 @@ export class Session {
     return [context, instructions];
   }
 
-  /**
-   * PF-8202: wait for the `remind` settlements committed but not yet started,
-   * and for the `remind` deliveries in flight, so their rows are saved before a
-   * turn's run loads history. A delivery that finishes may be followed by a
-   * reconcile pass that starts another, so this repeats; the bound keeps a busy
-   * reconcile loop from holding the turn, and one overall deadline keeps a
-   * stalled save from doing so. Anything later reaches the next turn. A `remind`
-   * delivery never waits for a turn, so this cannot deadlock. Never rejects:
-   * each delivery settles its own outcome.
-   */
-  private async _awaitRemindNoticeSaves(): Promise<void> {
-    if (this._remindNoticeSavesSettled()) return;
-    await new Promise<void>(resolve => {
-      const wake = () => {
-        clearTimeout(timer);
-        this._remindNoticeDrainWaiters.delete(wake);
-        resolve();
-      };
-      const timer = setTimeout(wake, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
-      (timer as { unref?: () => void }).unref?.();
-      this._remindNoticeDrainWaiters.set(wake, REMIND_NOTICE_BARRIER_ROUNDS);
-      if (!this._remindNoticeDraining) void this._drainRemindNoticeSaves();
-    });
-  }
-
-  private _remindNoticeSavesSettled(): boolean {
-    return this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0;
-  }
-
-  /**
-   * Runs while any turn waits. Each round waits for everything in both sets at
-   * that point, then counts down every waiter's rounds; a waiter wakes when its
-   * rounds run out or both sets are empty. The flag clears in the same step
-   * that sees no waiters, so a turn that joins later starts a new drain.
-   */
-  private async _drainRemindNoticeSaves(): Promise<void> {
-    this._remindNoticeDraining = true;
-    while (this._remindNoticeDrainWaiters.size > 0) {
-      if (this._remindNoticeSavesSettled()) {
-        for (const wake of [...this._remindNoticeDrainWaiters.keys()]) wake();
-        break;
-      }
-      await Promise.allSettled(this._remindSettlementsStarting);
-      await Promise.allSettled(this._remindDeliveries);
-      for (const [wake, rounds] of [...this._remindNoticeDrainWaiters]) {
-        if (rounds <= 1) wake();
-        else this._remindNoticeDrainWaiters.set(wake, rounds - 1);
-      }
-    }
-    this._remindNoticeDraining = false;
+  private _awaitRemindNoticeSaves(): Promise<void> {
+    return this._settlementNoticeDelivery._awaitRemindNoticeSaves();
   }
 
   /**
@@ -25199,6 +22791,9 @@ export class Session {
     } finally {
       child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
+      // In the same step as the active entry goes, so the child never reads as
+      // neither active nor settling here.
+      this._settlingDelegations.add(child.id);
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;
     }
@@ -25247,6 +22842,7 @@ export class Session {
         depth: childDepth,
       });
     } finally {
+      this._settlingDelegations.delete(child.id);
       this._delegationDriverClaims.delete(child.id);
       this._internalReleaseSubagentExecution();
       endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
@@ -25272,6 +22868,9 @@ export class Session {
     notify?: { childCancelRequest: SessionRecord['cancelRequest'] },
   ): Promise<boolean> {
     if (this._state === 'closed') return false;
+    // Before the first await, so a wait that begins while this write is in
+    // flight counts the child as running when it began.
+    this._settlingDelegations.add(subagentSessionId);
     const noticeMode =
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
@@ -25315,20 +22914,23 @@ export class Session {
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
+          // Before the public delegate_settled event: a wait that event starts
+          // must not take this settlement as one from after its call.
+          onCommitted: () => {
+            this._settlingDelegations.delete(subagentSessionId);
+            for (const listener of Array.from(this._delegatedSettlementListeners)) {
+              try {
+                listener(subagentSessionId);
+              } catch {
+                // A listener only wakes a reader early. One that throws must not
+                // skip the other listeners, the notice below, or reach the
+                // reconcile retry for a settlement that is already durable.
+              }
+            }
+          },
         });
       });
-      if (reconcileResult.reconciled) {
-        this._notifyDisplayRefresh();
-        for (const listener of Array.from(this._delegatedSettlementListeners)) {
-          try {
-            listener();
-          } catch {
-            // A listener only wakes a reader early. One that throws must not
-            // skip the other listeners, the notice below, or reach the
-            // reconcile retry for a settlement that is already durable.
-          }
-        }
-      }
+      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
         this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
@@ -25340,6 +22942,7 @@ export class Session {
       this._scheduleDelegationReconcileRetry(0);
       return false;
     } finally {
+      this._settlingDelegations.delete(subagentSessionId);
       releaseRemindSettlement?.();
     }
   }
@@ -25371,106 +22974,91 @@ export class Session {
   }
 
   /**
-   * Deliver one owed settlement notice as a `system-reminder` signal, at most
-   * once per child session id + settlement digest (`key`, hashed into a
-   * deterministic signal id, so every redelivery rewrites one message row).
-   *
-   * 1. Re-read the task: a notice another pass acknowledged, or one held by a
-   *    live claim, is not delivered again.
-   * 2. Persist the reminder row on the parent thread through the agent's
-   *    memory, as the runtime's `persist` signal behaviour does. Nothing is
-   *    delivered into a running turn, so the runtime never hands it to an
-   *    ungated follow-up run; the next parent turn reads it from history. A
-   *    history-load watch on the row, registered before the save, records any
-   *    run in this process that loads the row into its context.
-   * 3. `remind` acknowledges the notice and never starts a turn.
-   * 4. `wake` (PF-7679) waits, unclaimed, until the parent has no running turn,
-   *    parked interaction or queued turn, so a close, shutdown or crash during
-   *    that wait leaves the notice owed. A Stop or edit since the settlement, or
-   *    a run that loaded the row (the watch fired), acknowledges without waking.
-   *    Otherwise the wake turn builds its context and claims the notice: the
-   *    claim (`notice.claim`, valid while its claimer holds the session lease)
-   *    keeps the notice durable, and only its holder dispatches, after a
-   *    same-tick re-check and lease check. An accepted wake acknowledges the
-   *    notice under the claim. A wake not sent clears its claim (a stale fence
-   *    clears it as `remind`) and the delivery waits again; a claim that cannot
-   *    be cleared is marked dead in this process, so reconcile takes it over.
-   *
-   * Under OM `sourceWriteFencing: 'required'` (PF-8034) the row goes to the
-   * delegating mode's memory under the source-write guard of the parent run
-   * that delegated the task, recorded with the delegation; a wake run in that
-   * mode reuses it (`_resolveDelegationNoticeTarget`). A notice with no guard
-   * for fenced memory, or whose guard was revoked since (its OM record
-   * retracted, as when the transcript is deleted), is obsolete: acknowledged
-   * without a row or a wake, never under a new guard.
-   *
-   * Every exit is a typed outcome (`DelegationNoticeOutcome`). A cancelled
-   * parent drops the notice. A closed or torn-down parent, or one whose Harness
-   * is shutting down, leaves it owed for restart reconcile; a running delivery
-   * is awaited by the shutdown barrier (PF-7595). A notice left owed while the
-   * parent is live re-arms reconciliation with the caller's backoff attempt.
+   * PF-8326: the port settlement-notice delivery reaches this session through.
+   * Every member reads or calls the session when used, so reassigned state and
+   * instance spies are always current.
    */
+  private _settlementNoticeDeliveryPort(): SettlementNoticeDeliverySessionPort {
+    const session = this;
+    return {
+      get id() {
+        return session.id;
+      },
+      get resourceId() {
+        return session.resourceId;
+      },
+      get threadId() {
+        return session.threadId;
+      },
+      get state() {
+        return session._state;
+      },
+      get isClosing() {
+        return session.isClosing;
+      },
+      get harness() {
+        return session._harness;
+      },
+      get record() {
+        return session._record;
+      },
+      get storage() {
+        return session._storage;
+      },
+      get modeSwitchEpoch() {
+        return session._modeSwitchEpoch;
+      },
+      get currentRunModeId() {
+        return session._currentRunModeId;
+      },
+      get currentTurnRequestContext() {
+        return session._currentTurnRequestContext;
+      },
+      get delegationNoticeDeliveries() {
+        return session._delegationNoticeDeliveries;
+      },
+      get delegationNoticeWatches() {
+        return session._delegationNoticeWatches;
+      },
+      get remindSettlementsStarting() {
+        return session._remindSettlementsStarting;
+      },
+      isRunning: () => session.isRunning(),
+      activeWorkAdmissionIsCurrent: epoch => session._activeWorkAdmissionIsCurrent(epoch),
+      sessionLeaseHeld: () => session._sessionLeaseHeld(),
+      buildRequestContext: turn => session._buildRequestContext(turn),
+      injectSystemReminder: (content, opts, internal) => session._injectSystemReminder(content, opts, internal),
+      nextStateTransition: timeoutMs => session._nextStateTransition(timeoutMs),
+      notifyMaybeIdle: () => session._notifyMaybeIdle(),
+      planTaskPort: () => session._planTaskPort(),
+      scheduleDelegationReconcileRetry: attempt => session._scheduleDelegationReconcileRetry(attempt),
+      serializePlanTaskWrite: run => session._serializePlanTaskWrite(run),
+      settleDelegationNoticeOutcome: (outcome, notice, retryAttempt) =>
+        session._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
+      logDelegationNotice: (...args) => session._logDelegationNotice(...args),
+      withNoticeFence: (delivery, site, body) => session._withNoticeFence(delivery, site, body),
+      resolveDelegationNoticeMemory: notice => session._resolveDelegationNoticeMemory(notice),
+      awaitDelegationNoticeQuiescence: live => session._awaitDelegationNoticeQuiescence(live),
+      delegationNoticeClaimable: notice => session._delegationNoticeClaimable(notice),
+      delegationNoticeIsOwed: notice => session._delegationNoticeIsOwed(notice),
+      delegationNoticeBackoff: (attempt, live) => session._delegationNoticeBackoff(attempt, live),
+    };
+  }
+
   private _startDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
   ): void {
-    // Tracked so shutdown's bounded settle awaits a reminder write in flight.
-    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch).then(
-      outcome => this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
-      (error: unknown) => {
-        this._logDelegationNotice('error', 'settlement notice delivery failed', notice, error);
-        this._settleDelegationNoticeOutcome('left_owed', notice, retryAttempt);
-      },
-    );
-    this._delegationNoticeDeliveries.add(delivery);
-    const remind = notice.mode === 'remind';
-    if (remind) this._remindDeliveries.add(delivery);
-    const untrack = () => {
-      this._delegationNoticeDeliveries.delete(delivery);
-      if (remind) this._remindDeliveries.delete(delivery);
-    };
-    void delivery.then(untrack, untrack);
+    this._settlementNoticeDelivery._startDelegationSettlementNotice(notice, admissionEpoch, retryAttempt);
   }
 
-  /** PF-7679: act on a delivery's typed outcome. No outcome falls through as success. */
   private _settleDelegationNoticeOutcome(
     outcome: DelegationNoticeOutcome,
     notice: PendingDelegationSettlementNotice,
     retryAttempt: number,
   ): void {
-    switch (outcome) {
-      case 'wake':
-      case 'history':
-      case 'fenced':
-      case 'superseded':
-        return;
-      case 'left_owed':
-        if (this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown()) {
-          this._scheduleDelegationReconcileRetry(retryAttempt);
-        }
-        return;
-      case 'obsolete':
-        // Acknowledged durably, like a delivered notice: reconcile does not
-        // see it again. Retraction wins over the reminder.
-        this._logDelegationNotice(
-          'warn',
-          "settlement notice dropped: the delegating run's source-write guard is missing or revoked",
-          notice,
-        );
-        return;
-      case 'lost':
-        this._logDelegationNotice(
-          'error',
-          'settlement notice wake dispatched without a confirmed wake run; counted as delivered',
-          notice,
-        );
-        return;
-      default: {
-        const unexpected: never = outcome;
-        throw new Error(`unexpected settlement notice outcome: ${String(unexpected)}`);
-      }
-    }
+    this._settlementNoticeDelivery._settleDelegationNoticeOutcome(outcome, notice, retryAttempt);
   }
 
   private _logDelegationNotice(
@@ -25479,506 +23067,21 @@ export class Session {
     notice: PendingDelegationSettlementNotice,
     error?: unknown,
   ): void {
-    try {
-      this._harness.mastra.getLogger()[level](`Harness ${message}`, {
-        sessionId: this.id,
-        taskId: notice.taskId,
-        subagentSessionId: notice.subagentSessionId,
-        digest: notice.digest,
-        ...(error !== undefined ? { error } : {}),
-      });
-    } catch {
-      // Logging never changes the delivery outcome.
-    }
+    this._settlementNoticeDelivery._logDelegationNotice(level, message, notice, error);
   }
 
-  /** PF-7679: the delivery's fence, read synchronously in the tick of the guarded action. */
-  private _readNoticeFence(delivery: NoticeDelivery): NoticeFence {
-    const lifecycle: NoticeFence['lifecycle'] =
-      this._state === 'deleted'
-        ? 'deleted'
-        : this._state !== 'live'
-          ? 'closed'
-          : this._harness._internalIsShuttingDown()
-            ? 'shutting_down'
-            : this.isClosing
-              ? 'closing'
-              : 'live';
-    return {
-      lifecycle,
-      stale: !this._activeWorkAdmissionIsCurrent(delivery.epoch),
-      cancelled: this._record.cancelRequest !== undefined,
-      leaseHeld: this._sessionLeaseHeld(),
-    };
-  }
-
-  /**
-   * PF-7679: run a notice write at the head of the plan-task write chain (the
-   * chain Stop's downgrade uses), with the fence read when it gets there. The
-   * body must not queue another serialized write.
-   */
   private _withNoticeFence<T>(
     delivery: NoticeDelivery,
     site: NoticeFenceSite,
     body: (fence: NoticeFence) => Promise<T>,
   ): Promise<T> {
-    return this._serializePlanTaskWrite(() => {
-      const fence = this._readNoticeFence(delivery);
-      if (fence.lifecycle !== 'live' || fence.stale || fence.cancelled || !fence.leaseHeld) {
-        this._logDelegationNotice(
-          'debug',
-          `settlement notice fence at ${site}: ${fence.lifecycle}${fence.stale ? ', stale' : ''}${
-            fence.cancelled ? ', cancelled' : ''
-          }${fence.leaseHeld ? '' : ', lease not held'}`,
-          delivery.notice,
-        );
-      }
-      return body(fence);
-    });
+    return this._settlementNoticeDelivery._withNoticeFence(delivery, site, body);
   }
 
-  private async _deliverDelegationSettlementNotice(
-    notice: PendingDelegationSettlementNotice,
-    admissionEpoch: number,
-  ): Promise<DelegationNoticeOutcome> {
-    const key = `${notice.subagentSessionId}:${notice.digest}`;
-    // A shutting-down Harness starts no new delivery work; the notice stays
-    // owed for the next owner's reconcile.
-    const live = () => this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown();
-    if (!live()) return 'left_owed';
-    // Another pass of this session is delivering it.
-    if (this._delegationNoticesInFlight.has(key)) return 'superseded';
-    this._delegationNoticesInFlight.add(key);
-    let outcome: DelegationNoticeOutcome = 'left_owed';
-    try {
-      outcome = await this._runDelegationSettlementNotice(notice, admissionEpoch, key, live);
-      return outcome;
-    } finally {
-      this._delegationNoticesInFlight.delete(key);
-      // The row's watch is kept for this session's own retry only while the
-      // notice is left owed in a live session that holds the lease (a lost
-      // lease hands the notice to the next holder); teardown disposes the rest.
-      if (outcome !== 'left_owed' || !live() || !this._sessionLeaseHeld()) {
-        this._delegationNoticeWatches.get(key)?.dispose();
-        this._delegationNoticeWatches.delete(key);
-      }
-    }
-  }
-
-  private async _runDelegationSettlementNotice(
-    notice: PendingDelegationSettlementNotice,
-    admissionEpoch: number,
-    key: string,
-    live: () => boolean,
-  ): Promise<DelegationNoticeOutcome> {
-    const firstEpoch = this._delegationNoticeEpochs.get(key);
-    if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
-    else admissionEpoch = firstEpoch;
-    const delivery: NoticeDelivery = { key, notice, epoch: admissionEpoch };
-    const ids = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-    const takeover = (claim: DelegationNoticeClaim) => noticeClaimTakeoverEligible(this._harness, claim);
-    // The claim this delivery holds (its write may have landed), until resolved.
-    let claimId: string | undefined;
-    let watch = this._delegationNoticeWatches.get(key);
-    const backoff = (attempt: number): Promise<boolean> => this._delegationNoticeBackoff(attempt, live);
-    // Unserialized body: the caller runs it inside `_withNoticeFence`. A held
-    // claim removes only itself; an unclaimed delivery removes a notice with no
-    // claim or a claim reconcile may take over.
-    const removeNotice = async (): Promise<boolean> => {
-      const removed = await planTaskAcknowledgeDelegationSettlementNotice(
-        this._planTaskPort(),
-        claimId !== undefined ? { ...ids, claimId } : { ...ids, takeover },
-      );
-      if (removed) this._delegationNoticeEpochs.delete(key);
-      return removed;
-    };
-    // Delivered-ack, or the fenced ack of a Stop/edit/cancel. No write after a
-    // hard delete or once the lease is lost: the next holder re-checks.
-    const acknowledge = (site: NoticeFenceSite): Promise<'removed' | 'not_owed' | 'no_write'> =>
-      this._withNoticeFence(delivery, site, async fence => {
-        if (fence.lifecycle === 'deleted' || !fence.leaseHeld) return 'no_write';
-        return (await removeNotice()) ? 'removed' : 'not_owed';
-      });
-    const acknowledged = async (
-      site: NoticeFenceSite,
-      outcome: 'history' | 'fenced' | 'obsolete',
-    ): Promise<DelegationNoticeOutcome> => {
-      const result = await acknowledge(site);
-      return result === 'removed' ? outcome : result === 'not_owed' ? 'superseded' : 'left_owed';
-    };
-    const claim = (id: string): Promise<NoticeClaimResult> =>
-      this._withNoticeFence(delivery, 'claim', async fence => {
-        if (fence.lifecycle !== 'live' || !fence.leaseHeld) return 'left_owed';
-        // A Stop, edit or cancel since the settlement: never claim, never wake.
-        if (fence.stale || fence.cancelled) return (await removeNotice()) ? 'fenced' : 'claim_lost';
-        return planTaskClaimDelegationSettlementNotice(this._planTaskPort(), {
-          ...ids,
-          claim: { claimId: id, ownerId: this._harness.ownerId, claimedAt: Date.now() },
-          takeover,
-        });
-      });
-    // Clear this delivery's claim without a delivery (a stale or cancelled fence
-    // clears it as `remind`). The claim leaves the live set either way: cleared
-    // (or never landed, the notice still owed and claimable), gone, or (no
-    // write, or a failed one) dead, so reconcile may take it over.
-    const resolveClaim = async (): Promise<'cleared' | 'superseded' | 'dead'> => {
-      const id = claimId!;
-      try {
-        return await this._withNoticeFence(delivery, 'restore', async fence => {
-          if (fence.lifecycle === 'deleted' || !fence.leaseHeld) return 'dead';
-          const cleared = await planTaskClearDelegationSettlementNoticeClaim(this._planTaskPort(), {
-            ...ids,
-            claimId: id,
-            mode: fence.stale || fence.cancelled ? 'remind' : notice.mode,
-          });
-          if (cleared) return 'cleared';
-          // Not ours: a claim write that never landed leaves the notice owed
-          // with no claim, or a dead claim of this owner. A moved digest, a
-          // claim live here, or a foreign claim (its owner may hold the lease
-          // in storage) supersedes: this delivery never claims over it again.
-          const current = await this._loadDelegationNotice(notice);
-          const reclaimable =
-            current !== undefined &&
-            (current.claim === undefined ||
-              (current.claim.ownerId === this._harness.ownerId && this._delegationNoticeClaimable(current)));
-          return reclaimable ? 'cleared' : 'superseded';
-        });
-      } catch (error) {
-        this._logDelegationNotice('warn', 'settlement notice claim could not be cleared', notice, error);
-        return 'dead';
-      } finally {
-        claimId = undefined;
-        releaseNoticeClaim(this._harness, id);
-      }
-    };
-    // The wake ran (or a run loaded the row, or a fence ended it): acknowledge
-    // under the claim. A fenced-out ack leaves the claim for the next holder. A
-    // failed ack is retried with the reconcile backoff while the claim stays
-    // live, so no retry of this process re-delivers it. Past the backoff cap,
-    // or once the lease, the session or the epoch is lost, the claim is left
-    // dead: reconcile or the next holder takes it over (a possible duplicate).
-    const finishClaimed = async (outcome: 'wake' | 'history' | 'fenced' | 'lost'): Promise<DelegationNoticeOutcome> => {
-      const id = claimId!;
-      try {
-        for (let attempt = 0; ; attempt += 1) {
-          let failure: unknown;
-          try {
-            const result = await acknowledge('dispatch');
-            if (result === 'no_write') {
-              this._logDelegationNotice('error', 'settlement notice acknowledgement fenced out; claim left', notice);
-            }
-            return outcome;
-          } catch (error) {
-            failure = error;
-          }
-          this._logDelegationNotice(
-            'warn',
-            `settlement notice acknowledgement failed (attempt ${attempt + 1})`,
-            notice,
-            failure,
-          );
-          const fence = this._readNoticeFence(delivery);
-          const retry =
-            fence.lifecycle === 'live' &&
-            fence.leaseHeld &&
-            !fence.stale &&
-            !fence.cancelled &&
-            (await backoff(attempt));
-          if (!retry) {
-            this._logDelegationNotice(
-              'error',
-              'settlement notice acknowledgement given up; claim left dead, so it may be taken over and wake twice',
-              notice,
-              failure,
-            );
-            return 'left_owed';
-          }
-        }
-      } finally {
-        claimId = undefined;
-        releaseNoticeClaim(this._harness, id);
-      }
-    };
-    try {
-      if (!(await this._delegationNoticeIsOwed(notice))) {
-        this._delegationNoticeEpochs.delete(key);
-        return 'superseded';
-      }
-      const entry = this._readNoticeFence(delivery);
-      if (entry.lifecycle !== 'live' || !entry.leaseHeld) return 'left_owed';
-      if (entry.cancelled) return acknowledged('owed_reread', 'fenced');
-      const signalId = `harness-delegation-notice-${sha256CanonicalJson({ sessionId: this.id, key }).slice(0, 32)}`;
-      const content = delegationSettlementNoticeText(notice);
-      const attributes = { type: 'delegated-task-settled' };
-      const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      // Write the reminder row directly, as the runtime's `persist` behaviour
-      // does: no synthetic broadcast run occupies the thread, so a following
-      // idle wake is not mistaken for an interleave, and nothing is handed to
-      // an ungated follow-up run.
-      // PF-7631: the mode marker is taken before resolution, so any switch from
-      // here on disqualifies the wake grant.
-      const modeEpoch = this._modeSwitchEpoch;
-      const target = await this._resolveDelegationNoticeTarget(notice);
-      // Shutdown may have begun while the notice was re-read and memory resolved.
-      if (!live()) return 'left_owed';
-      // PF-8034: fenced memory with no guard of the delegating run for it.
-      if (target === 'obsolete') return acknowledged('row_save', 'obsolete');
-      const { resolved, sourceWriteGuard } = target;
-      // PF-7631: which agent's memory saved the row, set only once it is written.
-      let reminderRow: WakeReminderRowOrigin | undefined;
-      if (resolved !== undefined) {
-        // PF-7679: watch before the save, so a run that loads history while the
-        // row is written either sees it (and is recorded) or does not.
-        if (watch === undefined) {
-          watch = watchHistoryLoad(this.threadId, this.resourceId, signalId, () => this._notifyMaybeIdle());
-          this._delegationNoticeWatches.set(key, watch);
-        }
-        // PF-8034: an adapter that cannot check a guard is a configuration
-        // error, not a revocation: the notice stays owed.
-        if (sourceWriteGuard !== undefined) {
-          assertObservationalMemorySourceWriteGuardSupported(await resolved.memory.storage.getStore('memory'));
-        }
-        try {
-          await resolved.memory.saveMessages({
-            messages: [
-              createSignal({
-                type: 'system-reminder',
-                id: signalId,
-                contents: content,
-                attributes,
-                metadata,
-              }).toDBMessage({
-                resourceId: this.resourceId,
-                threadId: this.threadId,
-              }),
-            ],
-            ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
-          });
-        } catch (error) {
-          // PF-8034: the delegating run's guard was revoked (retraction wins).
-          // Any other failure leaves the notice owed, as before.
-          if (sourceWriteGuard !== undefined && isObservationalMemorySourceWriteConflict(error)) {
-            return acknowledged('row_save', 'obsolete');
-          }
-          throw error;
-        }
-        reminderRow = { ...resolved, modeEpoch };
-      }
-      if (!live()) return 'left_owed';
-      if (notice.mode === 'remind') return acknowledged('row_save', reminderRow !== undefined ? 'history' : 'fenced');
-      const rowDelivered = () => watch?.loaded() === true;
-      let claimWriteFailures = 0;
-      for (;;) {
-        // PF-7679: wait for quiescence before the claim, so a close, shutdown or
-        // crash during the wait leaves the notice owed. A run that already
-        // loaded the row ends the wait: the notice was delivered, even if a
-        // close follows before that run ends.
-        await this._awaitDelegationNoticeQuiescence(() => live() && !rowDelivered());
-        if (rowDelivered()) return acknowledged('quiescence', 'history');
-        const fence = this._readNoticeFence(delivery);
-        if (fence.lifecycle !== 'live' || !fence.leaseHeld) return 'left_owed';
-        // A Stop or edit since the settlement: the row stays; no wake.
-        if (fence.stale || fence.cancelled) return acknowledged('quiescence', 'fenced');
-        // Live before its write is queued, so a racing reconcile never takes
-        // this claim over.
-        const id = randomUUID();
-        holdNoticeClaim(this._harness, id);
-        // The wake turn races the claim write against an abort; the outcome
-        // below waits for the write itself, so it knows whether it claimed.
-        let claimWrite: Promise<NoticeClaimResult> | undefined;
-        try {
-          await this._injectSystemReminder(
-            content,
-            {
-              attributes,
-              metadata,
-              // PF-8034: a wake run in the mode whose memory took the row writes
-              // under the guard the row was saved with; another mode's memory
-              // never sees that guard.
-              ...(sourceWriteGuard !== undefined && reminderRow?.modeId === this._record.modeId
-                ? { observationalMemorySourceWriteGuard: sourceWriteGuard }
-                : {}),
-            },
-            {
-              signalId,
-              admissionEpoch,
-              wakeNoticeId: signalId,
-              // Only the claim's holder may wake.
-              claimNotice: () => {
-                claimWrite = claim(id).then(
-                  result => {
-                    if (result === 'claimed') claimId = id;
-                    else releaseNoticeClaim(this._harness, id);
-                    return result;
-                  },
-                  (error: unknown) => {
-                    // The write may have landed: resolve it as held.
-                    claimId = id;
-                    throw error;
-                  },
-                );
-                return claimWrite.then(result => result === 'claimed');
-              },
-              noticeRowDelivered: rowDelivered,
-              // PF-7631: the wake grant is considered only over a saved reminder
-              // row, and kept only while `_wakeGrantAllowed` holds.
-              ...(reminderRow !== undefined
-                ? {
-                    wakeSettlement: {
-                      taskId: notice.taskId,
-                      subagentSessionId: notice.subagentSessionId,
-                      outcome: notice.outcome,
-                    },
-                    wakeReminderRow: reminderRow,
-                  }
-                : {}),
-            },
-          );
-          return finishClaimed('wake');
-        } catch (err) {
-          let claimResult: NoticeClaimResult | 'failed' | undefined;
-          if (claimWrite === undefined) releaseNoticeClaim(this._harness, id);
-          else claimResult = await claimWrite.catch(() => 'failed' as const);
-          if (claimId === undefined) {
-            if (claimResult === 'claim_lost') return 'superseded';
-            if (claimResult === 'fenced') return 'fenced';
-            if (claimResult === 'left_owed') return 'left_owed';
-            // A turn or foreign run took the slot before the claim: wait again.
-            if (err instanceof HarnessBusyError && live()) {
-              await this._nextStateTransition(250);
-              continue;
-            }
-            this._logDelegationNotice('warn', 'settlement notice wake not sent', notice, err);
-            return 'left_owed';
-          }
-          if (err instanceof DelegationNoticeWakeNotSentError) {
-            // A run loaded the row after the claim: that run is the delivery.
-            if (err.reason === 'delivered') return finishClaimed('history');
-            // A Stop or edit after the claim: the row stays; no wake.
-            if (err.reason === 'stale') return finishClaimed('fenced');
-            // The dispatch may have started a run (T20): counted as delivered.
-            if (err.reason === 'unconfirmed') return finishClaimed('lost');
-          }
-          if (err instanceof NativeSignalAcceptanceTimeoutError) return finishClaimed('lost');
-          // Claimed but not sent: clear the claim before anything else.
-          const resolution = await resolveClaim();
-          if (resolution === 'superseded') return 'superseded';
-          if (resolution === 'dead') return 'left_owed';
-          if (claimResult === 'failed') {
-            // The claim write failed (a storage error or a version conflict):
-            // the notice is still owed, so back off and re-read it by claiming
-            // again, up to the reconcile backoff cap.
-            this._logDelegationNotice('warn', 'settlement notice claim write failed', notice, err);
-            if (await backoff(claimWriteFailures++)) continue;
-            return 'left_owed';
-          }
-          if (err instanceof DelegationNoticeWakeNotSentError && err.reason === 'slot_lost' && live()) {
-            // A run this process cannot see (a foreign lease holder, or one not
-            // yet registered here) refuses every retry: back off as the
-            // pre-claim busy path does. A close or Stop ends the loop above.
-            await this._nextStateTransition(250);
-            continue;
-          }
-          this._logDelegationNotice('warn', 'settlement notice wake not sent', notice, err);
-          return 'left_owed';
-        }
-      }
-    } catch (error) {
-      // Before the claim, or after it is resolved, the notice stays durable and
-      // the row is rewritten in place on retry, so copies cannot accumulate.
-      this._logDelegationNotice('warn', 'settlement notice delivery left owed', notice, error);
-      if (claimId !== undefined) await resolveClaim();
-      return 'left_owed';
-    }
-  }
-
-  /**
-   * Memory that receives a settlement reminder row. The active mode's agent
-   * memory comes first (a per-turn override may run another agent). When that
-   * agent has none (the parent switched to a memory-less mode that cannot
-   * delegate), the reminder goes to the memory of the mode that delegated the
-   * task: binding requires memory there for `remind`, and the parent's next
-   * turn in that mode reads the row from its thread history. Memory resolves
-   * with the parent's own request context, as its turns do, so a dynamic memory
-   * resolver selects the parent's store. Undefined only when neither mode has
-   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
-   * delegating mode removed from the configuration since).
-   */
-  private async _resolveDelegationNoticeMemory(
+  private _resolveDelegationNoticeMemory(
     notice: PendingDelegationSettlementNotice,
   ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
-    const activeModeId = this._currentRunModeId ?? this._record.modeId;
-    const modeIds = [activeModeId];
-    if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
-      if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
-    }
-    for (const modeId of modeIds) {
-      const resolved = await this._resolveModeNoticeMemory(modeId);
-      if (resolved !== undefined) return resolved;
-    }
-    return undefined;
-  }
-
-  /** One mode's agent memory, resolved with the parent's own request context. */
-  private async _resolveModeNoticeMemory(
-    modeId: string,
-  ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
-    const agent = this._harness.getAgentForMode(modeId);
-    const requestContext = await this._buildRequestContext({
-      modeId,
-      modelId: this._record.modelId,
-      abortSignal: new AbortController().signal,
-      ...(this._currentTurnRequestContext !== undefined
-        ? { persistedRequestContext: this._currentTurnRequestContext }
-        : {}),
-    });
-    const memory = await agent.getMemory({ requestContext });
-    return memory !== undefined && memory !== null ? { agent, memory, modeId } : undefined;
-  }
-
-  /**
-   * PF-8034: where a settlement reminder row goes, and under which guard.
-   * Memory that requires no OM source-write fencing keeps the order of
-   * `_resolveDelegationNoticeMemory` and is written unguarded. The recorded
-   * guard belongs to the delegating mode's memory, so a notice that carries
-   * one goes there first when that memory requires it. When the memory chosen
-   * requires fencing and the guard is not its own, a delegating mode whose
-   * memory requires none takes the row unguarded, as its run had no fence;
-   * otherwise the recorded guard is tried (its memory rejects it if it is not
-   * its own). With no guard at all, the notice is obsolete.
-   */
-  private async _resolveDelegationNoticeTarget(notice: PendingDelegationSettlementNotice): Promise<
-    | {
-        resolved?: { agent: Agent; memory: MastraMemory; modeId: string };
-        sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
-      }
-    | 'obsolete'
-  > {
-    const delegatingModeId =
-      notice.parentModeId !== undefined && this._harness._hasMode(notice.parentModeId)
-        ? notice.parentModeId
-        : undefined;
-    let delegating: Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> | undefined;
-    const resolveDelegating = () =>
-      delegatingModeId === undefined
-        ? Promise.resolve(undefined)
-        : (delegating ??= this._resolveModeNoticeMemory(delegatingModeId));
-    const guard = notice.sourceWriteGuard;
-    if (guard !== undefined) {
-      const own = await resolveDelegating();
-      if (own !== undefined && requiresObservationalMemorySourceWriteGuard(own.memory)) {
-        return { resolved: own, sourceWriteGuard: guard };
-      }
-    }
-    const resolved = await this._resolveDelegationNoticeMemory(notice);
-    if (resolved === undefined || !requiresObservationalMemorySourceWriteGuard(resolved.memory)) {
-      return resolved === undefined ? {} : { resolved };
-    }
-    const unfenced = await resolveDelegating();
-    if (unfenced !== undefined && !requiresObservationalMemorySourceWriteGuard(unfenced.memory)) {
-      return { resolved: unfenced };
-    }
-    return guard !== undefined ? { resolved, sourceWriteGuard: guard } : 'obsolete';
+    return this._settlementNoticeDelivery._resolveDelegationNoticeMemory(notice);
   }
 
   /**
@@ -26000,63 +23103,20 @@ export class Session {
     );
   }
 
-  /**
-   * PF-7679: wait until the parent has no running turn, no parked interaction
-   * and no queued turn, or until the delivery is no longer live. Each of those
-   * ends through `_notifyMaybeIdle`; the bounded poll only re-reads the record.
-   */
-  private async _awaitDelegationNoticeQuiescence(live: () => boolean): Promise<void> {
-    while (
-      live() &&
-      (this.isRunning() || this._record.pendingResume !== undefined || (this._record.pendingQueue ?? []).length > 0)
-    ) {
-      await this._nextStateTransition(1_000);
-    }
+  private _awaitDelegationNoticeQuiescence(live: () => boolean): Promise<void> {
+    return this._settlementNoticeDelivery._awaitDelegationNoticeQuiescence(live);
   }
 
-  /**
-   * PF-7679: whether this Harness may deliver an owed notice: it carries no
-   * claim, or a claim reconcile may take over (its claimer lost the lease, or
-   * it is not live in this Harness).
-   */
   private _delegationNoticeClaimable(notice: PendingDelegationSettlementNotice): boolean {
-    return notice.claim === undefined || noticeClaimTakeoverEligible(this._harness, notice.claim);
+    return this._settlementNoticeDelivery._delegationNoticeClaimable(notice);
   }
 
-  /** Exact re-read: the stored notice, while the one with this digest is still owed on its task. */
-  private async _loadDelegationNotice(
-    notice: PendingDelegationSettlementNotice,
-  ): Promise<PendingDelegationSettlementNotice | undefined> {
-    const snapshot = await this._storage.loadPlanTaskSubtree({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      rootTaskId: notice.taskId,
-      limit: 1,
-    });
-    const task = snapshot.tasks.find(row => row.taskId === notice.taskId);
-    const current = task === undefined ? undefined : readPendingDelegationSettlementNotice(task);
-    return current?.subagentSessionId === notice.subagentSessionId && current.digest === notice.digest
-      ? current
-      : undefined;
+  private _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
+    return this._settlementNoticeDelivery._delegationNoticeIsOwed(notice);
   }
 
-  /** Exact re-read: the notice with this digest is still owed on its task, and claimable. */
-  private async _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
-    const current = await this._loadDelegationNotice(notice);
-    return current !== undefined && this._delegationNoticeClaimable(current);
-  }
-
-  /**
-   * PF-7750: wait the reconcile backoff for `attempt` (0-based) of a notice
-   * write retry, unless the session stops being live. False once the backoff
-   * passes its cap, or not live.
-   */
-  private async _delegationNoticeBackoff(attempt: number, live: () => boolean): Promise<boolean> {
-    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
-    if (backoffMs > DELEGATION_RECONCILE_RETRY_MAX_MS) return false;
-    const until = Date.now() + backoffMs;
-    while (live() && Date.now() < until) await this._nextStateTransition(until - Date.now());
-    return live();
+  private _delegationNoticeBackoff(attempt: number, live: () => boolean): Promise<boolean> {
+    return this._settlementNoticeDelivery._delegationNoticeBackoff(attempt, live);
   }
 
   /**
@@ -26708,13 +23768,8 @@ export class Session {
     return current?.delegatedSubagentSessionId === childId && !TERMINAL_PLAN_TASK_STATUSES.has(current.status);
   }
 
-  /** PF-7679: dispose the kept row watches whose key `drop` selects, unless a delivery of it runs. */
   private _disposeKeptDelegationNoticeWatches(drop: (key: string) => boolean): void {
-    for (const [key, watch] of this._delegationNoticeWatches) {
-      if (!drop(key) || this._delegationNoticesInFlight.has(key)) continue;
-      watch.dispose();
-      this._delegationNoticeWatches.delete(key);
-    }
+    this._settlementNoticeDelivery._disposeKeptDelegationNoticeWatches(drop);
   }
 
   /**
@@ -26762,20 +23817,6 @@ export class Session {
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-/** PF-7473: true when the caller's admission check now fails. */
-function admissionLost(assertAdmitted: () => void): boolean {
-  try {
-    assertAdmitted();
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
-}
-
 function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
   if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
   return record[key];
@@ -26802,14 +23843,6 @@ function pendingInteractionGenerationKey(input: {
   return sha256CanonicalJson([input.kind, input.itemId ?? null, input.runId, input.toolCallId, input.requestedAt]);
 }
 
-const DISCARD_PENDING_INTERACTION_KINDS: ReadonlySet<PendingResume['kind']> = new Set([
-  'tool-approval',
-  'tool-suspension',
-  'question',
-  'plan-approval',
-  'sandbox-access',
-]);
-const MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH = 512;
 const DISCARDED_ERROR_CODE = 'harness.pending_interaction_discarded';
 
 /** The exact pending generation a discard is fenced to. */
@@ -26891,44 +23924,6 @@ function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generati
   );
 }
 
-/**
- * Audit copy of a cancelled session's pending interaction for its discard
- * receipt: cancellation keeps `pendingResume` as audit evidence, and discard
- * must clear it for the session to settle and delete.
- */
-function cancelledPendingAudit(
-  pending: PendingResume,
-  cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
-): NonNullable<InboxResponseReceipt['cancelledPendingResume']> {
-  // Identity and audit fields only — never payloads, suspend data or args —
-  // so the copy cannot push the claim write toward the record size budget.
-  return {
-    kind: pending.kind,
-    itemId: pending.itemId ?? pending.toolCallId,
-    runId: pending.runId,
-    toolCallId: pending.toolCallId,
-    requestedAt: pending.requestedAt,
-    expiresAt: pending.expiresAt,
-    ...(pending.toolName !== undefined ? { toolName: boundedAuditString(pending.toolName) } : {}),
-    cancelRequest: {
-      requestedAt: cancelRequest.requestedAt,
-      ...(cancelRequest.reason !== undefined ? { reason: boundedAuditString(cancelRequest.reason) } : {}),
-      ...(cancelRequest.requestedBy !== undefined
-        ? { requestedBy: boundedAuditString(cancelRequest.requestedBy) }
-        : {}),
-    },
-  };
-}
-
-const MAX_AUDIT_STRING_LENGTH = 256;
-const AUDIT_TRUNCATION_MARKER = '…[truncated]';
-
-function boundedAuditString(value: string): string {
-  return value.length <= MAX_AUDIT_STRING_LENGTH
-    ? value
-    : `${value.slice(0, MAX_AUDIT_STRING_LENGTH - AUDIT_TRUNCATION_MARKER.length)}${AUDIT_TRUNCATION_MARKER}`;
-}
-
 /** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
 function receiptGenerationDiscarded(record: SessionRecord, receipt: InboxResponseReceipt): boolean {
   return (
@@ -26965,33 +23960,6 @@ function discardClaimReceipt(record: SessionRecord, pending: PendingResume): Inb
   return Object.values(record.inboxResponseReceipts ?? {}).find(
     receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
-}
-
-/** Shared between `_resume` and `_resumeAnswer` for discard reclassification. */
-interface ResumeAnswerProgress {
-  /** Input validation passed; later rejections may be reclassified. */
-  validated: boolean;
-  /** The pending interaction observed when the answer arrived. */
-  pending: PendingResume | undefined;
-}
-
-/**
- * What `_expirePendingInteraction` did: recorded an expiry, finished a
- * discard-owned generation as its discard (no expiry evidence), or nothing.
- */
-type PendingExpiryOutcome = 'expired' | 'discarded' | 'none';
-
-function discardReceiptResult(
-  status: 'discarded' | 'already_resolved',
-  receipt: InboxResponseReceipt,
-): DiscardPendingInteractionResult {
-  return {
-    status,
-    itemId: receipt.itemId,
-    kind: receipt.kind,
-    responseId: receipt.responseId,
-    discardedAt: receipt.discardedAt ?? receipt.updatedAt,
-  };
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
@@ -27079,12 +24047,6 @@ class QueueRecoveryPendingError extends HarnessError {
   }
 }
 
-class NativeSignalAcceptanceTimeoutError extends HarnessValidationError {
-  constructor(validationPath: string) {
-    super(validationPath, `native signal acceptance timed out after ${SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS}ms`);
-  }
-}
-
 class QueueRecoveryStaleError extends HarnessError {
   readonly code = 'harness.queue_recovery_stale';
 
@@ -27145,19 +24107,4 @@ function createDeferred<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
-}
-
-/**
- * True when `parentSessionId` itself asked to stop exactly this child: the
- * `subagent` tool's cancel or `cancelSubagent`, which alone record the
- * harness-owned `targeted` marker. The reason is not consulted. A delegation
- * timeout, a cancel cascading down from the parent's own cancellation, and a
- * cancel from anyone else carry no marker, so those settle the delegated task
- * `failed`.
- */
-function isParentRequestedSubagentCancel(
-  cancelRequest: SessionRecord['cancelRequest'],
-  parentSessionId: string,
-): boolean {
-  return cancelRequest?.targeted === true && cancelRequest.requestedBy === parentSessionId;
 }

@@ -92,6 +92,11 @@ export interface QuickJsCodeModeTransportOptions {
   /**
    * Transpiles the wrapped TypeScript source `(async () => {\n<program>\n})` to JavaScript before QuickJS evaluates it.
    * Default: ts-blank-space (types erased in place). A rejection or throw is reported as the program's SyntaxError result.
+   *
+   * The output is spliced into the guest as the right-hand side of a `const`, so it must be one JavaScript function
+   * expression: no directive prologue such as `"use strict";`, no emitted helper statements, no module syntax, and the
+   * async arrow kept native (target ES2017 or later). The hook runs inside the run's `timeout` and `abortSignal`: a
+   * hook that has not settled when either fires yields the usual TimeoutError or AbortError result.
    */
   transpile?: (source: string) => string | Promise<string>;
 }
@@ -114,6 +119,50 @@ interface HostRpcEnvelope {
   ok: boolean;
   result?: unknown;
   error?: { message: string; name?: string };
+}
+
+function isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return typeof (value as { then?: unknown } | null | undefined)?.then === 'function';
+}
+
+/**
+ * Waits for work that runs before the interpreter starts (a caller-supplied
+ * transpile, or the first QuickJS module load), or for the run's deadline or
+ * abort, whichever comes first. The caller checks an already-aborted signal
+ * before starting the work; an abort during the work's synchronous part is seen
+ * here. A rejection propagates. Work that loses the race is left to settle on
+ * its own; its result is ignored.
+ */
+async function raceRunBudget<T>(
+  work: T | PromiseLike<T>,
+  deadline: number,
+  abortSignal: AbortSignal | undefined,
+): Promise<{ kind: 'done'; output: T } | { kind: 'timeout' } | { kind: 'abort' }> {
+  if (!isPromiseLike(work)) return { kind: 'done', output: work };
+  const output = Promise.resolve(work);
+  let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      output.then(value => ({ kind: 'done' as const, output: value })),
+      new Promise<{ kind: 'timeout' }>(resolve => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), Math.max(0, deadline - Date.now()));
+      }),
+      new Promise<{ kind: 'abort' }>(resolve => {
+        if (!abortSignal) return;
+        // The work has already run its synchronous part, which can abort the
+        // signal before this listener exists.
+        if (abortSignal.aborted) return resolve({ kind: 'abort' });
+        onAbort = () => resolve({ kind: 'abort' });
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (onAbort) abortSignal?.removeEventListener('abort', onAbort);
+    // A late rejection from work that lost the race must not go unhandled.
+    output.catch(() => undefined);
+  }
 }
 
 /**
@@ -180,11 +229,33 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
     // leaves genuine syntax errors alone — those surface from `evalCode` below
     // as a real SyntaxError, with QuickJS's own diagnostics. A caller-supplied
     // `transpile` replaces ts-blank-space; its throw or rejection is reported
-    // the same way.
+    // the same way. The run's deadline starts before the hook, and the hook is
+    // raced against the deadline and the abort signal, so a stalled compiler
+    // cannot hold the run past either.
+    const deadline = Date.now() + timeout;
+    const timedOutResult = (): CodeModeToolResult => ({
+      success: false,
+      logs,
+      error: { message: `Code Mode execution timed out after ${timeout}ms`, name: 'TimeoutError' },
+    });
+    const abortedResult = (): CodeModeToolResult => ({
+      success: false,
+      logs,
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+
     let strippedProgram: string;
     try {
       const wrappedSource = `(async () => {\n${program}\n})`;
-      strippedProgram = this.#transpile ? await this.#transpile(wrappedSource) : tsBlankSpace(wrappedSource);
+      if (!this.#transpile) {
+        strippedProgram = tsBlankSpace(wrappedSource);
+      } else {
+        if (abortSignal?.aborted) return abortedResult();
+        const transpiled = await raceRunBudget(this.#transpile(wrappedSource), deadline, abortSignal);
+        if (transpiled.kind === 'timeout') return timedOutResult();
+        if (transpiled.kind === 'abort') return abortedResult();
+        strippedProgram = transpiled.output;
+      }
     } catch (error) {
       const err = error as { message?: string };
       return {
@@ -233,11 +304,22 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       }
     };
 
-    const wasm = this.#module ?? (await getQuickJS());
-
-    if (abortSignal?.aborted) {
-      return { success: false, logs, error: { message: 'Code Mode execution aborted', name: 'AbortError' } };
+    // The first load of the shared module is raced like the hook, so a slow or
+    // stalled load cannot hold the run past its deadline or abort.
+    let wasm = this.#module;
+    if (!wasm) {
+      if (abortSignal?.aborted) return abortedResult();
+      const loaded = await raceRunBudget(getQuickJS(), deadline, abortSignal);
+      if (loaded.kind === 'timeout') return timedOutResult();
+      if (loaded.kind === 'abort') return abortedResult();
+      wasm = loaded.output;
     }
+
+    // Transpilation and the first module load spend the run's budget, and
+    // synchronous work cannot be preempted. Report an expired run before
+    // starting the interpreter.
+    if (abortSignal?.aborted) return abortedResult();
+    if (Date.now() >= deadline) return timedOutResult();
 
     const runtime = wasm.newRuntime();
     runtime.setMemoryLimit(this.#memoryLimitMb * 1024 * 1024);
@@ -299,7 +381,6 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       jobs.error?.dispose();
     };
 
-    const deadline = Date.now() + timeout;
     let interrupted: 'timeout' | 'abort' | undefined;
     // The only way to stop a runaway synchronous program: QuickJS calls this
     // between operations, and a truthy return unwinds the evaluation. It cannot
@@ -315,17 +396,6 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
         return true;
       }
       return false;
-    });
-
-    const timedOutResult = (): CodeModeToolResult => ({
-      success: false,
-      logs,
-      error: { message: `Code Mode execution timed out after ${timeout}ms`, name: 'TimeoutError' },
-    });
-    const abortedResult = (): CodeModeToolResult => ({
-      success: false,
-      logs,
-      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
     });
 
     let timer: NodeJS.Timeout | undefined;
@@ -415,6 +485,8 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       if (bootstrap.error) {
         const err = context.dump(bootstrap.error) as { message?: string };
         bootstrap.error.dispose();
+        if (interrupted === 'abort') return abortedResult();
+        if (interrupted === 'timeout') return timedOutResult();
         return { success: false, logs, error: { message: err?.message ?? 'Code Mode bootstrap failed' } };
       }
       bootstrap.value.dispose();

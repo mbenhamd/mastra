@@ -1915,6 +1915,12 @@ export interface ReconcileDelegationInput {
   result?: HarnessSubagentResultSummary;
   /** Record an owed parent notice in the same fenced settlement write. */
   notice?: DelegatedSettlementNoticeMode;
+  /**
+   * Runs once the settlement write commits, before the public
+   * `delegate_settled` event, so in-process readers learn of the settlement
+   * before anything that event starts. It must not throw.
+   */
+  onCommitted?: () => void;
 }
 
 export interface ReconcileDelegationResult {
@@ -2031,6 +2037,7 @@ export async function planTaskReconcileDelegation(
     staged,
   );
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  input.onCommitted?.();
   refreshSummary(port, postTasks, deltas);
   emitBestEffort(port, 'delegate_settled', settledTaskIds, deltas);
   const notice = readPendingDelegationSettlementNotice(updated);

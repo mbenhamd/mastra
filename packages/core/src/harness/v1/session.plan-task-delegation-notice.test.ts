@@ -2443,14 +2443,14 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         await parent.abortActiveWork({ reason: 'user_requested' });
         held.release();
         await poll(() => wakeAdmissions(db).length === 1 && wakeAdmissions(db)[0]!.status === 'cancelled', 3000);
-        await poll(() => (parent as any)._wakeTerminalAdmissionsInFlight.size === 0, 3000);
+        await poll(() => (parent as any)._wakeAdmissions.inFlightCount === 0, 3000);
         await deliveryFinished(parent, taskId);
 
-        expect((parent as any)._terminalStagingAdmissions.size).toBe(0);
-        expect((parent as any)._nativeTerminalRunIds.size).toBe(0);
+        expect((parent as any)._terminalStagingLedger.admissionCount).toBe(0);
+        expect((parent as any)._terminalStagingLedger.nativeRunCount).toBe(0);
         // A later turn runs normally and is not treated as the cancelled grant's run.
         await parent.message({ content: 'next' });
-        expect((parent as any)._nativeTerminalRunIds.size).toBe(0);
+        expect((parent as any)._terminalStagingLedger.nativeRunCount).toBe(0);
         expect(a.prompts.at(-1)).toContain('next');
       } finally {
         held.release();
