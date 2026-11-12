@@ -4128,7 +4128,7 @@ export class Session {
     // A lost CAS means the dispatch changed or the lease moved: its new owner
     // settles and reports the turn.
     if (swapped.applied) {
-      this._terminalStagingLedger.forgetStaging(runId);
+      this._terminalStagingLedger.forgetRun(runId);
     }
     return swapped.applied;
   }
@@ -4278,7 +4278,7 @@ export class Session {
       // fence until the canonical evidence is terminal, or a restart would
       // account the still-staged output again.
       if (admission.status === 'committed') {
-        this._terminalStagingLedger.forgetStaging(runId);
+        this._terminalStagingLedger.forgetRun(runId);
       }
       return 'unowned';
     }
@@ -4363,7 +4363,7 @@ export class Session {
       recovery: { expectedDispatch: evidence.dispatch ?? null, leaseOwner },
     });
     if (receipt.status === 'committed') {
-      this._terminalStagingLedger.forgetStaging(runId);
+      this._terminalStagingLedger.forgetRun(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
