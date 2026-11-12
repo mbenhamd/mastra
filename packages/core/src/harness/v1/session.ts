@@ -2459,6 +2459,22 @@ export class Session {
     return emitted;
   }
 
+  /**
+   * Emit a recovered run's terminal `agent_end`, then suppress the next live
+   * terminal `agent_end` for that run: {@link _emitTurnEvent} consumes the
+   * suppression. The suppression is lifted first, so this emission itself is
+   * never swallowed.
+   */
+  private _emitRecoveredAgentEnd(
+    runId: string,
+    finishReason: 'complete' | 'aborted' | 'error' | 'suspended',
+    usage: TokenUsage,
+  ): void {
+    this._recoveredAgentEndRunIds.delete(runId);
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
+    this._recoveredAgentEndRunIds.add(runId);
+  }
+
   private _toolTerminalKey(runId: string, toolCallId: string): string {
     return `${runId}:${toolCallId}`;
   }
@@ -4127,9 +4143,7 @@ export class Session {
     // the matching run_completed. Only a later live terminal agent_end for
     // this run is suppressed.
     this._runSpans.finalize(runId);
-    this._recoveredAgentEndRunIds.delete(runId);
-    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
-    this._recoveredAgentEndRunIds.add(runId);
+    this._emitRecoveredAgentEnd(runId, finishReason, usage);
     this._emitTurnEvent(event as EmitInput);
   }
 
