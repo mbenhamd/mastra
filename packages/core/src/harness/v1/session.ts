@@ -118,7 +118,6 @@ import type {
   HarnessRuntimeDependencyRefs,
   InboxResponseReceipt,
   PendingInteractionExpiryGeneration,
-  PendingMessageAdmission,
   PendingMessageAdmissionScanCursor,
   QueueAdmissionReceipt,
   PendingResume,
@@ -335,6 +334,13 @@ import {
   omSwitchReflectorModel,
 } from './session-observational-memory';
 import type { ObservationalMemorySessionPort } from './session-observational-memory';
+import {
+  interruptOrphanedMessageDispatch,
+  recheckOrphanedDispatchesIfDue,
+  recoverOrphanedMessageDispatches,
+  scheduleOrphanRecheck,
+} from './session-orphan-recovery';
+import type { OrphanRecoverySessionPort } from './session-orphan-recovery';
 import {
   appendExpiredPendingInteraction,
   applyInboxReceiptFromCompletedQueue,
@@ -587,7 +593,7 @@ type PendingEventAppend = {
   emittedAt: number;
 };
 
-type MessageAdmissionStart = {
+export type MessageAdmissionStart = {
   admissionHash: string;
   modeId: string;
   modelId: string;
@@ -3429,6 +3435,52 @@ export class Session {
     return reconcilePendingInteractionExpiryOnHydrate(this._pendingInteractionsPort());
   }
 
+  /** Build the port the orphan-recovery functions reach the session through. */
+  private _orphanRecoveryPort(): OrphanRecoverySessionPort {
+    const session = this;
+    return {
+      harness: this._harness,
+      id: this.id,
+      messageAdmissionStarts: this._messageAdmissionStarts,
+      resourceId: this.resourceId,
+      runCompletionWaiters: this._runCompletionWaiters,
+      runOutcomes: this._runOutcomes,
+      terminalStagingLedger: this._terminalStagingLedger,
+      threadId: this.threadId,
+      wakeAdmissions: this._wakeAdmissions,
+      get orphanRecheckAt() {
+        return session._orphanRecheckAt;
+      },
+      set orphanRecheckAt(value) {
+        session._orphanRecheckAt = value;
+      },
+      get orphanRecheckSchedules() {
+        return session._orphanRecheckSchedules;
+      },
+      set orphanRecheckSchedules(value) {
+        session._orphanRecheckSchedules = value;
+      },
+      get orphanRecovery() {
+        return session._orphanRecovery;
+      },
+      set orphanRecovery(value) {
+        session._orphanRecovery = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get storage() {
+        return session._storage;
+      },
+      commitInterruptedTerminalHandoff: (...args) => session._commitInterruptedTerminalHandoff(...args),
+      emitTurnEvent: (...args) => session._emitTurnEvent(...args),
+      publishRecoveredRunCompletion: (...args) => session._publishRecoveredRunCompletion(...args),
+    };
+  }
+
   /**
    * @internal — recovery for admitted `message()` dispatches whose owner died
    * mid-run. Called while this Harness holds the session lease: on adoption
@@ -3460,19 +3512,8 @@ export class Session {
    * Returns what blocks a close: another process's live claim, or a turn whose
    * settlement did not commit.
    */
-  async _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
-    if (this._orphanRecovery !== undefined) return this._orphanRecovery;
-    const recovery = this._recoverOrphanedMessageDispatchesOnce()
-      .catch(error => {
-        // A failed attempt stays due, so the next resolution or close retries it.
-        this._scheduleOrphanRecheck(Date.now());
-        throw error;
-      })
-      .finally(() => {
-        if (this._orphanRecovery === recovery) this._orphanRecovery = undefined;
-      });
-    this._orphanRecovery = recovery;
-    return recovery;
+  _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
+    return recoverOrphanedMessageDispatches(this._orphanRecoveryPort());
   }
 
   /**
@@ -3497,7 +3538,7 @@ export class Session {
     // would let it land pending on a closed session.
     if (phase === 'after-drain' && !(await this._awaitInFlightTurnsSettled())) {
       const blocked = { holder: 'in-flight-result-write', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-      this._scheduleOrphanRecheck(blocked.retryAt);
+      scheduleOrphanRecheck(this._orphanRecoveryPort(), blocked.retryAt);
       return blocked;
     }
     // An interaction already due is expired first — or, when its response was
@@ -3571,7 +3612,7 @@ export class Session {
           claim?.state === 'dispatching' && dispatchClaim === 'live'
             ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
             : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-        this._scheduleOrphanRecheck(blocked.retryAt);
+        scheduleOrphanRecheck(this._orphanRecoveryPort(), blocked.retryAt);
         return blocked;
       }
       cursor = page.nextCursor;
@@ -3627,174 +3668,8 @@ export class Session {
    * to leave (a claim that has since expired, or a settlement that did not
    * commit) is due. A failure keeps it due, so the next resolution retries.
    */
-  async _recheckOrphanedDispatchesIfDue(): Promise<void> {
-    if (this._orphanRecheckAt === undefined || Date.now() < this._orphanRecheckAt) return;
-    if (this._state !== 'live') return;
-    await this._recoverOrphanedMessageDispatches();
-  }
-
-  /** Keep the earliest pending recheck. */
-  private _scheduleOrphanRecheck(at: number): void {
-    this._orphanRecheckAt = this._orphanRecheckAt === undefined ? at : Math.min(this._orphanRecheckAt, at);
-    this._orphanRecheckSchedules++;
-  }
-
-  private async _recoverOrphanedMessageDispatchesOnce(): Promise<{
-    blockedBy?: { holder: string; retryAt: number };
-  }> {
-    if (!this._storage.supportsDispatchRecovery) return {};
-    const schedulesAtStart = this._orphanRecheckSchedules;
-    const orphaned: AgentSignalResultEvidence[] = [];
-    const unpublished: AgentSignalResultEvidence[] = [];
-    let blockedBy: { holder: string; retryAt: number } | undefined;
-    const block = (holder: string, retryAt: number) => {
-      if (blockedBy === undefined || retryAt < blockedBy.retryAt) blockedBy = { holder, retryAt };
-    };
-    // Released wake admissions this full scan still lists as pending. Only ids
-    // released before the scan began can be judged by it.
-    const releasedAtScanStart = this._wakeAdmissions.releasedSnapshot();
-    const releasedStillPending = new Set<string>();
-    let cursor: PendingMessageAdmissionScanCursor | undefined;
-    do {
-      const page = await this._storage.listPendingMessageAdmissions({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        now: Date.now(),
-        limit: HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT,
-        ...(cursor !== undefined ? { cursor } : {}),
-      });
-      for (const admission of page.items) {
-        const { evidence } = admission;
-        if (evidence.admissionId !== undefined && this._wakeAdmissions.isReleased(evidence.admissionId)) {
-          releasedStillPending.add(evidence.admissionId);
-        }
-        if (
-          evidence.status === 'completed' ||
-          (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
-        ) {
-          unpublished.push(evidence);
-          continue;
-        }
-        const state = this._classifyPendingMessageDispatch(admission);
-        if (state === 'orphaned') orphaned.push(evidence);
-        if (state === 'claimed' && evidence.dispatch?.state === 'dispatching') {
-          block(evidence.dispatch.attemptId, evidence.dispatch.claimExpiresAt);
-        }
-        if (state === 'finished') block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-      }
-      cursor = page.nextCursor;
-    } while (cursor !== undefined);
-    // A released wake admission settled by any path (its own detached commit,
-    // another owner, or a settlement below) leaves the set, so it stays bounded
-    // by the wakes still pending here.
-    for (const admissionId of releasedAtScanStart) {
-      if (!releasedStillPending.has(admissionId)) this._wakeAdmissions.forgetReleased(admissionId);
-    }
-    for (const evidence of orphaned) {
-      const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
-      let settled: boolean;
-      try {
-        settled = await this._interruptOrphanedMessageDispatch(evidence);
-      } catch (error) {
-        // PF-7631: a wake turn has no caller to report to. Its settlement
-        // failure is surfaced, and it blocks a close (typed refusal) while
-        // its admission stays durable for a retry or the next owner.
-        if (!wakeAdmission) throw error;
-        this._emitTurnEvent({
-          type: 'error',
-          ...(evidence.runId !== undefined ? { runId: evidence.runId } : {}),
-          signalId: evidence.signalId,
-          error: projectHarnessPublicError(error),
-        });
-        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-        continue;
-      }
-      if (settled && wakeAdmission) this._wakeAdmissions.forgetReleased(evidence.admissionId!);
-      const latest = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
-      if (settled && latest !== null && 'status' in latest && latest.status !== 'pending') {
-        // Cancellation may have won over a staged output. Publish the settled
-        // canonical result, never the pending snapshot recovery started with.
-        unpublished.push(latest);
-        continue;
-      }
-      // The settlement did not commit (a fresh claim, a moved lease, or a
-      // finalizer this process cannot run). A turn still pending blocks.
-      if (latest === null || !('status' in latest) || latest.status !== 'pending') continue;
-      const claim = latest.dispatch;
-      if (claim?.state === 'dispatching' && claim.claimExpiresAt > Date.now()) {
-        block(claim.attemptId, claim.claimExpiresAt);
-      } else {
-        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-      }
-    }
-    for (const evidence of unpublished) {
-      await this._publishRecoveredRunCompletion(evidence);
-    }
-    // This recovery replaces the recheck it ran for, but a recheck scheduled
-    // while it ran is for a turn it may not have seen: keep the earliest.
-    if (this._orphanRecheckSchedules === schedulesAtStart) {
-      this._orphanRecheckAt = blockedBy?.retryAt;
-    } else if (blockedBy !== undefined) {
-      this._scheduleOrphanRecheck(blockedBy.retryAt);
-    }
-    return blockedBy !== undefined ? { blockedBy } : {};
-  }
-
-  /**
-   * `active`: a run for it is in flight in this process (close drains it and
-   * its own abort settles the turn), it awaits a response, or the row is
-   * malformed — left alone. `finished`: its run finished here but the result
-   * was never recorded — never interrupted (a same-admission retry completes
-   * it from this process's cache), but it blocks a close. A suspended output
-   * is not a result: once its interaction is gone the turn is settled like
-   * any other. `claimed`: another process's dispatch claim is still live —
-   * left alone until it expires.
-   * `orphaned`: interrupt it.
-   */
-  private _classifyPendingMessageDispatch({
-    evidence,
-    dispatchClaim,
-  }: PendingMessageAdmission): 'active' | 'finished' | 'claimed' | 'orphaned' {
-    const runId = evidence.runId;
-    if (
-      evidence.status !== 'pending' ||
-      evidence.operationKind !== 'message' ||
-      evidence.admissionId === undefined ||
-      evidence.admissionHash === undefined ||
-      runId === undefined
-    ) {
-      return 'active';
-    }
-    // A suspension parked for resume is waiting on a response, not orphaned.
-    if (this._record.pendingResume?.runId === runId) return 'active';
-    // A run in flight here is live (or settling) in this process.
-    if (
-      this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._wakeAdmissions.isInFlight(evidence.admissionId) ||
-      this._runCompletionWaiters.has(runId)
-    ) {
-      return 'active';
-    }
-    let agent: Agent | undefined;
-    try {
-      agent = this._harness.getAgentForMode(evidence.modeId ?? this._record.modeId);
-    } catch (error) {
-      // An unregistered mode/agent cannot be running this run in this process.
-      if (!(error instanceof HarnessConfigError)) throw error;
-    }
-    if (agent?.getRunOutput(runId)) return 'active';
-    if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
-    const completed = this._runOutcomes.get(runId);
-    if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
-    return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
+  _recheckOrphanedDispatchesIfDue(): Promise<void> {
+    return recheckOrphanedDispatchesIfDue(this._orphanRecoveryPort());
   }
 
   /** A dispatch claim this process stamped may still be dispatched on (fresh clock). */
@@ -3808,41 +3683,8 @@ export class Session {
   }
 
   /** Returns true when this process's settlement committed. */
-  private async _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<boolean> {
-    const runId = evidence.runId!;
-    const error = { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE };
-    // The adapter judges the lease when the settlement commits.
-    const leaseOwner = { ownerId: this._harness.ownerId };
-    const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error, leaseOwner);
-    if (terminal === 'completed' || terminal === 'committed') return true;
-    if (terminal === 'skipped') return false;
-    const swapped = await this._storage.compareAndSwapSignalTerminal({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: evidence.signalId,
-      admissionId: evidence.admissionId!,
-      admissionHash: evidence.admissionHash!,
-      operationKind: 'message',
-      expected: evidence.dispatch ?? { state: 'reserved' },
-      leaseOwner,
-      terminal: {
-        status: 'failed',
-        signalId: evidence.signalId,
-        runId,
-        error,
-        ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
-        ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
-      },
-      updatedAt: Date.now(),
-    });
-    // A lost CAS means the dispatch changed or the lease moved: its new owner
-    // settles and reports the turn.
-    if (swapped.applied) {
-      this._terminalStagingLedger.forgetRun(runId);
-    }
-    return swapped.applied;
+  private _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<boolean> {
+    return interruptOrphanedMessageDispatch(this._orphanRecoveryPort(), evidence);
   }
 
   /**
@@ -7408,7 +7250,7 @@ export class Session {
               // The reservation stays unstamped; whoever holds the lease next
               // settles it. Keep recovery due in case that is this process.
               if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionClosedError) {
-                this._scheduleOrphanRecheck(Date.now());
+                scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
               }
               throw err;
             }
@@ -7463,7 +7305,7 @@ export class Session {
         if (this._state === 'deleted') {
           throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
         }
-        this._scheduleOrphanRecheck(Date.now());
+        scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
         latest = await this._storage.loadMessageResultEvidence({
           harnessName: this._record.harnessName,
           sessionId: this.id,
@@ -9040,11 +8882,11 @@ export class Session {
         },
         updatedAt: Date.now(),
       });
-      if (!swapped.applied) this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      if (!swapped.applied) scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now() + ORPHANED_DISPATCH_RETRY_MS);
     } catch (err) {
       // The admission is already cancelled; its row is left to recovery.
       console.error('[harness/v1] cancelled terminal turn settlement failed; recovery will settle it:', err);
-      this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now() + ORPHANED_DISPATCH_RETRY_MS);
       if (this._state !== 'live' && this._state !== 'closing') return;
       this._emitter.emit({
         type: 'storage_error',
@@ -9357,7 +9199,7 @@ export class Session {
     } catch (error) {
       this._wakeAdmissions.leave(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
-      this._scheduleOrphanRecheck(Date.now());
+      scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
       // The notice was acknowledged before this wake, so a refusal other than
       // a duplicate (busy) loses the wake: surface it rather than drop it. Its
       // reminder row is persisted and still reaches the next parent turn.
@@ -9380,7 +9222,7 @@ export class Session {
    */
   private _releaseWakeTerminalAdmission(admissionId: string): void {
     this._wakeAdmissions.release(admissionId);
-    this._scheduleOrphanRecheck(Date.now());
+    scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
   }
 
   /**
@@ -12474,7 +12316,7 @@ export class Session {
         // settlement notice keeps its claim until the delivery clears it (a
         // lease-fenced write), or the next lease holder takes it over.
         if (wakeTerminal !== undefined && !this._dispatchClaimStillHeld(wakeClaimExpiresAt)) {
-          this._scheduleOrphanRecheck(Date.now());
+          scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
           if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
           throw new HarnessBusyError(this.id, 'in_flight');
         }
@@ -12537,7 +12379,7 @@ export class Session {
               // PF-7679: a run took the slot; the delivery clears its claim.
               if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
             } else {
-              if (wakeTerminal !== undefined) this._scheduleOrphanRecheck(Date.now());
+              if (wakeTerminal !== undefined) scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
               // PF-7679: a run may have started; never read as a lost slot.
               if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('unconfirmed');
             }
@@ -12635,9 +12477,9 @@ export class Session {
                   () => false,
                 );
                 if (committed) wakeSettled = true;
-                else this._scheduleOrphanRecheck(Date.now());
+                else scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
               } else {
-                this._scheduleOrphanRecheck(Date.now());
+                scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
               }
             }
             // A wake whose terminal commit did not land leaves agent_end to
