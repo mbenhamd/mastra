@@ -5184,11 +5184,16 @@ export class Session {
   /**
    * PF-8698: the only writer of the current run id. The first run adopted for
    * a turn wins; later calls leave it as it is. Only `agent_start` passes
-   * `start`, so only it stamps the run's start time and signal id.
+   * `start`, so only it stamps the run's start time and signal id: also when
+   * the turn's first chunk already adopted the same run id, which happens when
+   * the runtime starts the stream before it acknowledges the signal.
    */
   private _adoptRunId(runId: string, start?: { signalId: string | undefined }): void {
-    if (this._currentRunId !== undefined) return;
-    this._currentRunId = runId;
+    if (this._currentRunId === undefined) {
+      this._currentRunId = runId;
+    } else if (this._currentRunId !== runId || this._currentRunStartedAt !== undefined) {
+      return;
+    }
     if (start === undefined) return;
     // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
     // is the canonical run-start choke for all entry paths.

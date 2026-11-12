@@ -919,6 +919,50 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
     }
   });
 
+  it("links its own signal() run to its signal when the run's first chunk arrives before agent_start", async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // The runtime may start the stream before it acknowledges the signal: hold
+    // the acknowledgement so the run's first chunk is drained before the
+    // session emits agent_start.
+    const sendSignal = agent.sendSignal.bind(agent);
+    agent.sendSignal = ((...args: Parameters<typeof agent.sendSignal>) => {
+      const sent = sendSignal(...args);
+      return {
+        ...sent,
+        accepted: sent.accepted.then(async accepted => {
+          await new Promise(resolve => setTimeout(resolve, 30));
+          return accepted;
+        }),
+      };
+    }) as typeof agent.sendSignal;
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({
+      finishReason: 'stop',
+      text: 'ok',
+      chunks: [{ type: 'text-delta', payload: { id: 'm', text: 'hi' } }],
+      holdUntil: hold,
+    });
+    const order: string[] = [];
+    let atAgentStart: ReturnType<typeof session.getDisplayState>['currentRun'];
+    const off = session.subscribe(event => {
+      order.push(event.type);
+      if (event.type === 'agent_start') atAgentStart = session.getDisplayState().currentRun;
+    });
+    try {
+      const signal = await session.signal({ content: 'hi', admissionId: 'own-signal-run' });
+      for (let i = 0; i < 100 && atAgentStart === undefined; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(order.indexOf('text_delta')).toBeLessThan(order.indexOf('agent_start'));
+      expect(atAgentStart).toMatchObject({ status: 'running', operation: { kind: 'signal', signalId: signal.id } });
+    } finally {
+      release();
+      off();
+    }
+  });
+
   // PF-8698: a run woken through the agent on the session's thread while the
   // session is idle is not the session's run, so it is never stamped as the
   // current run and nothing is left behind once it has ended.
