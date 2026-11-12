@@ -803,9 +803,13 @@ export class ComposioToolProvider extends BaseToolProvider {
           ownedIds.add(account.id);
           unresolved.delete(account.id);
         }
-        // A repeated cursor would loop forever; stop as if the list ended.
         const next = hasNextCursor(ownShared) ? (ownShared as { nextCursor: string }).nextCursor : undefined;
-        if (next === undefined || cursors.has(next)) break;
+        if (next === undefined || unresolved.size === 0) break;
+        // An incomplete scan cannot establish that the remaining accounts
+        // belong to somebody else.
+        if (cursors.has(next)) {
+          throw new Error('Composio repeated a cursor before connection ownership could be resolved');
+        }
         cursors.add(next);
         cursor = next;
       }
