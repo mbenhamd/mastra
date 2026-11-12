@@ -13,7 +13,7 @@ import type { MastraModelOutput } from '../../../stream/base/output';
  *     each chunk.
  *   - `_waitUntilFinished()` must resolve only AFTER `fullStream` has been
  *     fully consumed. The harness's completion watcher resolves the
- *     `_runCompletionPromises` entry on this signal, so resolving early
+ *     `_runCompletionWaiters` entry on this signal, so resolving early
  *     leaves event subscribers seeing a partial event sequence at the
  *     moment `Session.message()` returns.
  *
