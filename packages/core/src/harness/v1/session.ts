@@ -5430,8 +5430,6 @@ export class Session {
     if (reservation.reservedRunId !== undefined) {
       this._messageTokenLedger.commit(reservation.reservedRunId, reservation.reservation);
       reservation.reservation?.resolve();
-    } else if (reservation.tokenUsageDelta !== undefined && full.runId) {
-      this._messageTokenLedger.markAccounted(full.runId);
     }
   }
 
