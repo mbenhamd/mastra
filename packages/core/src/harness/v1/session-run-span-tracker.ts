@@ -14,7 +14,10 @@
  *   closes the run's span; later calls for the same run return `undefined`.
  * - The memory of finalized runs is bounded: once it holds
  *   {@link MAX_FINALIZED_RUN_IDS} runs, the next `finalize` forgets all of
- *   them before recording its own run.
+ *   them before recording its own run. This wholesale clear is the session's
+ *   behaviour before this owner, kept on purpose here. It is a known hazard:
+ *   a late duplicate terminal for a forgotten run would complete that run a
+ *   second time. PF-8766 replaces it with an oldest-first bound.
  * - `dispose` forgets every open span and every finalized run.
  *
  * The span identity is opaque here: the session captures it, and captures it
