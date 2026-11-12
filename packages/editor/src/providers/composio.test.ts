@@ -1,7 +1,7 @@
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
@@ -1336,6 +1336,78 @@ describe('ComposioToolProvider — listConnections', () => {
       const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] });
 
       expect(result.pagination.hasMore).toBe(true);
+    });
+  });
+
+  describe('items parsed by the SDK response schema', () => {
+    // The SDK parses each listed account with this schema, which has no
+    // `user_id`, so the raw owner never reaches a parsed item.
+    let parseAccount: (raw: unknown) => unknown;
+    beforeAll(async () => {
+      const actual = await vi.importActual<typeof import('@composio/core')>('@composio/core');
+      parseAccount = raw => actual.ConnectedAccountRetrieveResponseSchema.parse(raw);
+    });
+
+    const openToAll = { allowAllUsers: true, allowedUserIds: [], notAllowedUserIds: [] };
+    const account = (id: string, status: string, owner: string, accountType: 'PRIVATE' | 'SHARED') =>
+      parseAccount({
+        id,
+        user_id: owner,
+        authConfig: { id: 'ac_1', isComposioManaged: true, isDisabled: false },
+        status,
+        statusReason: null,
+        toolkit: { slug: 'gmail' },
+        isDisabled: false,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+        experimental: { accountType, ...(accountType === 'SHARED' ? { aclConfigForShared: openToAll } : {}) },
+      });
+
+    async function list(userIds: string[], owned: unknown[], shared: unknown[]) {
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+      await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
+      const raw = getRawInstance();
+      raw.connectedAccounts.list.mockClear();
+      raw.connectedAccounts.list.mockImplementation(async (query: { accountType?: string }) => ({
+        items: query.accountType === 'SHARED' ? shared : owned,
+        nextCursor: null,
+      }));
+      return integration.listConnections({ toolkit: 'gmail', userIds });
+    }
+
+    it("tells the user's expired own account apart from another user's active SHARED account", async () => {
+      const result = await list(
+        ['user_a'],
+        [account('ca_mine', 'EXPIRED', 'user_a', 'PRIVATE')],
+        [account('ca_shared', 'ACTIVE', 'admin', 'SHARED')],
+      );
+
+      // Composio's EXPIRED maps to the existing 'failed' status.
+      expect(result.items).toEqual([
+        {
+          connectionId: 'ca_mine',
+          status: 'failed',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          owned: true,
+          accountType: 'PRIVATE',
+        },
+        {
+          connectionId: 'ca_shared',
+          status: 'active',
+          createdAt: '2026-01-01T00:00:00Z',
+          owned: false,
+          accountType: 'SHARED',
+        },
+      ]);
+    });
+
+    it('claims no owner when several buckets were requested and the response carries none', async () => {
+      const result = await list(['user_a', 'user_b'], [account('ca_mine', 'ACTIVE', 'user_b', 'PRIVATE')], []);
+
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0]).toMatchObject({ connectionId: 'ca_mine', owned: true, accountType: 'PRIVATE' });
+      expect(result.items[0]).not.toHaveProperty('authorId');
     });
   });
 });
