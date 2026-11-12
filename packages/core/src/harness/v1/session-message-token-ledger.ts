@@ -63,7 +63,7 @@ type Reservation = { readonly promise: Promise<void> };
 
 export class MessageTokenLedger {
   /**
-   * Message admission retries can observe `_completedRuns` before the original
+   * Message admission retries can observe the run outcome cache before the original
    * message continuation has accounted usage. Track run ids accounted through
    * either path so the retry can persist before writing evidence without the
    * original continuation double-counting later.

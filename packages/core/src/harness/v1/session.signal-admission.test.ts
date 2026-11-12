@@ -1803,7 +1803,7 @@ describe('Session.signal() admissionId', () => {
 
       let rejectLive: ((error: unknown) => void) | undefined;
       if (scenario === 'cached') {
-        (session as any)._completedRuns.set(runId, { ok: false, err: new Error(secret) });
+        (session as any)._runOutcomes.remember(runId, { ok: false, err: new Error(secret) });
       } else if (scenario === 'live') {
         const waiters = (session as any)._runCompletionWaiters;
         void waiters.register(runId).promise.catch(() => {});
@@ -1842,7 +1842,7 @@ describe('Session.signal() admissionId', () => {
       runId,
     });
     const full = { runId, text: 'cached terminal', finishReason: 'stop', usage: {} } as any;
-    (session as any)._completedRuns.set(runId, { ok: true, full });
+    (session as any)._runOutcomes.remember(runId, { ok: true, full });
     const events: HarnessEvent[] = [];
     session.subscribe(event => events.push(event));
 
