@@ -21693,8 +21693,6 @@ export class Session {
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
-    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
-    // that will never reach a terminal here) so they cannot accumulate.
     this._clearTeardownCollections();
     this._drainAllTerminalObservers(new HarnessSessionClosedError(this.id));
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
@@ -21708,6 +21706,8 @@ export class Session {
    * clears and state transitions stay in each method, in their own order.
    */
   private _clearTeardownCollections(): void {
+    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
+    // that will never reach a terminal here) so they cannot accumulate.
     this._openRuns.clear();
     this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
