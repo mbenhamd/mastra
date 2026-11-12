@@ -6,6 +6,7 @@ import type { Event } from '../../events/types';
 import type { Mastra } from '../../mastra';
 import { ExecutionEngine } from '../../workflows/execution-engine';
 import type { ExecutionEngineOptions, ExecutionGraph } from '../../workflows/execution-engine';
+import type { WorkflowClaimErrorId } from '../lifecycle-errors';
 import { requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import type {
   SerializedStepFlowEntry,
@@ -195,7 +196,7 @@ export class EventedExecutionEngine extends ExecutionEngine {
             (current.lifecycleResumeAttempt ?? 0) === lifecycleResumeAttempt;
           if (!claimed) {
             throw new MastraError({
-              id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',
+              id: 'WORKFLOW_RESUME_ALREADY_CLAIMED' satisfies WorkflowClaimErrorId,
               domain: ErrorDomain.MASTRA_WORKFLOW,
               category: ErrorCategory.USER,
               text:

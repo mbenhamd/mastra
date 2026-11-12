@@ -2652,7 +2652,7 @@ describe('Harness v1 real-agent E2E — S4 settlement evidence', () => {
       ]);
       expect(events.indexOf(secondToolEnds[0]!)).toBeGreaterThan(secondToolStartIndex);
       expect({
-        currentQueuedItemId: (session as any)._currentQueuedItemId,
+        currentQueuedItemId: (session as any)._queueHead.currentId,
         draining: (session as any)._draining,
         hasActiveTurn: (session as any)._currentTurnAbortController !== undefined,
         hasRecoveryTimer: (session as any)._queuedResumeRecoveryTimer !== undefined,
@@ -6331,6 +6331,111 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
       // Tool step, rejected answer, silent repair, then the one recovery call.
       expect(providerCalls()).toBe(4);
       expect(result.text).toBe(recovered);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+describe('Harness v1 real-agent E2E — a settled question releases its parked run', () => {
+  // PF-8122 / PF-8367: a question declined, expired or stopped while no turn runs left
+  // the real agent run parked on the thread, so the user's next
+  // terminal-admission message was refused as "delivered into an active run"
+  // until the suspended-run TTL swept the run.
+  it.each([
+    ['declines a question', 'decline'],
+    ['lets a question expire', 'expire'],
+    ['stops while a question is open', 'stop'],
+  ] as const)('a user who %s can send their next message right away', async (_label, settle) => {
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream:
+          ++callCount === 1
+            ? toolCallStream(
+                'question-call',
+                'ask_user',
+                JSON.stringify({
+                  question: 'Which area should the overview cover?',
+                  options: [{ label: 'methods' }, { label: 'results' }],
+                  selectionMode: 'single_select',
+                }),
+              )
+            : textStream(['Here is ', 'an overview.']),
+      }),
+    });
+    const agent = new Agent({
+      id: 'settled-question-agent',
+      name: 'settled-question-agent',
+      instructions: 'ask one question',
+      model,
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default', tools: { ask_user: askUser }, harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+      sessions: {
+        storage: new InMemoryHarness({
+          db: new InMemoryDB(),
+          terminalHandoff: { enabled: true },
+          sessionRecordProjection: { enabled: true },
+        }),
+        ...(settle === 'expire' ? { pendingInteractionTtlMs: 1_000 } : {}),
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    } as any);
+
+    try {
+      const session = await harness.session({ resourceId: 'settled-question-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+      const asked = (await session.message({
+        content: 'give me an overview',
+        admissionId: 'adm-1',
+        executionAuthorityGrant: { key: 'usage-claim-1', generation: 1 },
+        terminalAdmissionSeed: { v: 1 },
+      })) as any;
+      expect(asked.finishReason).toBe('suspended');
+      const pending = session.getRecord().pendingResume!;
+      expect(pending.kind).toBe('question');
+
+      if (settle === 'decline') {
+        const declined = await session.discardPendingInteraction({
+          kind: pending.kind,
+          itemId: pending.itemId ?? pending.toolCallId,
+          runId: pending.runId,
+          toolCallId: pending.toolCallId,
+          pendingRequestedAt: pending.requestedAt,
+          responseId: 'decline-1',
+          reason: 'declined',
+        } as any);
+        expect(declined).toMatchObject({ status: 'discarded' });
+      } else if (settle === 'stop') {
+        await session.abortActiveWork({ reason: 'user_requested' });
+      } else {
+        await waitFor(() => session.getRecord().pendingResume === undefined, 'question expiry', 5_000);
+      }
+      expect(session.getRecord().pendingResume).toBeUndefined();
+      const questionRunEnds = events.filter(e => e.type === 'agent_end' && (e as any).runId === pending.runId);
+      expect(questionRunEnds.map(e => (e as any).finishReason)).not.toContain('aborted');
+      expect(questionRunEnds.filter(e => (e as any).finishReason !== 'suspended')).toHaveLength(1);
+
+      const next = (await session.message({
+        content: 'just give me the overview',
+        admissionId: 'adm-2',
+        executionAuthorityGrant: { key: 'usage-claim-2', generation: 1 },
+        terminalAdmissionSeed: { v: 1 },
+      })) as any;
+      expect(next.finishReason).toBe('stop');
+      expect(next.text).toBe('Here is an overview.');
     } finally {
       await harness.shutdown();
     }

@@ -3514,17 +3514,11 @@ describe('Session.message() — default path', () => {
   it('short-circuits duplicate stream retries when pending run completion settles first', async () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    let resolveCompletion!: (full: unknown) => void;
-    const completion = new Promise<unknown>(resolve => {
-      resolveCompletion = resolve;
-    });
     vi.spyOn(agent, 'getRunOutput').mockReturnValue(undefined);
     vi.spyOn(agent, 'waitForRunOutput').mockReturnValue(new Promise(() => {}));
-    (session as any)._runCompletionPromises.set('settling-pending-run', {
-      promise: completion,
-      resolve: resolveCompletion,
-      reject: vi.fn(),
-    });
+    const waiters = (session as any)._runCompletionWaiters;
+    const { promise: completion } = waiters.register('settling-pending-run');
+    const resolveCompletion = (full: unknown) => waiters.resolveIfCurrent('settling-pending-run', completion, full);
 
     const retry = (session as any)._returnDuplicateMessageResult(
       { status: 'pending', signalId: 'signal-1', runId: 'settling-pending-run' },
@@ -4548,15 +4542,9 @@ describe('Session.message() — default path', () => {
     // commit helper.
     const output = buildFakeOutput({ runId: 'adopted-run', fullOutput: agent.fullOutput });
     vi.spyOn(agent, 'getRunOutput').mockReturnValue(output);
-    let rejectCompletion!: (err: unknown) => void;
-    const completionPromise = new Promise<unknown>((_, reject) => {
-      rejectCompletion = reject;
-    });
-    (session as any)._runCompletionPromises.set('adopted-run', {
-      promise: completionPromise,
-      resolve: vi.fn(),
-      reject: rejectCompletion,
-    });
+    const waiters = (session as any)._runCompletionWaiters;
+    waiters.register('adopted-run');
+    const rejectCompletion = (err: unknown) => waiters.fail('adopted-run', err);
     const failures: Error[] = [];
     const adopted = await (session as any)._returnDuplicateMessageResult(
       {

@@ -139,8 +139,8 @@ function isWakeInput(input: unknown): boolean {
   return JSON.stringify(input).includes('"harness-wake:');
 }
 
-function wakeInFlight(session: Session): Set<string> {
-  return (session as any)._wakeTerminalAdmissionsInFlight as Set<string>;
+function wakeInFlightCount(session: Session): number {
+  return (session as any)._wakeAdmissions.inFlightCount as number;
 }
 
 function errorEvents(session: Session) {
@@ -421,7 +421,7 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
       expect(wakeIntents(db)).toHaveLength(1);
       expect(wakeIntents(db)[0]!.terminalResult.status).toBe(expectedStatus);
       expect(wakeEvidence(db).map(row => row.status)).toEqual([expectedStatus]);
-      expect(wakeInFlight(parent).size).toBe(0);
+      expect(wakeInFlightCount(parent)).toBe(0);
       await parent.close();
       expect(wakeIntents(db)).toHaveLength(1);
       expect(reminderCalls(a.parentAgent)).toHaveLength(1);
@@ -733,7 +733,7 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
 
     expect(wakeCommits).toBe(1);
     expect(events).toEqual([]);
-    expect(wakeInFlight(parent).size).toBe(0);
+    expect(wakeInFlightCount(parent)).toBe(0);
     await harness.shutdown().catch(() => {});
   });
 });
@@ -778,7 +778,7 @@ describe('PF-7631 wake admission interrupted at each await', () => {
     await poll(() => !parent.isRunning());
     // The held call then lands after the interrupt.
     gate.release();
-    await poll(() => wakeInFlight(parent).size === 0);
+    await poll(() => wakeInFlightCount(parent) === 0);
 
     if (row.interrupt === 'Stop') {
       await parent.waitForIdle({ timeoutMs: 3000 }).catch(() => {});
@@ -789,7 +789,7 @@ describe('PF-7631 wake admission interrupted at each await', () => {
       vi.setSystemTime(Date.now() + DISPATCH_CLAIM_LAPSED_MS);
       await harness.closeSession({ sessionId: parent.id });
     }
-    expect(wakeInFlight(parent).size).toBe(0);
+    expect(wakeInFlightCount(parent)).toBe(0);
     for (const evidence of wakeEvidence(db)) expect(evidence.status).not.toBe('pending');
     // Before the dispatch nothing ran under the grant: the admission is
     // cancelled, with no intent. Once dispatched, the reserved run started
@@ -858,7 +858,7 @@ describe('PF-7631 wake dispatch outcomes', () => {
     await poll(() => wakeDispatches === 1);
     // The wake turn is released, not parked on the acknowledgement.
     await poll(() => !parent.isRunning());
-    await poll(() => wakeInFlight(parent).size === 0);
+    await poll(() => wakeInFlightCount(parent) === 0);
     vi.mocked(globalThis.setTimeout).mockRestore();
     await parent.close();
 
@@ -878,7 +878,7 @@ describe('PF-7631 wake dispatch outcomes', () => {
       status: 'failed',
       error: { code: ambiguous ? 'harness.run_interrupted' : 'harness.terminal_cancelled' },
     });
-    expect(wakeInFlight(parent).size).toBe(0);
+    expect(wakeInFlightCount(parent)).toBe(0);
     for (const evidence of wakeEvidence(db)) expect(evidence.status).not.toBe('pending');
     await harness.shutdown();
   });
@@ -971,7 +971,7 @@ describe('PF-7631 wake grant invariants', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ signalId: 'notice-x' });
     expect(wakeIntents(db)).toHaveLength(0);
-    expect(wakeInFlight(parent).size).toBe(0);
+    expect(wakeInFlightCount(parent)).toBe(0);
     await parent.close();
     for (const evidence of wakeEvidence(db)) expect(evidence.status).not.toBe('pending');
     await harness.shutdown();

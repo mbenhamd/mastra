@@ -921,7 +921,7 @@ describe('Session.queue() — admission', () => {
   // catch (session.ts ~9967) sees a non-pending error → calls _failQueuedTurn
   // (session.ts ~9978/10901), which transitions the receipt to 'failed', removes
   // the item from pendingQueue, emits queue_failed, rejects the queue() resolver,
-  // clears _currentQueuedItemId, and re-kicks _maybeDrainQueue so the next item
+  // clears _queueHead.currentId, and re-kicks _maybeDrainQueue so the next item
   // drains. The claim is therefore REFUTED; this test locks that in.
   it('settles a failed queued dispatch and drains the next item (queue does not wedge)', async () => {
     const { harness, agent } = setupHarness();
@@ -1189,7 +1189,7 @@ describe('Session.queue() — events', () => {
     expect(agentEnd).toBeGreaterThan(agentStart);
 
     // §10.2: no queue_item_started event — but queuedItemId still flows through
-    // the drained turn's agent_start / agent_end (the `_currentQueuedItemId` tag).
+    // the drained turn's agent_start / agent_end (the `_queueHead.currentId` tag).
     expect(types).not.toContain('queue_item_started');
     const startEvt = events[agentStart] as Extract<HarnessEvent, { type: 'agent_start' }>;
     const endEvt = events[agentEnd] as Extract<HarnessEvent, { type: 'agent_end' }>;

@@ -1805,15 +1805,9 @@ describe('Session.signal() admissionId', () => {
       if (scenario === 'cached') {
         (session as any)._completedRuns.set(runId, { ok: false, err: new Error(secret) });
       } else if (scenario === 'live') {
-        const promise = new Promise<never>((_, reject) => {
-          rejectLive = reject;
-        });
-        void promise.catch(() => {});
-        (session as any)._runCompletionPromises.set(runId, {
-          promise,
-          resolve: () => {},
-          reject: rejectLive,
-        });
+        const waiters = (session as any)._runCompletionWaiters;
+        void waiters.register(runId).promise.catch(() => {});
+        rejectLive = error => waiters.fail(runId, error);
       } else {
         storage.loadMessageResultEvidence = async () => {
           throw new Error(secret);

@@ -283,7 +283,7 @@ describe('Session._emitSubagentEvent', () => {
     // Drive a turn that, while running, emits a subagent event. Use a fake
     // chunk that triggers the drain loop; we synchronously emit a subagent
     // event from a subscriber that sees `agent_start`, so it lands inside
-    // the turn's `_currentQueuedItemId` window.
+    // the turn's `_queueHead.currentId` window.
     const events: HarnessEvent[] = [];
     session.subscribe(e => {
       if (e.type === 'agent_start') {

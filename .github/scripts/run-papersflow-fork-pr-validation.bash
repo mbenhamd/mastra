@@ -8761,6 +8761,61 @@ NODE
     exit 1
   fi
 
+  # PF-8318: the post-merge main workflow, its known-failure comparison script
+  # and its baseline are admitted by exact path and only formatted here. Any
+  # other new workflow under .github/ still fails closed.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    mkdir -p .github/papersflow .github/scripts
+    printf '%s\n' 'name: Fork main validation fixture' 'on:' '  workflow_dispatch:' \
+      > .github/workflows/papersflow-fork-main.yml
+    printf '%s\n' 'export const knownFailures = true;' \
+      > .github/scripts/papersflow-main-known-failures.mjs
+    printf '%s\n' '[]' > .github/papersflow/main-known-failures.json
+    git add .
+    git commit -q -m 'post-merge main validation inputs'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/pf8318-main-validation-inputs-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_not_contains 'require dedicated validation' "$output"
+  assert_line_count 1 \
+    'exec oxfmt --check --no-error-on-unmatched-pattern .github/papersflow/main-known-failures.json .github/scripts/papersflow-main-known-failures.mjs .github/workflows/papersflow-fork-main.yml' \
+    "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'name: Unreviewed fork workflow' 'on:' '  workflow_dispatch:' \
+      > .github/workflows/x.yml
+    git add .
+    git commit -q -m 'unreviewed fork workflow'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/pf8318-unlisted-workflow-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Unlisted fork workflow unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains '.github/workflows/x.yml' "$output"
+  assert_contains 'require dedicated validation' "$output"
+  if [[ -s "$command_log" ]]; then
+    echo 'Unlisted fork workflow fixture executed package commands.' >&2
+    cat "$command_log" >&2
+    exit 1
+  fi
+
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
@@ -14408,14 +14463,17 @@ done < "$changed_files"
 while IFS= read -r file; do
   case "$file" in
     .changeset/* | \
+      .github/papersflow/main-known-failures.json | \
       .github/scripts/run-papersflow-fork-pr-validation.bash | \
       .github/scripts/check-packed-declaration-fixture.mjs | \
+      .github/scripts/papersflow-main-known-failures.mjs | \
       .github/workflows/README.md | \
       .github/workflows/e2e-docs.yml | \
       .github/workflows/labeler.yml | \
       .github/workflows/lint-docs.yml | \
       .github/workflows/lint.yml | \
       .github/workflows/mastracode-e2e.yml | \
+      .github/workflows/papersflow-fork-main.yml | \
       .github/workflows/papersflow-fork-pr.yml | \
       .github/workflows/prebuild.yml | \
       pnpm-lock.yaml | \
