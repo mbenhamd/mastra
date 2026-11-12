@@ -68,7 +68,6 @@ import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
 import { RequestContext } from '../../request-context';
 import {
-  HarnessStorageAdmissionConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionClosedError,
   HarnessStorageSessionEventReplayUnsupportedError,
@@ -237,6 +236,25 @@ import {
   validateCallerRequestContext,
 } from './request-context-input';
 import {
+  activeWorkAdmissionIsCurrent,
+  assertActiveWorkAdmission,
+  awaitDurableMessageResult,
+  beginActiveWorkInvalidation,
+  captureActiveWorkAdmission,
+  completedEvidenceResult,
+  computeMessageAdmissionHashes,
+  hasLiveMessageRun,
+  messageAdmissionIdentity,
+  messageDuplicateModeId,
+  messageDuplicateModelId,
+  resolveMessageAdmissionDuplicate,
+  returnDuplicateMessageResult,
+  writeMessageResultEvidence,
+  writeMessageResultEvidenceBestEffort,
+  writeMessageResultEvidenceBestEffortInBackground,
+} from './session-admission-reservation';
+import type { AdmissionReservationSessionPort } from './session-admission-reservation';
+import {
   cancelAndCloseDelegatedChildForDeadline,
   cancelOwnedSubagentSessions,
   cancelSubagent,
@@ -275,15 +293,12 @@ import type { SessionDisplayState, SessionRunProjection } from './session-displa
 import {
   createDeferred,
   delay,
-  MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS,
   MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS,
-  MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS,
   MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS,
   MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS,
   ORPHANED_DISPATCH_RETRY_MS,
   QUEUE_ACCEPTED_RECOVERY_STALE_MS,
   QUEUE_POST_RUN_FINALIZATION_RETRY_MS,
-  throwIfAborted,
 } from './session-durable-wait';
 import type { Deferred } from './session-durable-wait';
 import {
@@ -563,7 +578,7 @@ export type {
   SessionRunProjection,
 } from './session-display';
 
-type MessageAdmissionIdentity = {
+export type MessageAdmissionIdentity = {
   signalId: string;
   runId: string;
 };
@@ -623,7 +638,7 @@ export type MessageAdmissionStart = {
   duplicate?: boolean;
 };
 
-type MessageAdmissionHashes = {
+export type MessageAdmissionHashes = {
   primary: string;
   legacyCompatible: readonly string[];
 };
@@ -4809,38 +4824,73 @@ export class Session {
     this._abortActiveTurn('agent_aborted');
   }
 
+  /** Build the port the admission-reservation functions reach the session through. */
+  private _admissionReservationPort(): AdmissionReservationSessionPort {
+    const session = this;
+    return {
+      harness: this._harness,
+      id: this.id,
+      messageAdmissionStarts: this._messageAdmissionStarts,
+      operationEvidenceSignalIds: this._operationEvidenceSignalIds,
+      resourceId: this.resourceId,
+      resultEvidenceWrites: this._resultEvidenceWrites,
+      runCompletionWaiters: this._runCompletionWaiters,
+      runOutcomes: this._runOutcomes,
+      terminalFinalizer: this._terminalFinalizer,
+      threadId: this.threadId,
+      get activeWorkAdmissionEpoch() {
+        return session._activeWorkAdmissionEpoch;
+      },
+      set activeWorkAdmissionEpoch(value) {
+        session._activeWorkAdmissionEpoch = value;
+      },
+      get activeWorkInvalidationsInFlight() {
+        return session._activeWorkInvalidationsInFlight;
+      },
+      set activeWorkInvalidationsInFlight(value) {
+        session._activeWorkInvalidationsInFlight = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get storage() {
+        return session._storage;
+      },
+      awaitDurableMessageResult: (...args) => session._awaitDurableMessageResult(...args),
+      awaitRunCompletion: (...args) => session._awaitRunCompletion(...args),
+      captureMessageSuspendWithTokenUsage: (...args) => session._captureMessageSuspendWithTokenUsage(...args),
+      cleanupOperationEvidenceIfDeleted: (...args) => session._cleanupOperationEvidenceIfDeleted(...args),
+      commitCachedDuplicateTerminal: (...args) => session._commitCachedDuplicateTerminal(...args),
+      commitTerminalHandoff: (...args) => session._commitTerminalHandoff(...args),
+      discardedErrorForReceipt: (...args) => session._discardedErrorForReceipt(...args),
+      ensureThreadSubscription: (...args) => session._ensureThreadSubscription(...args),
+      persistTokenUsageOrLatch: (...args) => session._persistTokenUsageOrLatch(...args),
+      prepareTerminalIdentity: (...args) => session._prepareTerminalIdentity(...args),
+      raceActiveTurnWaiter: (...args) => session._raceActiveTurnWaiter(...args),
+      recordMessageTurnCompletion: (...args) => session._recordMessageTurnCompletion(...args),
+      retainTerminalObservers: (...args) => session._retainTerminalObservers(...args),
+      sessionDeletedError: (...args) => session._sessionDeletedError(...args),
+      stageCompletedTerminalOutput: (...args) => session._stageCompletedTerminalOutput(...args),
+      terminalFailure: (...args) => session._terminalFailure(...args),
+      withActiveDeletedWaiter: (...args) => session._withActiveDeletedWaiter(...args),
+    };
+  }
+
   private _captureActiveWorkAdmission(operation: string): number {
-    if (this._activeWorkInvalidationsInFlight > 0) {
-      void operation;
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-    return this._activeWorkAdmissionEpoch;
+    return captureActiveWorkAdmission(this._admissionReservationPort(), operation);
   }
 
   private _activeWorkAdmissionIsCurrent(epoch: number): boolean {
-    return this._activeWorkInvalidationsInFlight === 0 && this._activeWorkAdmissionEpoch === epoch;
+    return activeWorkAdmissionIsCurrent(this._admissionReservationPort(), epoch);
   }
 
   private _assertActiveWorkAdmission(epoch: number, operation: string, signal?: AbortSignal): void {
-    if (signal?.aborted) {
-      throw signal.reason instanceof Error ? signal.reason : new HarnessAbortedError(this.id, 'agent_aborted');
-    }
-    if (!this._activeWorkAdmissionIsCurrent(epoch)) {
-      void operation;
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
+    return assertActiveWorkAdmission(this._admissionReservationPort(), epoch, operation, signal);
   }
 
   /** Begin a synchronous admission barrier; the returned closure is idempotent. */
   private _beginActiveWorkInvalidation(): () => void {
-    this._activeWorkAdmissionEpoch += 1;
-    this._activeWorkInvalidationsInFlight += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this._activeWorkInvalidationsInFlight = Math.max(0, this._activeWorkInvalidationsInFlight - 1);
-    };
+    return beginActiveWorkInvalidation(this._admissionReservationPort());
   }
 
   /**
@@ -8093,7 +8143,7 @@ export class Session {
     timer.unref?.();
   }
 
-  private async _resolveMessageAdmissionDuplicate({
+  private _resolveMessageAdmissionDuplicate({
     admissionId,
     admissionHash,
     compatibleAdmissionHashes,
@@ -8102,372 +8152,18 @@ export class Session {
     admissionHash: string;
     compatibleAdmissionHashes?: readonly string[];
   }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | undefined> {
-    const resolved = await this._storage.resolveOperationAdmissionEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      kind: 'signal',
+    return resolveMessageAdmissionDuplicate(this._admissionReservationPort(), {
       admissionId,
-      attemptedAdmissionHash: admissionHash,
+      admissionHash,
+      compatibleAdmissionHashes,
     });
-    if (resolved.status === 'none') return undefined;
-    if (resolved.status === 'conflict') {
-      if (
-        resolved.storedAdmissionHash !== undefined &&
-        compatibleAdmissionHashes?.includes(resolved.storedAdmissionHash)
-      ) {
-        return resolved.evidence as AgentSignalResultEvidence | OperationAdmissionTombstone | undefined;
-      }
-      throw new HarnessAdmissionConflictError(this.id, admissionId, resolved.storedAdmissionHash ?? '', admissionHash);
-    }
-    return resolved.evidence as AgentSignalResultEvidence | OperationAdmissionTombstone | undefined;
   }
 
-  private async _returnDuplicateMessageResult(
+  private _returnDuplicateMessageResult(
     evidence: AgentSignalResultEvidence | OperationAdmissionTombstone,
     opts: MessageOptions,
   ): Promise<AgentResult | AgentStream | unknown> {
-    return this._withActiveDeletedWaiter(async activeDeleted => {
-      if ('status' in evidence) {
-        // A cancelled terminal admission settles its turn with this code; a
-        // same-admission retry keeps reporting the cancellation.
-        if (
-          evidence.status === 'failed' &&
-          evidence.error.code === 'harness.terminal_cancelled' &&
-          opts.executionAuthorityGrant !== undefined
-        ) {
-          const terminalError = new HarnessTerminalHandoffCancelledError(opts.executionAuthorityGrant.key);
-          try {
-            opts.onTerminalCommitError?.(terminalError);
-          } catch {
-            // The terminal outcome below is authoritative.
-          }
-          throw terminalError;
-        }
-        if (opts.stream === true) {
-          if (evidence.status === 'pending') {
-            const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
-            const duplicateModelId = this._messageDuplicateModelId(evidence, opts);
-            const agent = this._harness.getAgentForMode(duplicateModeId);
-            await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
-            const runId = await this._pendingMessageRunId(evidence);
-            if (runId && this._runOutcomes.has(runId)) {
-              const cached = this._runOutcomes.get(runId);
-              // A run whose own output rejected in this process: commit its
-              // durable failed terminal instead of leaving it pending.
-              if (cached !== undefined && !cached.ok && cached.runFailed === true) {
-                await this._commitCachedDuplicateTerminal(
-                  new RejectedTerminalRun(cached.err),
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-              }
-              if (cached?.ok && evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-                await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
-                const terminalCommitted = await this._commitCachedDuplicateTerminal(
-                  cached.full,
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-                if (!terminalCommitted) {
-                  await this._writeMessageResultEvidenceBestEffort({
-                    status: 'completed',
-                    signalId: evidence.signalId,
-                    runId,
-                    modeId: duplicateModeId,
-                    modelId: duplicateModelId,
-                    operationKind: 'message',
-                    result: cached.full,
-                    admissionId: evidence.admissionId,
-                    admissionHash: evidence.admissionHash,
-                  });
-                }
-              }
-              throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
-            }
-            let output = runId ? (agent.getRunOutput(runId) as AgentStream | undefined) : undefined;
-            let retainedCompletedOutput = false;
-            if (
-              output &&
-              (output as { status?: string }).status !== undefined &&
-              (output as { status?: string }).status !== 'running'
-            ) {
-              retainedCompletedOutput = true;
-              output = undefined;
-            }
-            if (runId && !output && !retainedCompletedOutput) {
-              const waitAbortController = new AbortController();
-              const completion = this._runCompletionWaiters.promiseFor(runId)?.then(
-                () => undefined,
-                () => undefined,
-              );
-              try {
-                output = (await Promise.race([
-                  this._raceActiveTurnWaiter(
-                    (
-                      agent.waitForRunOutput(runId, { abortSignal: waitAbortController.signal }) as Promise<AgentStream>
-                    ).catch(() => undefined),
-                    activeDeleted,
-                  ),
-                  ...(completion ? [completion] : []),
-                  delay(MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS, waitAbortController.signal).then(
-                    () => undefined,
-                    () => undefined,
-                  ),
-                ])) as AgentStream | undefined;
-              } finally {
-                waitAbortController.abort(
-                  new HarnessValidationError('message().admissionId', 'duplicate stream wait ended'),
-                );
-              }
-            }
-            if (output) {
-              // The returned stream may have been adopted after the original
-              // caller died between dispatch and bookkeeping — retain this
-              // retry's terminal observers AND take settlement ownership: a
-              // detached task runs the durable completion bookkeeping the
-              // original caller would have run (a suspended outcome must still
-              // park its pendingResume or the approval can never be answered)
-              // and then drives the terminal commit when the run ends. The
-              // per-runId in-flight dedup makes the commit a no-op when the
-              // original caller is still alive and commits first.
-              const adoptedTerminal =
-                this._terminalFinalizer !== undefined &&
-                opts.executionAuthorityGrant !== undefined &&
-                runId !== undefined &&
-                evidence.admissionId !== undefined &&
-                evidence.admissionHash !== undefined;
-              if (adoptedTerminal) {
-                this._retainTerminalObservers(runId!, {
-                  onReceipt: opts.onTerminalCommit,
-                  onFailure: opts.onTerminalCommitError,
-                });
-              }
-              // `_prepareTerminalIdentity` can throw synchronously — drain the
-              // observers retained above before propagating or they strand.
-              let identity: HarnessTerminalIdentity | undefined;
-              try {
-                identity = adoptedTerminal
-                  ? this._prepareTerminalIdentity(
-                      this._messageAdmissionIdentity(evidence.admissionId!),
-                      evidence.admissionId!,
-                      evidence.admissionHash!,
-                      opts.executionAuthorityGrant!,
-                    )
-                  : undefined;
-              } catch (err) {
-                throw this._terminalFailure(err, undefined, runId);
-              }
-              const duplicateMode = this._messageDuplicateModeId(evidence, opts);
-              const duplicateModel = this._messageDuplicateModelId(evidence, opts);
-              // Settle through the canonical run-completion barrier, not the raw
-              // stream output — `getFullOutput()` alone misses the output-drain
-              // barrier, tool receipts, and terminal-text materialization, so a
-              // terminal-tool response would commit empty evidence instead of
-              // the authoritative answer.
-              void this._awaitRunCompletion(runId!)
-                .then(async full => {
-                  const fullOutput = full as FullOutput<unknown>;
-                  try {
-                    await this._prepareCachedDuplicateMessageCompletion(fullOutput, evidence, opts, activeDeleted);
-                    if (identity !== undefined) {
-                      await this._commitTerminalHandoff(identity, fullOutput, {
-                        modeId: duplicateMode,
-                        modelId: duplicateModel,
-                      });
-                    }
-                  } catch (err) {
-                    // `_commitTerminalHandoff` drains retained observers on its
-                    // own failures, but pre-commit failures (suspension park,
-                    // usage persist, run-materialization) never reach that
-                    // drain — surface an indeterminate outcome here instead of
-                    // stranding the observers retained above. The drain is
-                    // idempotent against the helper's own.
-                    this._terminalFailure(err, undefined, runId);
-                  }
-                })
-                .catch(async err => {
-                  // A run whose own output rejected commits its durable failed
-                  // terminal (the commit drains the retained observers).
-                  const cached = this._runOutcomes.get(runId!);
-                  if (
-                    identity !== undefined &&
-                    cached !== undefined &&
-                    !cached.ok &&
-                    cached.runFailed === true &&
-                    cached.err === err
-                  ) {
-                    await this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), {
-                      modeId: duplicateMode,
-                      modelId: duplicateModel,
-                    }).catch(() => {});
-                    return;
-                  }
-                  // Otherwise `_awaitRunCompletion` itself failed (collector or
-                  // output-drain) — the `.then` never ran, so no settlement
-                  // helper saw the failure. Drain the retained observers with
-                  // the indeterminate outcome; the admission stays pending for
-                  // recovery either way.
-                  this._terminalFailure(err, undefined, runId);
-                });
-              return output;
-            }
-          }
-          // A committed terminal admission must replay its durable receipt to
-          // this retry's observers before reporting the stream as unavailable —
-          // the throw below is not a substitute for the terminal outcome.
-          if (evidence.status === 'completed' && evidence.erased === true) {
-            await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
-          }
-          if (
-            evidence.status === 'completed' &&
-            this._terminalFinalizer !== undefined &&
-            opts.executionAuthorityGrant !== undefined
-          ) {
-            await this._commitCachedDuplicateTerminal(
-              this._completedEvidenceResult(evidence) as FullOutput<unknown>,
-              evidence,
-              opts,
-              activeDeleted,
-            );
-          }
-          if (evidence.status === 'failed') await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
-          throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
-        }
-        if (evidence.status === 'completed') {
-          // A terminal caller still needs its durable receipt replayed — the
-          // committed fast-path converges on the stored winner without
-          // recomputing it.
-          if (evidence.erased === true) await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
-          const completedResult = this._completedEvidenceResult(evidence);
-          // A completed (terminal, immutable) suspended result whose
-          // suspension was discarded replays the discard, not `suspended`.
-          const discardedSuspension = this._discardReceiptForSuspendedOutput(completedResult);
-          if (discardedSuspension !== undefined)
-            throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardedSuspension);
-          if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
-            await this._commitCachedDuplicateTerminal(
-              completedResult as FullOutput<unknown>,
-              evidence,
-              opts,
-              activeDeleted,
-            );
-          }
-          return completedResult;
-        }
-        if (evidence.status === 'failed') {
-          await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
-          throw publicErrorProjectionToError(evidence.error);
-        }
-        const runId = await this._pendingMessageRunId(evidence);
-        if (runId) {
-          const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
-          const duplicateModelId = this._messageDuplicateModelId(evidence, opts);
-          const agent = this._harness.getAgentForMode(duplicateModeId);
-          await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
-          const cached = this._runOutcomes.get(runId);
-          if (cached) {
-            if (!cached.ok) {
-              // A run whose own output rejected in this process: commit its
-              // durable failed terminal (a no-op replay once committed), then
-              // report the run's failure as before.
-              if (cached.runFailed === true) {
-                await this._commitCachedDuplicateTerminal(
-                  new RejectedTerminalRun(cached.err),
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-              }
-              throw cached.err;
-            }
-            if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-              await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
-              const terminalCommitted = await this._commitCachedDuplicateTerminal(
-                cached.full,
-                evidence,
-                opts,
-                activeDeleted,
-              );
-              if (!terminalCommitted) {
-                await this._writeMessageResultEvidenceBestEffort({
-                  status: 'completed',
-                  signalId: evidence.signalId,
-                  runId,
-                  modeId: duplicateModeId,
-                  modelId: duplicateModelId,
-                  operationKind: 'message',
-                  result: cached.full,
-                  admissionId: evidence.admissionId,
-                  admissionHash: evidence.admissionHash,
-                });
-              }
-            }
-            return cached.full;
-          }
-          if (!this._hasLiveMessageRun(agent, runId)) {
-            let durable: AgentResult;
-            try {
-              durable = await this._raceActiveTurnWaiter(
-                this._awaitDurableMessageResult(evidence, opts),
-                activeDeleted,
-              );
-            } catch (err) {
-              // The admission may have committed a failed or interrupted
-              // terminal meanwhile: replay its durable receipt to this retry.
-              // A completed turn whose result a session delete erased mid-wait
-              // replays its completed receipt too (PF-5309).
-              await this._replayCommittedTerminalFailure(
-                evidence,
-                opts,
-                activeDeleted,
-                err instanceof HarnessMessageResultErasedError ? { includeCompleted: true } : {},
-              );
-              throw err;
-            }
-            // The durable wait resolved because the admission committed — the
-            // committed fast-path replays the stored receipt so this retry's
-            // terminal observers see the same outcome as the winner's caller.
-            await this._commitCachedDuplicateTerminal(durable as FullOutput<unknown>, evidence, opts, activeDeleted);
-            return durable;
-          }
-          let live: FullOutput<unknown>;
-          try {
-            live = await this._raceActiveTurnWaiter(this._awaitRunCompletion(runId), activeDeleted);
-          } catch (err) {
-            // A live run whose own output rejected: commit (or replay) its
-            // durable failed terminal for this retry, then report the failure.
-            const rejected = this._runOutcomes.get(runId);
-            if (rejected !== undefined && !rejected.ok && rejected.runFailed === true && rejected.err === err) {
-              await this._commitCachedDuplicateTerminal(new RejectedTerminalRun(err), evidence, opts, activeDeleted);
-            }
-            throw err;
-          }
-          if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-            await this._prepareCachedDuplicateMessageCompletion(live, evidence, opts, activeDeleted);
-            const terminalCommitted = await this._commitCachedDuplicateTerminal(live, evidence, opts, activeDeleted);
-            if (!terminalCommitted) {
-              await this._writeMessageResultEvidenceBestEffort({
-                status: 'completed',
-                signalId: evidence.signalId,
-                runId,
-                modeId: duplicateModeId,
-                modelId: duplicateModelId,
-                operationKind: 'message',
-                result: live,
-                admissionId: evidence.admissionId,
-                admissionHash: evidence.admissionHash,
-              });
-            }
-          }
-          return live;
-        }
-      }
-      throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-    });
+    return returnDuplicateMessageResult(this._admissionReservationPort(), evidence, opts);
   }
 
   /**
@@ -8521,183 +8217,6 @@ export class Session {
       }
     }
     return true;
-  }
-
-  /**
-   * A same-admission retry whose turn already committed a non-completed
-   * terminal — a rejected run's `failed` result, or an interrupted dispatch's
-   * `aborted` one — gets that durable receipt replayed to its
-   * `onTerminalCommit`, as a retry of a completed turn does, before it reports
-   * the failure. An admission that is not committed is left alone, and a
-   * failed lookup only skips the replay: the durable intent is authoritative.
-   */
-  private async _replayCommittedTerminalFailure(
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-    replay: { includeCompleted?: true } = {},
-  ): Promise<void> {
-    const grant = opts.executionAuthorityGrant;
-    if (
-      opts.onTerminalCommit === undefined ||
-      grant === undefined ||
-      evidence.admissionId === undefined ||
-      !this._storage.supportsTerminalHandoff
-    ) {
-      return;
-    }
-    let receipt: HarnessTerminalCommitReceipt;
-    try {
-      const admission = await this._raceActiveTurnWaiter(
-        this._storage.loadTerminalAdmission({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          admissionId: evidence.admissionId,
-          executionGrant: grant,
-        }),
-        activeDeleted,
-      );
-      if (
-        admission?.status !== 'committed' ||
-        (replay.includeCompleted !== true && admission.terminalResult?.status === 'completed')
-      ) {
-        return;
-      }
-      const intent = await this._raceActiveTurnWaiter(
-        this._storage.loadTerminalIntent({
-          harnessName: admission.harnessName,
-          intentId: harnessTerminalIntentId(admission.id),
-        }),
-        activeDeleted,
-      );
-      receipt = { status: 'duplicate', admission, ...(intent !== null ? { intent } : {}) };
-    } catch {
-      return;
-    }
-    try {
-      opts.onTerminalCommit(receipt);
-    } catch {
-      // Receipt observers are diagnostics only and cannot change the durable winner.
-    }
-  }
-
-  private async _prepareCachedDuplicateMessageCompletion(
-    full: FullOutput<unknown>,
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-  ): Promise<void> {
-    const runId = full.runId ?? evidence.runId;
-    if (runId !== undefined) {
-      try {
-        // The cached output exists only in this process, so a native run
-        // here is known and still fails closed on a lookup failure.
-        await this._raceActiveTurnWaiter(
-          this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true }),
-          activeDeleted,
-        );
-      } catch (error) {
-        throw this._terminalFailure(error, opts.onTerminalCommitError, runId);
-      }
-    }
-    if (full.finishReason === 'suspended') {
-      // A cached suspension is a replay of an earlier generation — a resumed
-      // run may already have parked a *newer* pendingResume (different tool
-      // call, or a different run entirely). The durable park is authoritative;
-      // restoring the stale cached suspension would revert it.
-      const parked = this._record.pendingResume;
-      const payload = full.suspendPayload as { toolCallId?: string } | undefined;
-      if (parked !== undefined && (parked.runId !== full.runId || parked.toolCallId !== payload?.toolCallId)) {
-        return;
-      }
-      // `discardPendingInteraction` resolved this suspended call. Re-parking
-      // the cached suspension (with a fresh `requestedAt`) would make the
-      // discarded run answerable again; settle the still-pending message
-      // admission as discarded instead and report that outcome.
-      const discardedCallRunId = full.runId ?? evidence.runId;
-      const discard = parked === undefined ? this._discardReceiptForSuspendedOutput(full, evidence.runId) : undefined;
-      if (discard !== undefined) {
-        const discardError = discardedErrorForReceipt(this._pendingInteractionsPort(), discard);
-        if (evidence.status === 'pending') {
-          // Same admitted failure write a failed message turn makes, so later
-          // retries replay a terminal outcome. Best effort: the discard
-          // receipt keeps refusing the re-park if this write fails.
-          await this._raceActiveTurnWaiter(
-            this._writeMessageResultEvidence({
-              status: 'failed',
-              signalId: evidence.signalId,
-              runId: discardedCallRunId,
-              ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
-              ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
-              operationKind: 'message',
-              error: projectHarnessPublicError(discardError),
-              ...(evidence.admissionId !== undefined && evidence.admissionHash !== undefined
-                ? { admissionId: evidence.admissionId, admissionHash: evidence.admissionHash }
-                : {}),
-            }).catch(() => undefined),
-            activeDeleted,
-          );
-        }
-        throw discardError;
-      }
-      // The deferred admission bound to this run may already be terminal
-      // (aborted/cancelled/fenced) or sealed. Re-parking the cached suspension
-      // then resurrects a pending interaction whose grant can never settle —
-      // a later respond would drive the provider against a revoked or finished
-      // grant. Only a still-pending admission may be re-parked here; the
-      // commit helper below reports the terminal outcome to this caller. The
-      // probe keys off durable state, not local finalizer registration — a
-      // reopened session without a finalizer must still see the dead grant.
-      const admissionRunId = full.runId ?? evidence.runId;
-      const sessionIncarnation = this._record.sessionIncarnation;
-      if (
-        this._storage.supportsTerminalHandoff &&
-        sessionIncarnation !== undefined &&
-        evidence.admissionId !== undefined &&
-        admissionRunId !== undefined
-      ) {
-        const admission = await this._raceActiveTurnWaiter(
-          this._storage.loadTerminalAdmissionByRun({
-            harnessName: this._record.harnessName,
-            sessionId: this.id,
-            runId: admissionRunId,
-            sessionIncarnation,
-          }),
-          activeDeleted,
-        );
-        if (admission !== null && admission.status !== 'pending') return;
-      }
-      await this._captureMessageSuspendWithTokenUsage(
-        full,
-        undefined,
-        this._messageDuplicateModeId(evidence, opts),
-        this._messageDuplicateModelId(evidence, opts),
-        activeDeleted,
-        {
-          restoreFence: {
-            expectedKey: parked === undefined ? undefined : pendingInteractionGenerationKey(parked),
-          },
-        },
-      );
-      return;
-    }
-
-    const { tokenUsageAccounted } = this._recordMessageTurnCompletion(full, { persist: false });
-    if (tokenUsageAccounted) {
-      await this._raceActiveTurnWaiter(this._persistTokenUsageOrLatch(), activeDeleted);
-    }
-  }
-
-  private async _pendingMessageRunId(evidence: AgentSignalResultEvidence): Promise<string | undefined> {
-    if (evidence.status !== 'pending') return evidence.runId;
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    if (!starting) return evidence.runId;
-    try {
-      const startingEvidence = await starting.promise;
-      return startingEvidence.runId ?? evidence.runId;
-    } catch {
-      return evidence.runId;
-    }
   }
 
   /**
@@ -8985,103 +8504,23 @@ export class Session {
   }
 
   private _messageDuplicateModeId(evidence: AgentSignalResultEvidence, opts: MessageOptions): string {
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    return starting?.modeId ?? evidence.modeId ?? opts.mode ?? this._record.modeId;
+    return messageDuplicateModeId(this._admissionReservationPort(), evidence, opts);
   }
 
   private _messageDuplicateModelId(evidence: AgentSignalResultEvidence, opts: MessageOptions): string {
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    return starting?.modelId ?? evidence.modelId ?? opts.model ?? this._record.modelId;
+    return messageDuplicateModelId(this._admissionReservationPort(), evidence, opts);
   }
 
   private _hasLiveMessageRun(agent: Agent, runId: string): boolean {
-    return Boolean(agent.getRunOutput(runId) || this._runCompletionWaiters.has(runId) || this._runOutcomes.has(runId));
+    return hasLiveMessageRun(this._admissionReservationPort(), agent, runId);
   }
 
-  private async _awaitDurableMessageResult(
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-  ): Promise<AgentResult> {
-    const deadline = Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
-    let extendedWaitMs = MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS;
-    while (true) {
-      throwIfAborted(opts.abortSignal, 'message().admissionId');
-      const latest = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
-      if (!latest) {
-        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-      }
-      if ('status' in latest) {
-        if (latest.status === 'completed') return this._completedEvidenceResult(latest);
-        if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
-        // While canonical evidence stays pending, consult the durable terminal
-        // admission each pass — a cancelled/fenced grant can never produce the
-        // completed evidence this loop waits on, and surfacing the durable
-        // outcome beats expiring into an unrelated liveness error (or waiting
-        // forever on a parked pendingResume).
-        const sessionIncarnation = this._record.sessionIncarnation;
-        if (this._storage.supportsTerminalHandoff && sessionIncarnation !== undefined && latest.runId !== undefined) {
-          const boundAdmission = await this._storage.loadTerminalAdmissionByRun({
-            harnessName: this._record.harnessName,
-            sessionId: this.id,
-            runId: latest.runId,
-            sessionIncarnation,
-          });
-          if (boundAdmission?.status === 'cancelled' || boundAdmission?.status === 'fenced') {
-            const terminalError =
-              boundAdmission.status === 'cancelled'
-                ? new HarnessTerminalHandoffCancelledError(boundAdmission.executionGrant.key)
-                : new HarnessTerminalHandoffFencedError(this.id);
-            try {
-              opts.onTerminalCommitError?.(terminalError);
-            } catch {
-              // The terminal outcome below is authoritative.
-            }
-            throw terminalError;
-          }
-        }
-      } else {
-        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-      }
-      let pastDeadline = false;
-      if (Date.now() >= deadline) {
-        // A terminal-mode message whose run is parked in `pendingResume`
-        // legitimately stays pending until the approval-gated resume settles
-        // the deferred admission — waiting past the probe deadline is correct.
-        // Key off the durable parked state, not local finalizer registration —
-        // a reopened session that has not re-registered a finalizer must still
-        // extend the wait for a run durably parked in pendingResume.
-        const suspendedOnThisRun = evidence.runId !== undefined && this._record.pendingResume?.runId === evidence.runId;
-        if (!suspendedOnThisRun) {
-          throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
-        }
-        pastDeadline = true;
-      }
-      await delay(pastDeadline ? extendedWaitMs : MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, opts.abortSignal);
-      if (pastDeadline) {
-        extendedWaitMs = Math.min(extendedWaitMs * 2, MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS);
-      }
-    }
+  private _awaitDurableMessageResult(evidence: AgentSignalResultEvidence, opts: MessageOptions): Promise<AgentResult> {
+    return awaitDurableMessageResult(this._admissionReservationPort(), evidence, opts);
   }
 
   private _messageAdmissionIdentity(admissionId: string): MessageAdmissionIdentity {
-    const digest = sha256CanonicalJson({
-      kind: 'message-admission',
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      admissionId,
-    });
-    return {
-      signalId: `harness-message-${digest.slice(0, 32)}`,
-      runId: `harness-message-${digest.slice(32, 64)}`,
-    };
+    return messageAdmissionIdentity(this._admissionReservationPort(), admissionId);
   }
 
   private _prepareTerminalIdentity(
@@ -9728,7 +9167,7 @@ export class Session {
     return signalAdmissionIdentity(this._signalsPort(), admissionId);
   }
 
-  private async _writeMessageResultEvidence(
+  private _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[]; leaseOwner?: { ownerId: string } },
   ): Promise<{
@@ -9736,51 +9175,7 @@ export class Session {
     applied: boolean;
     evidence?: AgentSignalResultEvidence | OperationAdmissionTombstone;
   }> {
-    if (status.admissionId !== undefined && status.admissionHash !== undefined && status.operationKind === undefined) {
-      throw new Error(
-        `Invalid Harness admission evidence for session "${this.id}" signal "${status.signalId}": operationKind is required`,
-      );
-    }
-    const now = Date.now();
-    this._operationEvidenceSignalIds.add(status.signalId);
-    try {
-      const evidence: AgentSignalResultEvidence = {
-        ...status,
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const write = this._storage.writeMessageResultEvidence(
-        evidence,
-        options?.leaseOwner !== undefined ? { leaseOwner: options.leaseOwner } : undefined,
-      );
-      // A turn's result write can outlive the turn (an aborted turn does not
-      // await it); close waits for these before judging what is pending.
-      this._resultEvidenceWrites.add(write);
-      void write
-        .finally(() => {
-          this._resultEvidenceWrites.delete(write);
-        })
-        .catch(() => {});
-      const result = await write;
-      await this._cleanupOperationEvidenceIfDeleted(status);
-      return result.created ? { created: true, applied: result.applied, evidence } : result;
-    } catch (err) {
-      if (err instanceof HarnessStorageSessionNotFoundError) throw this._sessionDeletedError(err);
-      if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
-        const duplicate = await this._resolveMessageAdmissionDuplicate({
-          admissionId: status.admissionId,
-          admissionHash: status.admissionHash,
-          compatibleAdmissionHashes: options?.compatibleAdmissionHashes,
-        });
-        if (duplicate) return { created: false, applied: false, evidence: duplicate };
-        throw new HarnessAdmissionConflictError(this.id, status.admissionId, '', status.admissionHash);
-      }
-      throw err;
-    }
+    return writeMessageResultEvidence(this._admissionReservationPort(), status, options);
   }
 
   /**
@@ -9807,7 +9202,7 @@ export class Session {
       .catch(() => {});
   }
 
-  private async _writeMessageResultEvidenceBestEffort(
+  private _writeMessageResultEvidenceBestEffort(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
   ): Promise<
@@ -9818,31 +9213,14 @@ export class Session {
       }
     | undefined
   > {
-    try {
-      return await this._writeMessageResultEvidence(status, options);
-    } catch (err) {
-      if (status.admissionId !== undefined) throw err;
-      // The initial pre-dispatch admission reservation is the durable barrier.
-      // Non-idempotent callers have no durable replay contract, so storage
-      // evidence is only best-effort for them.
-    }
+    return writeMessageResultEvidenceBestEffort(this._admissionReservationPort(), status, options);
   }
 
   private _writeMessageResultEvidenceBestEffortInBackground(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
   ): void {
-    const write = this._writeMessageResultEvidenceBestEffort(status, options);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<void>(resolve => {
-      timer = setTimeout(resolve, MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS);
-      timer.unref?.();
-    });
-    void Promise.race([write, timeout])
-      .catch(() => {})
-      .finally(() => {
-        if (timer !== undefined) clearTimeout(timer);
-      });
+    return writeMessageResultEvidenceBestEffortInBackground(this._admissionReservationPort(), status, options);
   }
 
   /**
@@ -9886,29 +9264,12 @@ export class Session {
   }
 
   /**
-   * A duplicate of a turn whose session was deleted (PF-5309): its result is
-   * erased, but its committed terminal receipt is still durable. Replay that
-   * receipt to the caller's terminal observers, then fail with the typed
-   * erased error, so no observer is left waiting and no caller sees an empty
-   * success.
-   */
-  private async _rejectErasedDuplicate(
-    evidence: AgentSignalResultEvidence & { status: 'completed' },
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-  ): Promise<never> {
-    await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted, { includeCompleted: true });
-    throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
-  }
-
-  /**
    * The result a completed durable evidence row reports. A row whose content a
    * session delete erased (PF-5309) still proves completion but has no result:
    * it fails with a typed error instead of resolving as an empty success.
    */
   private _completedEvidenceResult(evidence: { signalId: string; result: unknown; erased?: true }): AgentResult {
-    if (evidence.erased === true) throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
-    return evidence.result as AgentResult;
+    return completedEvidenceResult(this._admissionReservationPort(), evidence);
   }
 
   private _computeMessageAdmissionHashes(
@@ -9916,86 +9277,7 @@ export class Session {
     stable: { modeId: string; modelId: string },
     persistedRequestContext?: PersistedRequestContextInput,
   ): MessageAdmissionHashes {
-    const primary = sha256CanonicalJson(
-      this._messageAdmissionHashInput(opts, undefined, { hashVersion: 2 }, persistedRequestContext),
-    );
-    // Pre-v2 evidence hashed the effective mode/model. Keep compatibility
-    // candidates for the current effective tuple only; old evidence does not
-    // persist enough metadata to safely infer previous defaults after drift.
-    const legacyCompatible = [
-      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable, undefined, persistedRequestContext)),
-      sha256CanonicalJson(
-        this._messageAdmissionHashInput(opts, stable, { includeAttachmentMetadata: false }, persistedRequestContext),
-      ),
-    ];
-    return {
-      primary,
-      legacyCompatible: [...new Set(legacyCompatible)].filter(hash => hash !== primary),
-    };
-  }
-
-  private _messageAdmissionHashInput(
-    opts: MessageOptions,
-    stable?: { modeId: string; modelId: string },
-    options?: { hashVersion?: number; includeAttachmentMetadata?: boolean },
-    persistedRequestContext?: PersistedRequestContextInput,
-  ) {
-    return {
-      // Operation-kind discriminator in the admission hash (signal vs queue);
-      // §5.1d token is `'signal'`. Distinct from the queue path's `kind: 'queue'`.
-      kind: 'signal',
-      ...(options?.hashVersion !== undefined ? { hashVersion: options.hashVersion } : {}),
-      content: opts.content,
-      ...(stable !== undefined
-        ? { mode: stable.modeId, model: stable.modelId }
-        : {
-            ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-            ...(opts.model !== undefined ? { model: opts.model } : {}),
-          }),
-      ...(opts.modelSettings !== undefined ? { modelSettings: opts.modelSettings } : {}),
-      ...(opts.logicalMessageIdentity !== undefined
-        ? { logicalMessageIdentity: { ...opts.logicalMessageIdentity } }
-        : {}),
-      ...(opts.executionAuthorityGrant !== undefined
-        ? { executionAuthorityGrant: { ...opts.executionAuthorityGrant } }
-        : {}),
-      ...(opts.terminalAdmissionSeed !== undefined
-        ? { terminalAdmissionSeed: structuredClone(opts.terminalAdmissionSeed) }
-        : {}),
-      attachments: (opts.attachments ?? []).map(attachment => ({
-        attachmentId: attachment.attachmentId,
-        resourceId: attachment.resourceId,
-        ...(attachment.ownerSessionId !== undefined ? { ownerSessionId: attachment.ownerSessionId } : {}),
-        ...(attachment.bytes !== undefined ? { bytes: attachment.bytes } : {}),
-        ...(attachment.sha256 !== undefined ? { sha256: attachment.sha256 } : {}),
-        ...(attachment.source !== undefined ? { source: attachment.source } : {}),
-        ...(options?.includeAttachmentMetadata !== false
-          ? {
-              ...(attachment.kind !== undefined ? { kind: attachment.kind } : {}),
-              ...(attachment.name !== undefined ? { name: attachment.name } : {}),
-              ...(attachment.mimeType !== undefined ? { mimeType: attachment.mimeType } : {}),
-              ...(attachment.primitiveType !== undefined ? { primitiveType: attachment.primitiveType } : {}),
-              ...(attachment.elementType !== undefined ? { elementType: attachment.elementType } : {}),
-              ...(attachment.renderer !== undefined ? { renderer: attachment.renderer } : {}),
-              ...(attachment.schemaId !== undefined ? { schemaId: attachment.schemaId } : {}),
-              ...(attachment.metadata !== undefined ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
-              ...(attachment.object !== undefined ? { object: attachment.object } : {}),
-            }
-          : {}),
-      })),
-      // §4.4c / §5.1: caller request context is part of admission identity when
-      // present. Absent => omitted => the hash is byte-identical to pre-feature
-      // evidence (backward-compatible). Mirrors the queue path's requestContext.
-      ...(persistedRequestContext ? { requestContext: clonePersistedRequestContext(persistedRequestContext) } : {}),
-      ...(opts.observationalMemorySourceWriteGuard
-        ? {
-            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
-              opts.observationalMemorySourceWriteGuard,
-              'message().observationalMemorySourceWriteGuard',
-            ),
-          }
-        : {}),
-    };
+    return computeMessageAdmissionHashes(this._admissionReservationPort(), opts, stable, persistedRequestContext);
   }
 
   private _computeSignalAdmissionHash(
@@ -12351,16 +11633,8 @@ export class Session {
     return discardPendingInteraction(this._pendingInteractionsPort(), opts);
   }
 
-  /** The discard receipt for the suspended call `output` parked on, if discarded. */
-  private _discardReceiptForSuspendedOutput(output: unknown, fallbackRunId?: string): InboxResponseReceipt | undefined {
-    const full = output as { finishReason?: unknown; runId?: unknown; suspendPayload?: unknown } | undefined;
-    if (full?.finishReason !== 'suspended') return undefined;
-    const runId = typeof full.runId === 'string' ? full.runId : fallbackRunId;
-    const toolCallId = (full.suspendPayload as { toolCallId?: unknown } | undefined)?.toolCallId;
-    if (runId === undefined || typeof toolCallId !== 'string') return undefined;
-    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
-      receipt => receipt.discardedAt !== undefined && receipt.runId === runId && receipt.toolCallId === toolCallId,
-    );
+  private _discardedErrorForReceipt(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
+    return discardedErrorForReceipt(this._pendingInteractionsPort(), receipt);
   }
 
   // -------------------------------------------------------------------------
