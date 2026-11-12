@@ -3464,15 +3464,7 @@ export class Session {
     // which (for the long-lived thread subscription) do NOT carry their own
     // runId — can be attributed to this run by `_emitForChunk` (§10.2
     // text_delta/tool_start/tool_end all require a runId).
-    if (this._currentRunId === undefined) {
-      this._currentRunId = id;
-      // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
-      // is the canonical run-start choke for all entry paths.
-      this._currentRunStartedAt = Date.now();
-      // §5.1b: a signal-backed run records its originating signalId so the live
-      // projection's `operation` can link to the durable signal row.
-      this._currentRunSignalId = signalId;
-    }
+    this._adoptRunId(id, { signalId });
     this._emitTurnEvent(
       wakeNoticeId === undefined
         ? { type: 'agent_start', runId: id }
@@ -5189,12 +5181,27 @@ export class Session {
     }
   }
 
+  /**
+   * PF-8698: the only writer of the current run id. The first run adopted for
+   * a turn wins; later calls leave it as it is. Only `agent_start` passes
+   * `start`, so only it stamps the run's start time and signal id.
+   */
+  private _adoptRunId(runId: string, start?: { signalId: string | undefined }): void {
+    if (this._currentRunId !== undefined) return;
+    this._currentRunId = runId;
+    if (start === undefined) return;
+    // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
+    // is the canonical run-start choke for all entry paths.
+    this._currentRunStartedAt = Date.now();
+    // §5.1b: a signal-backed run records its originating signalId so the live
+    // projection's `operation` can link to the durable signal row.
+    this._currentRunSignalId = start.signalId;
+  }
+
   /** Capture the first run id for the active turn display state. */
   private _captureTurnRunId(full: FullOutput<unknown>): void {
     if (this._currentTurnAbortController === undefined) return;
-    if (full.runId && this._currentRunId === undefined) {
-      this._currentRunId = full.runId;
-    }
+    if (full.runId) this._adoptRunId(full.runId);
   }
 
   private _tokenUsageDeltaFromFullOutput(
@@ -7357,10 +7364,10 @@ export class Session {
     try {
       for await (const chunk of sub.stream) {
         const runId = (chunk as { runId?: string }).runId;
-        if (runId && this._currentRunId === undefined) {
-          // First chunk for a run marks our "current run" for getDisplayState().
-          this._currentRunId = runId;
-        }
+        // First chunk for a run marks our "current run" for getDisplayState(),
+        // but only inside a turn this session opened (PF-8698): a run woken on
+        // the thread from outside the session is not the session's run.
+        if (runId && this._currentTurnAbortController !== undefined) this._adoptRunId(runId);
         this._emitForChunk(chunk);
       }
     } catch (err) {

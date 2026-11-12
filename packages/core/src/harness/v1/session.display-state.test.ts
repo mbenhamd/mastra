@@ -919,12 +919,10 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
     }
   });
 
-  // Known gap PF-8698: a run woken through the agent on the session's thread
-  // while the session is idle is stamped as the session's current run by the
-  // thread subscription, but no turn is opened for it, so nothing clears it
-  // when the run ends. Whether the session should adopt such a run or ignore
-  // it is undecided; either way it must not report the run once it has ended.
-  it.fails('reports no current run after a run woken through the agent on an idle session has ended', async () => {
+  // PF-8698: a run woken through the agent on the session's thread while the
+  // session is idle is not the session's run, so it is never stamped as the
+  // current run and nothing is left behind once it has ended.
+  it('reports no current run after a run woken through the agent on an idle session has ended', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     // A first turn opens the session's thread subscription.
