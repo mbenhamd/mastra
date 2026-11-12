@@ -327,6 +327,42 @@ describe('Harness subagent outcome terminal contract', () => {
     ]);
   });
 
+  it('keeps a near-limit direct delivery valid by leaving out earlier receipts that do not fit the report', () => {
+    const answer = 'a'.repeat(47 * 1024);
+    const terminalToolResult = {
+      status: 'success',
+      items: [
+        {
+          toolName: 'run_python_analysis',
+          toolCallId: 'python-final',
+          status: 'success',
+          value: { text: answer },
+        },
+      ],
+    };
+    const earlier = Array.from({ length: 23 }, (_, index) => ({
+      toolCallId: `${String(index).padStart(2, '0')}${'x'.repeat(1_022)}`,
+      toolName: 'run_python_analysis',
+      status: 'success' as const,
+    }));
+    const rawResult = withHarnessSubagentToolReceipts({ finishReason: 'tool-calls', terminalToolResult }, [
+      ...earlier,
+      { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
+    ]);
+
+    const completion = verifyHarnessSubagentTerminalCompletion(rawResult);
+    expect(completion?.outcome).toBe('completed');
+    expect(completion?.evidence[0]?.toolCallId).toBe('python-final');
+    expect(completion?.evidence.length).toBeGreaterThan(1);
+    expect(completion?.evidence.length).toBeLessThan(24);
+    const summary = summarizeHarnessSubagentResult(rawResult);
+    expect(summary).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
+    expect(projectHarnessSpawnSubagentResult({ subagentSessionId: 'child-session-1', result: summary })).toMatchObject({
+      kind: 'subagent-direct-answer',
+      text: answer,
+    });
+  });
+
   it('drops oversized or unprojected terminal artifact metadata without rejecting the verified text', () => {
     const oversizedTerminal = {
       status: 'success',

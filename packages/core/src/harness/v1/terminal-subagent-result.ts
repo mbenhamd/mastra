@@ -978,19 +978,30 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
   // child's other framework-minted receipts are Harness-observed too, so they
   // join the evidence in call order: a caller that requires every delegated
   // call to be proven can then verify a multi-call direct delivery. Run
-  // tool-result fallbacks are provider-shaped and never added, an ambiguous
-  // call id is skipped, and the list stays within the report's item bound.
+  // tool-result fallbacks are never appended, and an ambiguous earlier call id
+  // is skipped. Appending stops at the report's item and byte bounds, so a
+  // terminal-only report that verified before still verifies; a call left out
+  // stays unproven for the caller.
+  const encoder = new TextEncoder();
+  let reportBytes = encoder.encode(
+    JSON.stringify({ kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND, outcome: 'completed', summary, evidence }),
+  ).byteLength;
   for (const receipt of frameworkToolReceipts(value)) {
     if (evidence.length >= MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS) break;
     if (seenCallIds.has(receipt.toolCallId) || byCallId.get(receipt.toolCallId)?.length !== 1) continue;
-    seenCallIds.add(receipt.toolCallId);
-    evidence.push({
+    const item: HarnessSubagentOutcomeReport['evidence'][number] = {
       kind: 'tool-result',
       toolName: receipt.toolName,
       toolCallId: receipt.toolCallId,
       status: receipt.status,
       description: `Framework-observed result from ${receipt.toolName}.`,
-    });
+    };
+    // One more array element serializes as a comma plus the item.
+    const itemBytes = encoder.encode(JSON.stringify(item)).byteLength + 1;
+    if (reportBytes + itemBytes > MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES) break;
+    reportBytes += itemBytes;
+    seenCallIds.add(receipt.toolCallId);
+    evidence.push(item);
   }
 
   const projected = harnessSubagentOutcomeReportSchema.safeParse({

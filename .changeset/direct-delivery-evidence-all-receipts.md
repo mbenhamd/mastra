@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-A subagent that ends by direct delivery now carries every framework-observed tool receipt as evidence, not only the terminal call. Callers that require each delegated call to be proven can verify a multi-call direct delivery. Run tool-result fallbacks and ambiguous call ids are still left out, and failed calls appear with an error status.
+When a subagent ends by direct delivery, its evidence now lists the terminal call first, followed by its other framework-observed tool receipts in call order. Receipts are added only while the report stays within its item limit (24, including the terminal call) and its byte limit. A direct delivery that was valid before stays valid, and a call left out stays unproven for the caller. Run tool-result fallbacks are not appended, ambiguous earlier call ids are skipped, and failed calls keep an error status.
