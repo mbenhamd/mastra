@@ -1272,6 +1272,36 @@ describe('Session adoption — orphaned message dispatch', () => {
     }
   });
 
+  it('refuses to close over a failed run whose failure did not commit as an unsettled admission, not a live run', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun();
+    const owner = harnessProcess(db, agent, false);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+    // The run's output never reaches this process, and the failure it leaves
+    // cannot be written: the admitted row stays pending over a failed run.
+    vi.spyOn(agent, 'waitForRunOutput').mockRejectedValue(new Error('run output lost'));
+    vi.spyOn(agent, 'getRunOutput').mockReturnValue(undefined);
+    const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
+    owner.storage.writeMessageResultEvidence = async record => {
+      if (record.status === 'failed') throw new Error('failure write lost');
+      return write(record);
+    };
+    try {
+      await expect(session.message({ content: 'hi', admissionId: 'failed-turn' })).rejects.toThrow();
+      expect(
+        (await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 })).items,
+      ).toHaveLength(1);
+
+      const refused = await owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' }).catch(e => e);
+      expect(refused).toBeInstanceOf(HarnessSessionLockedError);
+      expect((refused as HarnessSessionLockedError).currentOwnerId).toBe('unsettled-admission');
+    } finally {
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
   it('refuses to close while a result write is still in flight, then closes once it lands', async () => {
     const db = new InMemoryDB();
     const agent = new MockAgent({ id: 'default' });

@@ -349,6 +349,7 @@ import {
   UNSUSPENDED_AGENTIC_LOOP_STATUSES,
 } from './session-persistence';
 import { QueueHead } from './session-queue-head';
+import { RunCompletionWaiters } from './session-run-completion-waiters';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
 import {
@@ -1762,19 +1763,8 @@ export class Session {
   /** True once the subscription has been torn down (by close or eviction).
    *  Guards re-opens and re-entrant teardown. */
   private _threadSubscriptionClosed = false;
-  /**
-   * Per-run completion promises, keyed by `runId`. `_watchRunCompletion()`
-   * resolves or rejects the matching entry after the runtime output finishes.
-   * Entries left over on `close()` are rejected so callers don't hang.
-   */
-  private readonly _runCompletionPromises = new Map<
-    string,
-    {
-      promise: Promise<FullOutput<unknown>>;
-      resolve: (full: FullOutput<unknown>) => void;
-      reject: (err: unknown) => void;
-    }
-  >();
+  /** PF-8485: the per-run completion waiters `_awaitRunCompletion()` callers share. */
+  private readonly _runCompletionWaiters = new RunCompletionWaiters();
   /**
    * Runs whose model output has reached its terminal boundary but whose
    * subscription events are still draining. Closing the subscription must not
@@ -4061,7 +4051,7 @@ export class Session {
     if (
       this._messageAdmissionStarts.has(evidence.admissionId) ||
       this._wakeAdmissions.isInFlight(evidence.admissionId) ||
-      this._runCompletionPromises.has(runId)
+      this._runCompletionWaiters.has(runId)
     ) {
       return 'active';
     }
@@ -7118,7 +7108,7 @@ export class Session {
   // Signal-routing helpers (§4.2). One long-lived thread subscription per
   // Session multiplexes every run on the thread into a single chunk
   // stream. `message()` calls `agent.sendSignal()`, gets a `runId` back,
-  // and awaits the matching entry in `_runCompletionPromises`. Completion
+  // and awaits the matching entry in `_runCompletionWaiters`. Completion
   // settlement is handled by `_watchRunCompletion()`; the drain loop only
   // emits harness events from stream chunks.
   // -------------------------------------------------------------------------
@@ -7214,15 +7204,8 @@ export class Session {
     // Multiple callers can await the same run (e.g. `message()` followed by
     // an active-delivery `signal()` that drains into the same run). Memoize
     // the promise so they all see the same resolution.
-    const existing = this._runCompletionPromises.get(runId);
-    if (existing) return existing.promise;
-    let resolve!: (full: FullOutput<unknown>) => void;
-    let reject!: (err: unknown) => void;
-    const promise = new Promise<FullOutput<unknown>>((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-    this._runCompletionPromises.set(runId, { promise, resolve, reject });
+    const { promise, created } = this._runCompletionWaiters.register(runId);
+    if (!created) return promise;
     // Single canonical settler: wait for the runtime to register the run's
     // `MastraModelOutput`, then await its `_waitUntilFinished()`. The drain
     // loop emits events from chunks; it does NOT settle completion. This
@@ -7253,10 +7236,8 @@ export class Session {
         _waitUntilFinished?: () => Promise<void>;
       };
     } catch (err) {
-      const waiter = this._runCompletionPromises.get(runId);
-      this._runCompletionPromises.delete(runId);
+      this._runCompletionWaiters.fail(runId, err);
       this._rememberCompletedRun(runId, { ok: false, err });
-      waiter?.reject(err);
       return;
     }
     // Stage the provider's completed output as soon as the run has it, before
@@ -7301,10 +7282,8 @@ export class Session {
               const lease = captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, runId);
               if (lease) clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, runId, lease);
             }
-            const waiter = this._runCompletionPromises.get(runId);
-            this._runCompletionPromises.delete(runId);
+            this._runCompletionWaiters.fail(runId, terminalError);
             this._rememberCompletedRun(runId, { ok: false, err: terminalError });
-            waiter?.reject(terminalError);
             return;
           }
           // Subscription teardown wakes the barrier. Since the model output is
@@ -7347,11 +7326,7 @@ export class Session {
   }
 
   private _rejectNonTerminalRunCompletions(reason: unknown): void {
-    for (const [runId, entry] of this._runCompletionPromises) {
-      if (this._modelTerminalRunsPendingEventDrain.has(runId)) continue;
-      this._runCompletionPromises.delete(runId);
-      entry.reject(reason);
-    }
+    this._runCompletionWaiters.rejectAllExcept(runId => this._modelTerminalRunsPendingEventDrain.has(runId), reason);
   }
 
   /**
@@ -7411,14 +7386,13 @@ export class Session {
    * observe it.
    */
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
-    const waiter = this._runCompletionPromises.get(runId);
+    const waiter = this._runCompletionWaiters.promiseFor(runId);
     // Share this waiter through output collection and durable staging: the
     // runtime may already have cleared its output when another caller joins.
     const cached = this._completedRuns.get(runId);
     if (cached && !cached.ok) {
       this._runToolReceipts.delete(runId);
-      this._runCompletionPromises.delete(runId);
-      if (waiter) waiter.reject(cached.err);
+      this._runCompletionWaiters.fail(runId, cached.err);
       return;
     }
     let rawFull: FullOutput<unknown>;
@@ -7436,8 +7410,10 @@ export class Session {
       const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
-      this._runCompletionPromises.delete(runId);
-      if (waiter) waiter.reject(err);
+      // Remember before `fail`, as the base did here, while the other failure
+      // sites `fail` first. Either order is the same: `_rememberCompletedRun`
+      // never reads the waiters, and a rejection runs no continuation synchronously.
+      this._runCompletionWaiters.fail(runId, err);
       return;
     }
     this._abortedTerminalRunIds.delete(runId);
@@ -7451,16 +7427,16 @@ export class Session {
       full = this._materializeHarnessRunOutput(runId, rawFull);
       await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true });
       this._rememberCompletedRun(runId, { ok: true, full });
-      if (waiter) waiter.resolve(full);
+      this._runCompletionWaiters.resolveIfCurrent(runId, waiter, full);
     } catch (err) {
       this._runToolReceipts.delete(runId);
       // A staging failure is pending settlement of concrete output. Keep that
       // output available to a same-admission retry, which must stage it before
       // delivering completion or accounting usage.
       this._rememberCompletedRun(runId, full === undefined ? { ok: false, err } : { ok: true, full });
-      if (waiter) waiter.reject(err);
+      this._runCompletionWaiters.rejectIfCurrent(runId, waiter, err);
     } finally {
-      if (this._runCompletionPromises.get(runId) === waiter) this._runCompletionPromises.delete(runId);
+      this._runCompletionWaiters.dropIfCurrent(runId, waiter);
     }
   }
 
@@ -8556,7 +8532,7 @@ export class Session {
     // Signal-routed path: every non-structured message goes through
     // `agent.sendSignal()`. The long-lived thread subscription is the
     // single chunk consumer for this Session; the drain loop emits
-    // per-chunk harness events and resolves `_runCompletionPromises[runId]`
+    // per-chunk harness events and resolves the `runId` entry of `_runCompletionWaiters`
     // when the run terminates.
     //
     // On an idle thread the agent starts a fresh run with
@@ -9095,10 +9071,8 @@ export class Session {
       finishOwnedMessageTurn();
       rejectMessageAdmissionStart(failure);
       void completion.catch(() => {});
-      const waiter = this._runCompletionPromises.get(signal.runId);
-      this._runCompletionPromises.delete(signal.runId);
+      this._runCompletionWaiters.fail(signal.runId, failure);
       this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-      waiter?.reject(failure);
       if (
         admissionIdentity !== undefined &&
         terminalIdentity === undefined &&
@@ -9160,10 +9134,8 @@ export class Session {
             : err;
           finishOwnedMessageTurn();
           void completion.catch(() => {});
-          const waiter = this._runCompletionPromises.get(signal.runId);
-          this._runCompletionPromises.delete(signal.runId);
+          this._runCompletionWaiters.fail(signal.runId, failure);
           this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-          waiter?.reject(failure);
           if (
             admissionIdentity !== undefined &&
             terminalIdentity === undefined &&
@@ -9439,10 +9411,8 @@ export class Session {
       }
       if (!streamStarted) {
         void completion.catch(() => {});
-        const waiter = this._runCompletionPromises.get(signal.runId);
-        this._runCompletionPromises.delete(signal.runId);
+        this._runCompletionWaiters.fail(signal.runId, failure);
         this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-        waiter?.reject(failure);
       }
       if (
         admissionIdentity !== undefined &&
@@ -9763,7 +9733,7 @@ export class Session {
             }
             if (runId && !output && !retainedCompletedOutput) {
               const waitAbortController = new AbortController();
-              const completion = this._runCompletionPromises.get(runId)?.promise.then(
+              const completion = this._runCompletionWaiters.promiseFor(runId)?.then(
                 () => undefined,
                 () => undefined,
               );
@@ -10776,7 +10746,7 @@ export class Session {
 
   private _hasLiveMessageRun(agent: Agent, runId: string): boolean {
     return Boolean(
-      agent.getRunOutput(runId) || this._runCompletionPromises.has(runId) || this._completedRuns.has(runId),
+      agent.getRunOutput(runId) || this._runCompletionWaiters.has(runId) || this._completedRuns.has(runId),
     );
   }
 
@@ -12450,7 +12420,7 @@ export class Session {
             );
           })();
         }
-      } else if (this._runCompletionPromises.has(evidence.runId)) {
+      } else if (this._runCompletionWaiters.has(evidence.runId)) {
         const admission =
           evidence.admissionId !== undefined && evidence.admissionHash !== undefined
             ? {
@@ -12935,7 +12905,7 @@ export class Session {
     const isSignalRunActive = (runId: string) => {
       const pendingResume = this._record.pendingResume;
       return (
-        this._runCompletionPromises.has(runId) ||
+        this._runCompletionWaiters.has(runId) ||
         sub.activeRunId() === runId ||
         (pendingResume !== undefined &&
           pendingResume.originSignalId === signalAdmission?.identity.signalId &&
@@ -21865,7 +21835,7 @@ export class Session {
   /**
    * Synchronous teardown for the thread subscription on close/evict/delete.
    * Unsubscribes, marks the subscription closed, and rejects every outstanding entry in
-   * `_runCompletionPromises` so awaiters don't hang on a dead subscription.
+   * `_runCompletionWaiters` so awaiters don't hang on a dead subscription.
    * The drain loop's `for-await` exits naturally once `unsubscribe()` wakes it.
    */
   private _tearDownThreadSubscription(reason: unknown): void {
@@ -23305,7 +23275,7 @@ export class Session {
     if (
       this._record.pendingResume?.runId === runId ||
       this._messageAdmissionStarts.has(admissionId) ||
-      this._runCompletionPromises.has(runId) ||
+      this._runCompletionWaiters.has(runId) ||
       this._completedRuns.has(runId)
     ) {
       return 'reattach';
