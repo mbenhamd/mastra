@@ -2709,7 +2709,16 @@ export class Session {
     await this._runSummaryPersistence;
   }
 
-  /** Build the port the delegation driver reaches the session through. */
+  /**
+   * Build the port the delegation driver reaches the session through. Seven
+   * driver members stay on `Session`: `cancelSubagent`,
+   * `_cancelOwnedSubagentSessions`, `_planTaskDelegate`,
+   * `_driveDelegatedSubagent` and `_cancelAndCloseDelegatedChildForDeadline`
+   * reach private members of another `Session` (the child's `_cancelInternal`
+   * or `_record`); `_interruptOrphanedDelegationSignal` uses a module-private
+   * constant that another member also uses; `_internalSettlingDelegations` is
+   * a one-line getter.
+   */
   private _delegationDriverPort(): DelegationDriverSessionPort {
     const session = this;
     return {
@@ -2718,7 +2727,9 @@ export class Session {
       threadId: this.threadId,
       subagentDepth: this.subagentDepth,
       harness: this._harness,
-      storage: this._storage,
+      get storage() {
+        return session._storage;
+      },
       emitter: this._emitter,
       queueHead: this._queueHead,
       activeSubagents: this._activeSubagents,

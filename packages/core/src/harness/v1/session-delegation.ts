@@ -173,7 +173,10 @@ export const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
  * `Session` and is reached through this port: the claim, settling and
  * listener sets, the reconcile timers and flags, the in-flight execution
  * count, and the notice watches and `remind` starts that settlement-notice
- * delivery also reads.
+ * delivery also reads. Seven driver members stay on `Session` (see
+ * `_delegationDriverPort()`): five reach private members of another `Session`,
+ * one uses a module-private constant shared with another member, and one is a
+ * one-line getter.
  */
 export interface DelegationDriverSessionPort {
   readonly id: string;
