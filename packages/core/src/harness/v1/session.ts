@@ -6076,7 +6076,8 @@ export class Session {
     return { cancelled: Array.from(new Set(cancelled)), unavailable: Array.from(new Set(unavailable)) };
   }
 
-  private async _cancelInternal(
+  /** @internal The owning parent session cancels this child through it, from the delegation driver. */
+  async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
     /** PF-7473: re-proved inside the serialized cancel write; a throw aborts it. */
@@ -22065,7 +22066,7 @@ export class Session {
       child,
       taskBody,
       input.agentType,
-      child._record.modelId,
+      child.getRecord().modelId,
       delegationStartedAt,
       delegationDeadlineAt,
       delegationParentToolCallId,
@@ -22227,7 +22228,7 @@ export class Session {
         }
         // The first cancel request wins: a targeted cancel committed before the
         // deadline still settles `cancelled`, as restart reconcile would.
-        if (isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)) {
+        if (isParentRequestedSubagentCancel(child.getRecord().cancelRequest, this.id)) {
           outcome = 'cancelled';
           publicError = { ...DELEGATED_SUBAGENT_CANCELLED_ERROR };
         } else {
@@ -22252,15 +22253,15 @@ export class Session {
         // `tool-calls`, so requiring `stop` would reject every real first-call
         // terminal delivery.
         outcome =
-          child._record.cancelRequest === undefined && report !== undefined
+          child.getRecord().cancelRequest === undefined && report !== undefined
             ? report.outcome
-            : isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)
+            : isParentRequestedSubagentCancel(child.getRecord().cancelRequest, this.id)
               ? 'cancelled'
               : 'failed';
         // The framework stopped the child at its per-type budget before it
         // reported an outcome: a typed partial result, not a generic failure.
         budgetExhausted =
-          child._record.cancelRequest === undefined && report === undefined
+          child.getRecord().cancelRequest === undefined && report === undefined
             ? (parseHarnessSubagentBudgetExhausted(rawResult) ?? child._internalSubagentBudgetExhaustion())
             : undefined;
         if (budgetExhausted !== undefined) {
@@ -22268,7 +22269,7 @@ export class Session {
         } else if (outcome !== 'completed') {
           publicError = {
             code:
-              child._record.cancelRequest !== undefined
+              child.getRecord().cancelRequest !== undefined
                 ? 'harness.subagent_cancelled'
                 : (report?.issue?.code ??
                   ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
@@ -22277,7 +22278,7 @@ export class Session {
                       ? 'harness.subagent_outcome_missing'
                       : 'harness.subagent_incomplete')),
             message:
-              child._record.cancelRequest !== undefined
+              child.getRecord().cancelRequest !== undefined
                 ? 'The delegated subagent was cancelled before it completed'
                 : (report?.issue?.message ??
                   (report === undefined
@@ -22292,7 +22293,7 @@ export class Session {
       // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
       // Only this parent's own cancel of the child settles as skipped work, and
       // its error names the cancel rather than the rejection it caused.
-      const parentCancelled = isParentRequestedSubagentCancel(child._record.cancelRequest, this.id);
+      const parentCancelled = isParentRequestedSubagentCancel(child.getRecord().cancelRequest, this.id);
       outcome = parentCancelled ? 'cancelled' : 'failed';
       publicError = parentCancelled ? { ...DELEGATED_SUBAGENT_CANCELLED_ERROR } : projectHarnessPublicError(error);
     } finally {
@@ -22327,7 +22328,7 @@ export class Session {
         return;
       }
       const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary, {
-        childCancelRequest: child._record.cancelRequest,
+        childCancelRequest: child.getRecord().cancelRequest,
       });
       if (!reconciled) {
         settlement = 'not_reconciled';
