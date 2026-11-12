@@ -1282,14 +1282,21 @@ describe('ComposioToolProvider — listConnections', () => {
           if (query.accountType === 'ALL') {
             return { items: [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }], nextCursor: 'more' };
           }
-          if (!query.userIds) {
-            // Every SHARED account, regardless of owner.
-            return { items: [ownShared, sharedAccount('ca_admin', { allowAllUsers: true })], nextCursor: null };
-          }
+          // Composio's SHARED accounts and their owners; a userIds filter
+          // keeps only the accounts those users own.
+          const sharedByOwner = [
+            { owner: 'user_a', account: sharedAccount('ca_other_own') },
+            { owner: 'user_a', account: ownShared },
+            { owner: 'admin', account: sharedAccount('ca_admin', { allowAllUsers: true }) },
+          ];
+          const matching = sharedByOwner
+            .filter(entry => !query.userIds || query.userIds.includes(entry.owner))
+            .map(entry => entry.account);
+          if (!query.userIds) return { items: matching, nextCursor: null };
           // The bucket's own SHARED accounts, over two pages.
           return query.cursor === 'own_2'
-            ? { items: [ownShared], nextCursor: null }
-            : { items: [sharedAccount('ca_other_own')], nextCursor: 'own_2' };
+            ? { items: matching.slice(1), nextCursor: null }
+            : { items: matching.slice(0, 1), nextCursor: 'own_2' };
         },
       );
 
