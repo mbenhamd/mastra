@@ -36,10 +36,15 @@
  *   - Counting a run without marking it: `_recordTurnCompletion` adds usage
  *     and never consults or marks this ledger; its callers rely on the
  *     durable baselines of point 3.
- *   - Marking a run whose usage is not yet saved: three sites mark before the
- *     awaited save that carries the delta; if that save fails, the run stays
- *     marked though the counter did not move (`_finalizeResumedTurnOutcome`,
- *     `_maybeRecoverStaleQueuedResume`, `_finalizeCompletedQueuedTurn`).
+ *   - Marking a run before its usage is saved, which is safe where it happens
+ *     today: three sites (`_finalizeResumedTurnOutcome`,
+ *     `_maybeRecoverStaleQueuedResume`, `_finalizeCompletedQueuedTurn`) mark
+ *     the run before the awaited queue-marker save that carries the delta.
+ *     The counter moves only if that save succeeds; if it fails, the retry is
+ *     gated by the durable `postRunFinalizedAt` and recomputes the delta, so
+ *     the in-memory mark only stops a duplicate message path from counting.
+ *     A new site that marks early without such a durable retry would lose
+ *     the count.
  *   - `_recordMessageTurnCompletion` reads `isAccounted` but not `isReserved`.
  *   - Evicting a run while a capture holds its reservation: a second capture
  *     can then reserve and count the run again, and the first capture's
