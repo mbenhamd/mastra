@@ -83,3 +83,86 @@ export const UNSUSPENDED_AGENTIC_LOOP_STATUSES: ReadonlySet<string> = new Set([
   'bailed',
   'skipped',
 ]);
+
+/**
+ * §5.1 state-shape validation. Returns the dotted path (`$` for the root) of the
+ * FIRST value in a candidate `session.state` that cannot round-trip through
+ * `JSON.stringify`/`JSON.parse` as plain JSON, or `undefined` when the whole
+ * value is valid. Valid = `null`, string, boolean, FINITE number, plain array,
+ * or PLAIN object whose values are all valid.
+ *
+ * The check is descriptor-STRICT — it rejects everything `JSON.stringify` would
+ * silently DROP or TRANSFORM, not just obviously-bad scalar values:
+ *   - scalar: `undefined`, `function`, `symbol`, `bigint`, `NaN`/`Infinity`
+ *   - circular references
+ *   - non-plain objects (`Date`/`Map`/`Set`/`RegExp`/class instances) — these
+ *     either throw, serialize as `{}`, or transform via `toJSON`
+ *   - symbol-keyed properties (dropped by JSON)
+ *   - non-enumerable own properties (dropped by JSON)
+ *   - accessor properties (getters/setters) — not data, and a getter would run
+ *     arbitrary/throwing code; we reject WITHOUT invoking it
+ *   - arrays with non-index own properties or sparse holes (dropped / become null)
+ * Traversal is deterministic (`Reflect.ownKeys` order) so the reported path is
+ * stable, and a data value is only READ after its descriptor is confirmed safe.
+ */
+export function firstNonJsonStatePath(value: unknown, path: string, seen: Set<object>): string | undefined {
+  if (value === null) return undefined;
+  const t = typeof value;
+  if (t === 'string' || t === 'boolean') return undefined;
+  if (t === 'number') return Number.isFinite(value as number) ? undefined : path;
+  if (t === 'undefined' || t === 'function' || t === 'symbol' || t === 'bigint') return path;
+  if (t !== 'object') return path;
+  const obj = value as object;
+  if (seen.has(obj)) return path; // circular reference
+
+  if (Array.isArray(obj)) {
+    seen.add(obj);
+    const len = obj.length;
+    // Reject any own key that isn't a dense [0, len) index (extra props +
+    // accessors are dropped/transformed by JSON; `length` is intrinsic).
+    for (const key of Reflect.ownKeys(obj)) {
+      if (key === 'length') continue;
+      if (typeof key === 'symbol') return done(seen, obj, path);
+      // Only CANONICAL dense indices are real array elements; `"01"`/`"1.0"`/
+      // `""`/`" "` etc. coerce into range but are non-index props JSON drops.
+      const idx = Number(key);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= len || String(idx) !== key) return done(seen, obj, path);
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (desc === undefined || desc.get !== undefined || desc.set !== undefined) {
+        return done(seen, obj, path === '$' ? String(idx) : `${path}.${idx}`);
+      }
+    }
+    for (let i = 0; i < len; i++) {
+      const childPath = path === '$' ? String(i) : `${path}.${i}`;
+      if (!(i in obj)) return done(seen, obj, childPath); // sparse hole (JSON → null)
+      const r = firstNonJsonStatePath((obj as unknown[])[i], childPath, seen);
+      if (r !== undefined) return done(seen, obj, r);
+    }
+    seen.delete(obj);
+    return undefined;
+  }
+
+  // Only plain objects (Object.prototype or null prototype) are valid JSON
+  // containers; Date/Map/Set/class instances etc. are not round-trippable.
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) return path;
+  seen.add(obj);
+  for (const key of Reflect.ownKeys(obj)) {
+    if (typeof key === 'symbol') return done(seen, obj, path); // symbol-keyed prop (dropped)
+    const childPath = path === '$' ? key : `${path}.${key}`;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined) return done(seen, obj, childPath);
+    if (!desc.enumerable) return done(seen, obj, childPath); // dropped by JSON
+    if (desc.get !== undefined || desc.set !== undefined) return done(seen, obj, childPath); // accessor — never invoked
+    const r = firstNonJsonStatePath((obj as Record<string, unknown>)[key], childPath, seen);
+    if (r !== undefined) return done(seen, obj, r);
+  }
+  seen.delete(obj);
+  return undefined;
+}
+
+/** Pop the circular-tracking frame and return the offending path. */
+function done(seen: Set<object>, obj: object, path: string): string {
+  seen.delete(obj);
+  return path;
+}

@@ -39,7 +39,6 @@ import {
   AGENT_RESPONSE_RECOVERY_STEP,
 } from '../../agent/merge-execution-options';
 import type { AgentExecutionOptionComposers } from '../../agent/merge-execution-options';
-import { normalizeLogicalMessageIdentity } from '../../agent/message-list';
 import type { LogicalMessageIdentity } from '../../agent/message-list';
 import { createSignal } from '../../agent/signals';
 import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
@@ -140,8 +139,6 @@ import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import {
-  getTransformedToolPayload,
-  hasTransformedToolPayload,
   normalizeToolPayloadTransformPolicy,
   toolPayloadTransformPolicyPassesThrough,
 } from '../../tools/payload-transform';
@@ -285,8 +282,32 @@ import {
   waitForDelegationResult,
 } from './session-delegation';
 import type { DelegationDriverSessionPort } from './session-delegation';
-import { MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS, pendingResumeForDisplay } from './session-display';
+import {
+  harnessDisplayToolPayload,
+  MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS,
+  pendingResumeForDisplay,
+} from './session-display';
 import type { SessionDisplayState, SessionRunProjection } from './session-display';
+import {
+  createDeferred,
+  delay,
+  MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS,
+  MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS,
+  MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS,
+  MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS,
+  MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS,
+  ORPHANED_DISPATCH_RETRY_MS,
+  QUEUE_ACCEPTED_RECOVERY_STALE_MS,
+  QUEUE_POST_RUN_FINALIZATION_RETRY_MS,
+  throwIfAborted,
+} from './session-durable-wait';
+import type { Deferred } from './session-durable-wait';
+import {
+  HARNESS_RUN_INTERRUPTED_MESSAGE,
+  publicErrorProjectionToError,
+  QueuePostRunFinalizationPendingError,
+  ResumeRecoveryStaleError,
+} from './session-errors';
 import {
   clearSessionGoal,
   createGoalJudgeAgent,
@@ -328,16 +349,25 @@ import {
 } from './session-observational-memory';
 import type { ObservationalMemorySessionPort } from './session-observational-memory';
 import {
+  appendExpiredPendingInteraction,
   ASK_USER_TOOL_NAME,
   cancelledPendingAudit,
   compactJsonObject,
   DISCARD_PENDING_INTERACTION_KINDS,
   discardReceiptResult,
+  findDiscardReceiptIn,
+  getOwnRecordValue,
   MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH,
+  MAX_INBOX_RESPONSE_RECEIPTS,
+  pendingInteractionGenerationKey,
   preRegistrationSlot,
+  pruneInboxResponseReceipts,
+  receiptGenerationDiscarded,
+  receiptMatchesDiscardGeneration,
   SUBMIT_PLAN_TOOL_NAME,
 } from './session-pending-interactions';
 import type {
+  DiscardGeneration,
   InboxReceiptResponseOptions,
   LegacyInboxResponseOptions,
   PendingExpiryOutcome,
@@ -347,6 +377,7 @@ import {
   ASSISTANT_DRAFT_FLUSH_DELAY_MS,
   ASSISTANT_DRAFT_TEXT_DECODER,
   ASSISTANT_DRAFT_TEXT_ENCODER,
+  firstNonJsonStatePath,
   isPlainStateObject,
   MAX_ASSISTANT_DRAFT_FIELD_BYTES,
   MAX_PENDING_FAILED_EVENT_APPENDS,
@@ -381,9 +412,16 @@ import type {
   NoticeFenceSite,
   WakeReminderRowOrigin,
 } from './session-settlement-notices';
-import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
+import {
+  lineagedSignalAcceptanceError,
+  lineagedSignalRunMismatchError,
+  NativeSignalAcceptanceTimeoutError,
+  SIGNAL_DISPATCH_CLAIM_TTL_MS,
+  SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS,
+} from './session-signal-acceptance';
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
+import { RejectedTerminalRun, terminalFinalizerKey } from './session-terminal-finalizers';
 import { TerminalStagingLedger } from './session-terminal-staging-ledger';
 import { TerminalSubagentAnswers } from './session-terminal-subagent-answers';
 import {
@@ -393,10 +431,17 @@ import {
   UNGATED_HARNESS_BUILTIN_TOOL_IDS,
 } from './session-tool-surface';
 import {
+  assertCallerAdmissionIdNotReserved,
   assertCallerGrantKeyNotReserved,
   boundInboxReceiptResult,
+  cloneAttachmentMetadata,
+  clonePersistedRequestContext,
+  HARNESS_SESSION_MAX_STEPS,
   HarnessResponseRecoveryAlreadyPreparedError,
+  normalizeObservationalMemorySourceWriteGuard,
+  normalizeSessionLogicalMessageIdentity,
   normalizeSessionLogicalMessageInputIdentity,
+  sameObservationalMemorySourceWriteGuard,
 } from './session-turn-options';
 import type {
   HarnessExecutionHookErrorReporter,
@@ -503,64 +548,6 @@ type SignalSettlementAdmission = Pick<
   'admissionId' | 'admissionHash' | 'modeId' | 'modelId' | 'dispatch'
 >;
 
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason: unknown) => void;
-};
-
-/**
- * Validate and clone the native OM source-write fence at a Harness boundary.
- * The fence is an execution identity, so accepting a partial or malformed
- * value would turn a retry into an unbound write.
- */
-function normalizeObservationalMemorySourceWriteGuard(
-  value: ObservationalMemorySourceWriteGuard | undefined,
-  field: string,
-): ObservationalMemorySourceWriteGuard | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new HarnessValidationError(field, 'must be an object with recordId, threadId, and resourceId');
-  }
-  if (typeof value.recordId !== 'string' || value.recordId.length === 0) {
-    throw new HarnessValidationError(`${field}.recordId`, 'must be a non-empty string');
-  }
-  if (value.threadId !== null && typeof value.threadId !== 'string') {
-    throw new HarnessValidationError(`${field}.threadId`, 'must be a string or null');
-  }
-  if (typeof value.resourceId !== 'string' || value.resourceId.length === 0) {
-    throw new HarnessValidationError(`${field}.resourceId`, 'must be a non-empty string');
-  }
-  return {
-    recordId: value.recordId,
-    threadId: value.threadId,
-    resourceId: value.resourceId,
-  };
-}
-
-function sameObservationalMemorySourceWriteGuard(
-  left: ObservationalMemorySourceWriteGuard | undefined,
-  right: ObservationalMemorySourceWriteGuard | undefined,
-): boolean {
-  return (
-    left?.recordId === right?.recordId && left?.threadId === right?.threadId && left?.resourceId === right?.resourceId
-  );
-}
-
-function harnessDisplayToolPayload(
-  metadata: unknown,
-  phase: 'input-delta' | 'input-available' | 'output-available' | 'error',
-  fallback: unknown,
-): unknown {
-  const transformed = getTransformedToolPayload(metadata, 'display', phase);
-  if (hasTransformedToolPayload(transformed)) return transformed.transformed;
-  // A display policy may intentionally suppress a payload. Never fall back to
-  // the raw value in that case, because Harness events are durable/replayable
-  // display records rather than the model's private transcript.
-  if (transformed?.suppress === true) return { suppressed: true };
-  return fallback;
-}
-
 /**
  * §S4.1 — a pending event-ledger append awaiting transient-failure retry. Everything
  * except `storedAt` is captured at enqueue time; `storedAt` is stamped at write time so
@@ -611,21 +598,6 @@ type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
 /** Defensive cap on exact-once tool-terminal observations across resumed segments. */
 const MAX_EMITTED_TOOL_TERMINALS = 4096;
-/** One session can expose only one pending interaction at a time; keep a small
- * durable tail so late reconnect responses receive an exact expiry result
- * without allowing tombstones to grow without bound. */
-const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
-
-// Step ceiling for every harness-driven agent turn. Without an explicit
-// `maxSteps`, `agent.stream()`/`agent.generate()` fall back to the agent's
-// small default (5), and a tool-heavy turn terminates CLEANLY at the step
-// boundary with no synthesis text — live-diagnosed as a silent empty chat
-// turn: 5 tool-only steps, `finish-step`×5, `finish`, zero text deltas
-// (models that batch small parallel tool calls burn the budget fastest).
-// agent-controller.ts centralizes the same guarantee for CLI-harness runs
-// (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
-// budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
-const HARNESS_SESSION_MAX_STEPS = 1000;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -927,14 +899,6 @@ class HarnessOrdinaryStepBudgetExhaustedError extends Error {
   }
 }
 
-// §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
-// itself is idempotency state, so only a recent window is needed, and a stored
-// result must never carry provider payloads large enough to push the session
-// record past a storage document limit (Azure Responses reasoning blobs made a
-// single applied receipt ~400KB and broke every later saveSession with an
-// HTTP 500).
-const MAX_INBOX_RESPONSE_RECEIPTS = 64;
-
 function pruneQueueAdmissionReceipts(
   receipts: Record<string, QueueAdmissionReceipt>,
 ): Record<string, QueueAdmissionReceipt> {
@@ -944,48 +908,10 @@ function pruneQueueAdmissionReceipts(
   return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
 }
 
-function pruneInboxResponseReceipts(
-  receipts: Record<string, InboxResponseReceipt>,
-): Record<string, InboxResponseReceipt> {
-  const entries = Object.entries(receipts);
-  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
-  entries.sort((left, right) => (right[1].updatedAt ?? 0) - (left[1].updatedAt ?? 0));
-  // `discardPendingInteraction` receipts are the durable replay and
-  // crash-recovery record of a discard. Its claim converts the generation's
-  // other receipts in the same write (sharing its timestamp), so plain recency
-  // could evict it at once. Retain the newest few discard receipts first; the
-  // remaining slots keep the ordinary recency order.
-  const pinned = entries
-    .filter(([, receipt]) => receipt.discardedAt !== undefined)
-    .slice(0, MAX_RETAINED_DISCARD_RECEIPTS);
-  const pinnedIds = new Set(pinned.map(([responseId]) => responseId));
-  const rest = entries.filter(([responseId]) => !pinnedIds.has(responseId));
-  return Object.fromEntries([...pinned, ...rest.slice(0, MAX_INBOX_RESPONSE_RECEIPTS - pinned.length)]);
-}
-
-/** Discard receipts retained ahead of recency pruning (bounded). */
-const MAX_RETAINED_DISCARD_RECEIPTS = 8;
-
 /** Backoff before the one retry of a failed provider-result stage. */
 const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
-const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
-const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
-const MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS = 1_000;
-const MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS = 15_000;
-const SIGNAL_DISPATCH_CLAIM_TTL_MS = 30_000;
 const SIGNAL_DISPATCH_CLAIM_RENEW_MS = 10_000;
 const SIGNAL_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
-const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
-/**
- * Settlement message recorded (with `HARNESS_RUN_INTERRUPTED_ERROR_CODE`) when
- * recovery finds an admitted `message()` dispatch whose owner died mid-run.
- */
-const HARNESS_RUN_INTERRUPTED_MESSAGE =
-  'The run was interrupted when the process that owned it stopped; it was not re-run.';
-/** Back-off before recovery retries a turn whose settlement did not commit. */
-const ORPHANED_DISPATCH_RETRY_MS = 1_000;
 // Cap explicit extensions to one day so a lost worker cannot pin a session indefinitely.
 const MAX_LEASE_EXTENSION_MS = 24 * 60 * 60 * 1_000;
 
@@ -1022,89 +948,6 @@ function diffStateKeys(prev: unknown, next: unknown): string[] {
     changed.push(key);
   }
   return changed;
-}
-
-/**
- * §5.1 state-shape validation. Returns the dotted path (`$` for the root) of the
- * FIRST value in a candidate `session.state` that cannot round-trip through
- * `JSON.stringify`/`JSON.parse` as plain JSON, or `undefined` when the whole
- * value is valid. Valid = `null`, string, boolean, FINITE number, plain array,
- * or PLAIN object whose values are all valid.
- *
- * The check is descriptor-STRICT — it rejects everything `JSON.stringify` would
- * silently DROP or TRANSFORM, not just obviously-bad scalar values:
- *   - scalar: `undefined`, `function`, `symbol`, `bigint`, `NaN`/`Infinity`
- *   - circular references
- *   - non-plain objects (`Date`/`Map`/`Set`/`RegExp`/class instances) — these
- *     either throw, serialize as `{}`, or transform via `toJSON`
- *   - symbol-keyed properties (dropped by JSON)
- *   - non-enumerable own properties (dropped by JSON)
- *   - accessor properties (getters/setters) — not data, and a getter would run
- *     arbitrary/throwing code; we reject WITHOUT invoking it
- *   - arrays with non-index own properties or sparse holes (dropped / become null)
- * Traversal is deterministic (`Reflect.ownKeys` order) so the reported path is
- * stable, and a data value is only READ after its descriptor is confirmed safe.
- */
-function firstNonJsonStatePath(value: unknown, path: string, seen: Set<object>): string | undefined {
-  if (value === null) return undefined;
-  const t = typeof value;
-  if (t === 'string' || t === 'boolean') return undefined;
-  if (t === 'number') return Number.isFinite(value as number) ? undefined : path;
-  if (t === 'undefined' || t === 'function' || t === 'symbol' || t === 'bigint') return path;
-  if (t !== 'object') return path;
-  const obj = value as object;
-  if (seen.has(obj)) return path; // circular reference
-
-  if (Array.isArray(obj)) {
-    seen.add(obj);
-    const len = obj.length;
-    // Reject any own key that isn't a dense [0, len) index (extra props +
-    // accessors are dropped/transformed by JSON; `length` is intrinsic).
-    for (const key of Reflect.ownKeys(obj)) {
-      if (key === 'length') continue;
-      if (typeof key === 'symbol') return done(seen, obj, path);
-      // Only CANONICAL dense indices are real array elements; `"01"`/`"1.0"`/
-      // `""`/`" "` etc. coerce into range but are non-index props JSON drops.
-      const idx = Number(key);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= len || String(idx) !== key) return done(seen, obj, path);
-      const desc = Object.getOwnPropertyDescriptor(obj, key);
-      if (desc === undefined || desc.get !== undefined || desc.set !== undefined) {
-        return done(seen, obj, path === '$' ? String(idx) : `${path}.${idx}`);
-      }
-    }
-    for (let i = 0; i < len; i++) {
-      const childPath = path === '$' ? String(i) : `${path}.${i}`;
-      if (!(i in obj)) return done(seen, obj, childPath); // sparse hole (JSON → null)
-      const r = firstNonJsonStatePath((obj as unknown[])[i], childPath, seen);
-      if (r !== undefined) return done(seen, obj, r);
-    }
-    seen.delete(obj);
-    return undefined;
-  }
-
-  // Only plain objects (Object.prototype or null prototype) are valid JSON
-  // containers; Date/Map/Set/class instances etc. are not round-trippable.
-  const proto = Object.getPrototypeOf(obj);
-  if (proto !== Object.prototype && proto !== null) return path;
-  seen.add(obj);
-  for (const key of Reflect.ownKeys(obj)) {
-    if (typeof key === 'symbol') return done(seen, obj, path); // symbol-keyed prop (dropped)
-    const childPath = path === '$' ? key : `${path}.${key}`;
-    const desc = Object.getOwnPropertyDescriptor(obj, key);
-    if (desc === undefined) return done(seen, obj, childPath);
-    if (!desc.enumerable) return done(seen, obj, childPath); // dropped by JSON
-    if (desc.get !== undefined || desc.set !== undefined) return done(seen, obj, childPath); // accessor — never invoked
-    const r = firstNonJsonStatePath((obj as Record<string, unknown>)[key], childPath, seen);
-    if (r !== undefined) return done(seen, obj, r);
-  }
-  seen.delete(obj);
-  return undefined;
-}
-
-/** Pop the circular-tracking frame and return the offending path. */
-function done(seen: Set<object>, obj: object, path: string): string {
-  seen.delete(obj);
-  return path;
 }
 
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
@@ -1189,18 +1032,6 @@ function wakeTerminalFinalizer(finalizer: HarnessTerminalFinalizer): HarnessTerm
       return { projectionKind: projection.projectionKind, projectionId: projection.projectionId, payload };
     },
   };
-}
-
-/**
- * PF-7631: the `harness-wake:` namespace is minted only by the Harness, one
- * grant per settlement wake turn. Every public admission boundary shares the
- * session's admission-id space (message, queue and signal evidence), so each
- * rejects a caller id in it before any evidence is written.
- */
-function assertCallerAdmissionIdNotReserved(field: string, admissionId: string | undefined): void {
-  if (admissionId !== undefined && isHarnessWakeReservedKey(admissionId)) {
-    throw new HarnessValidationError(field, 'admissionId uses the Harness-reserved wake namespace');
-  }
 }
 
 /**
@@ -1354,25 +1185,6 @@ export interface SessionInternals {
    * including settle-only versions, commit a `HarnessWakeTerminalPayload`.
    */
   terminalWakeFinalizer?: HarnessTerminalFinalizer;
-}
-
-/** Lookup key for a terminal finalizer registration by its id and version. */
-export function terminalFinalizerKey(id: string, version: string): string {
-  return JSON.stringify([id, version]);
-}
-
-function normalizeSessionLogicalMessageIdentity(
-  value: LogicalMessageIdentity | undefined,
-  methodName: string,
-): LogicalMessageIdentity | undefined {
-  try {
-    return normalizeLogicalMessageIdentity(value);
-  } catch (error) {
-    throw new HarnessValidationError(
-      `${methodName}.logicalMessageIdentity`,
-      error instanceof Error ? error.message : 'must contain valid input and response ids',
-    );
-  }
 }
 
 /**
@@ -22884,43 +22696,6 @@ export class Session {
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
-  if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
-  return record[key];
-}
-
-function appendExpiredPendingInteraction(
-  current: SessionRecord['expiredPendingInteractions'],
-  receipt: NonNullable<SessionRecord['expiredPendingInteractions']>[string],
-): NonNullable<SessionRecord['expiredPendingInteractions']> {
-  const next = { ...(current ?? {}), [receipt.generationKey]: receipt };
-  const retained = Object.values(next)
-    .sort((a, b) => b.expiredAt - a.expiredAt || b.generationKey.localeCompare(a.generationKey))
-    .slice(0, MAX_EXPIRED_PENDING_INTERACTIONS);
-  return Object.fromEntries(retained.map(entry => [entry.generationKey, entry]));
-}
-
-function pendingInteractionGenerationKey(input: {
-  kind: PendingResume['kind'];
-  itemId?: string;
-  runId: string;
-  toolCallId: string;
-  requestedAt: number;
-}): string {
-  return sha256CanonicalJson([input.kind, input.itemId ?? null, input.runId, input.toolCallId, input.requestedAt]);
-}
-
-const DISCARDED_ERROR_CODE = 'harness.pending_interaction_discarded';
-
-/** The exact pending generation a discard is fenced to. */
-interface DiscardGeneration {
-  kind: PendingResume['kind'];
-  itemId: string;
-  runId: string;
-  toolCallId: string;
-  pendingRequestedAt: number;
-}
-
 function parseDiscardPendingInteractionOptions(opts: unknown): DiscardPendingInteractionOptions {
   if (opts === null || typeof opts !== 'object') {
     throw new HarnessValidationError('discardPendingInteraction()', 'options must be an object');
@@ -22981,36 +22756,6 @@ function pendingMatchesDiscardGeneration(pending: PendingResume, generation: Dis
   );
 }
 
-function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generation: DiscardGeneration): boolean {
-  return (
-    receipt.kind === generation.kind &&
-    receipt.itemId === generation.itemId &&
-    receipt.runId === generation.runId &&
-    receipt.toolCallId === generation.toolCallId &&
-    receipt.pendingRequestedAt === generation.pendingRequestedAt
-  );
-}
-
-/** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
-function receiptGenerationDiscarded(record: SessionRecord, receipt: InboxResponseReceipt): boolean {
-  return (
-    findDiscardReceiptIn(record, {
-      kind: receipt.kind,
-      itemId: receipt.itemId,
-      runId: receipt.runId,
-      toolCallId: receipt.toolCallId,
-      pendingRequestedAt: receipt.pendingRequestedAt,
-    }) !== undefined
-  );
-}
-
-/** The `discardPendingInteraction` receipt for `generation` in `record`, if any. */
-function findDiscardReceiptIn(record: SessionRecord, generation: DiscardGeneration): InboxResponseReceipt | undefined {
-  return Object.values(record.inboxResponseReceipts ?? {}).find(
-    receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
-  );
-}
-
 /**
  * The `discardPendingInteraction` receipt whose claim (`expiryStartedAt`) is
  * stamped on `pending` in `record`, if that generation is discard-owned.
@@ -23027,17 +22772,6 @@ function discardClaimReceipt(record: SessionRecord, pending: PendingResume): Inb
   return Object.values(record.inboxResponseReceipts ?? {}).find(
     receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
-}
-
-function publicErrorProjectionToError(error: { code: string; message: string }): Error {
-  // Every stored-error replay (receipts, signal/queue/message evidence)
-  // comes through here: a discard outcome replays as its typed error, even
-  // after the discard receipt itself has been pruned.
-  if (error.code === DISCARDED_ERROR_CODE) return HarnessPendingInteractionDiscardedError.fromProjection(error);
-  const projected = new Error(error.message);
-  projected.name = error.code;
-  (projected as Error & { code: string }).code = error.code;
-  return projected;
 }
 
 /**
@@ -23065,42 +22799,8 @@ function snapshotTerminalAdmissionSeed(seed: JsonValue): JsonValue {
   }
 }
 
-function cloneAttachmentMetadata(metadata: Record<string, JsonValue>): Record<string, JsonValue> {
-  return JSON.parse(JSON.stringify(metadata)) as Record<string, JsonValue>;
-}
-
 function clonePersistedAttachment(attachment: PersistedAttachment): PersistedAttachment {
   return JSON.parse(JSON.stringify(attachment)) as PersistedAttachment;
-}
-
-function clonePersistedRequestContext(input: PersistedRequestContextInput): PersistedRequestContextInput {
-  return JSON.parse(JSON.stringify(input)) as PersistedRequestContextInput;
-}
-
-function lineagedSignalAcceptanceError(path: string, action: string): HarnessConfigError {
-  if (action === 'discard' || action === 'deliver') {
-    return new HarnessConfigError(path, 'a full logical message identity cannot be delivered into an active run');
-  }
-  if (action === 'blocked') {
-    return new HarnessConfigError(path, 'a full logical message identity was blocked by a suspended thread');
-  }
-  return new HarnessConfigError(path, `a full logical message identity was not accepted (${action})`);
-}
-
-/**
- * A dispatched native terminal run whose own output rejected (a provider or
- * agent error). Settled through the terminal commit as a durable `failed`
- * result; the finalizer receives no output.
- */
-class RejectedTerminalRun {
-  constructor(readonly error: unknown) {}
-}
-
-function lineagedSignalRunMismatchError(path: string, expectedRunId: string, actualRunId: string): HarnessConfigError {
-  return new HarnessConfigError(
-    path,
-    `a full logical message identity was accepted by run "${actualRunId}" instead of its reserved run "${expectedRunId}"`,
-  );
 }
 
 class QueueRecoveryPendingError extends HarnessError {
@@ -23121,57 +22821,4 @@ class QueueRecoveryStaleError extends HarnessError {
     super('queued turn was accepted by the signal runtime but no live run or durable terminal result is available');
     this.name = 'harness.queue_recovery_stale';
   }
-}
-
-class ResumeRecoveryStaleError extends HarnessError {
-  readonly code = 'harness.resume_recovery_stale';
-
-  constructor() {
-    super('resume was admitted but no live owner or durable terminal result is available');
-    this.name = 'harness.resume_recovery_stale';
-  }
-}
-
-class QueuePostRunFinalizationPendingError extends HarnessError {
-  readonly code = 'harness.queue_post_run_finalization_pending';
-  readonly retryAt: number;
-  readonly cause: unknown;
-
-  constructor(retryAt: number, cause: unknown) {
-    super('queued turn completed and is waiting for post-run finalization to persist');
-    this.name = 'harness.queue_post_run_finalization_pending';
-    this.retryAt = retryAt;
-    this.cause = cause;
-  }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined, path: string): void {
-  if (!signal?.aborted) return;
-  throw signal.reason ?? new HarnessValidationError(path, 'operation aborted');
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal, 'delay()');
-  return new Promise((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout>;
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal?.reason ?? new HarnessValidationError('delay()', 'operation aborted'));
-    };
-    timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
 }

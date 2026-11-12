@@ -1,4 +1,5 @@
 import type { HarnessAssistantDraft, SessionRecord } from '../../storage/domains/harness';
+import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
 import type { PlanTaskSummary } from './plan-task-session';
 import type {
   ActiveSubagentState,
@@ -123,4 +124,18 @@ export function pendingResumeForDisplay(pending: SessionRecord['pendingResume'])
     ...displayPending,
     expiresAt: pending.expiresAt,
   };
+}
+
+export function harnessDisplayToolPayload(
+  metadata: unknown,
+  phase: 'input-delta' | 'input-available' | 'output-available' | 'error',
+  fallback: unknown,
+): unknown {
+  const transformed = getTransformedToolPayload(metadata, 'display', phase);
+  if (hasTransformedToolPayload(transformed)) return transformed.transformed;
+  // A display policy may intentionally suppress a payload. Never fall back to
+  // the raw value in that case, because Harness events are durable/replayable
+  // display records rather than the model's private transcript.
+  if (transformed?.suppress === true) return { suppressed: true };
+  return fallback;
 }
