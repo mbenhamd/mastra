@@ -13,27 +13,6 @@ function admission(status: HarnessTerminalAdmissionRecord['status']): HarnessTer
  * state. These pin what the staging, commit and session-save paths rely on.
  */
 describe('TerminalStagingLedger', () => {
-  it('forgetStaging keeps the native mark and forgetRun drops it', () => {
-    const ledger = new TerminalStagingLedger();
-    for (const runId of ['run-a', 'run-b']) {
-      ledger.admitNative(runId, admission('pending'));
-      ledger.markStagedAndAccounted(runId);
-    }
-
-    ledger.forgetStaging('run-a');
-    ledger.forgetRun('run-b');
-
-    for (const runId of ['run-a', 'run-b']) {
-      expect(ledger.isAccounted(runId)).toBe(false);
-      expect(ledger.isStaged(runId)).toBe(false);
-      expect(ledger.admissionFor(runId)).toBeUndefined();
-    }
-    expect(ledger.isNative('run-a')).toBe(true);
-    expect(ledger.isNative('run-b')).toBe(false);
-    expect(ledger.nativeRunCount).toBe(1);
-    expect(ledger.admissionCount).toBe(0);
-  });
-
   it('cachePending caches a loaded admission only while it is pending', () => {
     const ledger = new TerminalStagingLedger();
     const pending = admission('pending');

@@ -9,12 +9,8 @@
  * session ran inline before, in the same order; nothing here awaits, calls
  * back into the session, or adds a check the session did not make:
  *
- *   - `forgetStaging` and `forgetRun` both drop a run's fence, staged mark and
- *     cached admission; only `forgetRun` also drops the native-admission mark.
- *     The session's call sites differ in exactly that, and this ledger does not
- *     decide which one is right (`_interruptOrphanedMessageDispatch` and
- *     `_commitInterruptedTerminalHandoff` keep the native mark;
- *     `_runTerminalHandoffCommit` and `_cancelWakeTerminalAdmission` drop it).
+ *   - `forgetRun` is the one way a settled run leaves the ledger: it drops
+ *     the run's fence, staged mark, cached admission and native mark together.
  *   - The admissions map holds only pending admissions: `cachePending` caches
  *     only a pending one, and `admitNative` refuses (returns `false`, changing
  *     nothing) one that is not.
@@ -41,26 +37,13 @@ export class TerminalStagingLedger {
   private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
 
   /**
-   * Drop the run's usage fence, staged mark and cached admission; keep its
-   * native mark. The recovery paths use this when they settle a run whose
-   * dispatch was orphaned (`_interruptOrphanedMessageDispatch`,
-   * `_commitInterruptedTerminalHandoff`): usually a run another process
-   * admitted, so this process never marked it native. Of what it drops, only
-   * the usage fence is read again (every later session save persists it); the
-   * staged mark, the cached admission and the native mark are read only while
-   * the same run stages or completes here, which a settled run does not.
-   */
-  forgetStaging(runId: string): void {
-    this._terminalTokenAccountedRunIds.delete(runId);
-    this._stagedTerminalRunIds.delete(runId);
-    this._terminalStagingAdmissions.delete(runId);
-  }
-
-  /**
-   * Drop the run's usage fence, staged mark, cached admission and native mark.
-   * Used where this process settles a run it admitted natively itself: its
-   * terminal commit (`_runTerminalHandoffCommit`) or a wake grant it gave up
-   * before dispatch (`_cancelWakeTerminalAdmission`).
+   * Drop the run's usage fence, staged mark, cached admission and native mark,
+   * once the run is settled. The session calls it where this process commits a
+   * run's terminal handoff (`_runTerminalHandoffCommit`), cancels a wake grant
+   * before dispatch (`_cancelWakeTerminalAdmission`), and where recovery
+   * settles an orphaned dispatch (`_interruptOrphanedMessageDispatch`,
+   * `_commitInterruptedTerminalHandoff`), including a wake admission this
+   * process admitted and then released to recovery.
    */
   forgetRun(runId: string): void {
     this._terminalTokenAccountedRunIds.delete(runId);
