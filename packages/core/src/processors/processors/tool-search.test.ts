@@ -1864,6 +1864,26 @@ describe('ToolSearchProcessor', () => {
       expect(next.tools?.weather).toBeDefined();
     });
 
+    it('autoLoad text never defers a loaded tool to a later turn: it is callable on the next step of the same run', async () => {
+      const tools = { weather: createMockTool('weather', 'Get weather') };
+      const processor = new ToolSearchProcessor({ tools, storage: 'context', search: { autoLoad: true } });
+      const state: Record<string, unknown> = {};
+      const firstArgs = createMockArgs('thread-same-run', undefined, { state });
+      const addSystem = vi.spyOn(firstArgs.messageList, 'addSystem');
+      const first = await processor.processInputStep(firstArgs);
+      const searchResult = await first.tools?.search_tools!.execute?.({ query: 'weather' }, undefined);
+
+      const modelFacingText = [
+        ...addSystem.mock.calls.map(([value]) => String(value)),
+        first.tools?.search_tools?.description ?? '',
+        searchResult.message,
+      ];
+      for (const text of modelFacingText) expect(text).not.toMatch(/next turn/i);
+
+      const next = await processor.processInputStep(createMockArgs('thread-same-run', undefined, { state }));
+      expect(next.tools?.weather).toBeDefined();
+    });
+
     it('loads are append-only: the cached prefix keeps its order as tools are loaded', async () => {
       const processor = new ToolSearchProcessor({
         tools: {
