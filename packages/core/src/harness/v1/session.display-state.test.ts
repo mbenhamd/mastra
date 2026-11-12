@@ -961,6 +961,7 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
       vi.setSystemTime(1_000_000);
       const signal = await session.signal({ content: 'hi', admissionId: 'own-signal-run' });
       for (let i = 0; i < 100 && atAgentStart === undefined; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(order).toContain('text_delta');
       expect(order.indexOf('text_delta')).toBeLessThan(order.indexOf('agent_start'));
       expect(atAgentStart).toMatchObject({
         status: 'running',
