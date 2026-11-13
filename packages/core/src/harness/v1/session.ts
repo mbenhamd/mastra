@@ -350,6 +350,7 @@ import {
 } from './session-persistence';
 import { QueueHead } from './session-queue-head';
 import { ReplacementToolSurfaceSlot } from './session-replacement-tool-surface-slot';
+import { ResumeUsageFence } from './session-resume-usage-fence';
 import { RunCompletionWaiters } from './session-run-completion-waiters';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
@@ -1554,7 +1555,7 @@ export class Session {
    * the still-parked pending generation so the durable watermark advances
    * atomically with whichever write commits first.
    */
-  private _resumeUsageBaseline: { generationKey: string; runUsage: TokenUsage } | undefined;
+  private readonly _resumeUsageFence = new ResumeUsageFence();
   /** Span-summary — tail promise serializing best-effort durable run-summary writes (Slice B). */
   private _runSummaryPersistence: Promise<void> = Promise.resolve();
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
@@ -10327,14 +10328,10 @@ export class Session {
       const cached = this._completedRuns.get(runId);
       const finalizationAccounted = cached?.ok === true && cached.resumeAccountingKey === generationKey;
       if (cached?.ok === true) cached.resumeAccountingKey = generationKey;
-      if (
-        !queuedUsagePersisted &&
-        !finalizationAccounted &&
-        this._resumeUsageBaseline?.generationKey !== generationKey
-      ) {
+      if (!queuedUsagePersisted && !finalizationAccounted && !this._resumeUsageFence.isArmedFor(generationKey)) {
         this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
         const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
-        if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+        if (runUsage !== undefined) this._resumeUsageFence.arm(generationKey, runUsage);
       }
       this._messageTokenLedger.markAccounted(runId);
     } else {
@@ -17445,7 +17442,7 @@ export class Session {
       // baseline alongside it — a cold retry then computes a zero delta.
       const runUsage = this._tokenUsageDeltaFromFullOutput(full);
       if (runUsage !== undefined) {
-        this._resumeUsageBaseline = { generationKey: resumeAccountingKey, runUsage };
+        this._resumeUsageFence.arm(resumeAccountingKey, runUsage);
       }
     };
     let alreadyAccounted = false;
@@ -20894,19 +20891,19 @@ export class Session {
         // cumulative usage must also advance the parked pending's durable
         // baseline — otherwise a crash between the two leaves a stale
         // `accountedTokenUsage` and a cold settlement retry double-counts.
-        const resumeUsageBaseline = this._resumeUsageBaseline;
-        if (resumeUsageBaseline !== undefined && next.pendingResume !== undefined) {
+        if (next.pendingResume !== undefined) {
           const parked = next.pendingResume;
-          if (
+          const resumeUsageBaseline = this._resumeUsageFence.baselineFor(() =>
             pendingInteractionGenerationKey({
               kind: parked.kind,
               itemId: parked.itemId,
               runId: parked.runId,
               toolCallId: parked.toolCallId,
               requestedAt: parked.requestedAt,
-            }) === resumeUsageBaseline.generationKey
-          ) {
-            next.pendingResume = { ...parked, accountedTokenUsage: resumeUsageBaseline.runUsage };
+            }),
+          );
+          if (resumeUsageBaseline !== undefined) {
+            next.pendingResume = { ...parked, accountedTokenUsage: resumeUsageBaseline };
           }
         }
         // PF-2251 D2/D4 — receipts stay bounded on EVERY persisted record, at
@@ -21008,22 +21005,19 @@ export class Session {
           };
           // Disarm the resume-usage fence once the parked generation is gone
           // (pending-clearing flush) or was superseded by a different one.
-          const armedBaseline = this._resumeUsageBaseline;
-          if (armedBaseline !== undefined) {
-            const parkedNow = this._record.pendingResume;
-            if (
-              parkedNow === undefined ||
-              pendingInteractionGenerationKey({
-                kind: parkedNow.kind,
-                itemId: parkedNow.itemId,
-                runId: parkedNow.runId,
-                toolCallId: parkedNow.toolCallId,
-                requestedAt: parkedNow.requestedAt,
-              }) !== armedBaseline.generationKey
-            ) {
-              this._resumeUsageBaseline = undefined;
-            }
-          }
+          const parkedNow = this._record.pendingResume;
+          this._resumeUsageFence.disarmUnlessParked(
+            parkedNow === undefined
+              ? undefined
+              : () =>
+                  pendingInteractionGenerationKey({
+                    kind: parkedNow.kind,
+                    itemId: parkedNow.itemId,
+                    runId: parkedNow.runId,
+                    toolCallId: parkedNow.toolCallId,
+                    requestedAt: parkedNow.requestedAt,
+                  }),
+          );
           this._syncPendingInteractionExpiryTimer();
           // §10.2 state_changed — emit only when durable `session.state` actually
           // changed, after the record is committed so subscribers reading state
