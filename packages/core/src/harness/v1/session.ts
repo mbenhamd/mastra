@@ -210,7 +210,6 @@ import type {
   HarnessEventUnsubscribe,
   RunCompletedEvent,
   RunCompletedStatus,
-  RunToolRollup,
   SubagentEndEvent,
   SubagentReasoningDeltaEvent,
   SubagentAnswerDeltaEvent,
@@ -352,6 +351,8 @@ import { QueueHead } from './session-queue-head';
 import { ReplacementToolSurfaceSlot } from './session-replacement-tool-surface-slot';
 import { ResumeUsageFence } from './session-resume-usage-fence';
 import { RunCompletionWaiters } from './session-run-completion-waiters';
+import { RunSpanTracker } from './session-run-span-tracker';
+import type { RunSpanSnapshot } from './session-run-span-tracker';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
 import {
@@ -1279,13 +1280,13 @@ export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 
 
 // ---------------------------------------------------------------------------
 // Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
-// `run_completed` event + the durable run summary. An OpenRunSpan is opened at
+// `run_completed` event + the durable run summary. A run span is opened at
 // the run's FIRST `agent_start` (agent_start is emitted ONCE per run; a resume
 // reuses the runId and emits only the terminal `agent_end`) and finalized +
 // removed at the run's terminal `agent_end`. It is intentionally NOT cleared by
 // `_resetTurnTracking`/`_endTurn`, so it survives an in-process suspend/resume
 // and the duration spans the whole run (including any HITL wait). A run whose
-// original start was lost to a process restart has NO OpenRunSpan when its
+// original start was lost to a process restart has NO open span when its
 // terminal fires post-restart → the summary is marked `reconstructed` and omits
 // the start/duration/rollup rather than publishing falsely precise metrics.
 // ---------------------------------------------------------------------------
@@ -1302,23 +1303,6 @@ interface RunSpanIdentity {
   operationKind?: HarnessRunOperationRefKind;
 }
 
-/** @internal — in-memory accumulator for one in-flight run's span + tool rollup. */
-interface OpenRunSpan {
-  startedAt: number;
-  identity: RunSpanIdentity;
-  /** Per-tool-call start times (runId-scoped), used to compute `tool_end.durationMs` even across an in-process suspend. */
-  activeToolStarts: Map<string, { toolName: string; startedAt: number }>;
-  rollup: {
-    count: number;
-    errors: number;
-    totalDurationMs: number;
-    maxDurationMs: number;
-    perTool: Map<string, { count: number; errors: number; totalDurationMs: number }>;
-  };
-}
-
-/** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
-const MAX_FINALIZED_RUN_IDS = 4096;
 /** Bounded safe receipt evidence retained per run for subagent settlement. */
 const MAX_HARNESS_RUN_TOOL_RECEIPTS = 256;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES = 64 * 1024;
@@ -1525,14 +1509,13 @@ export class Session {
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
-   * Span-summary — in-flight run span accumulators, keyed by runId. Opened at a
-   * run's first `agent_start`, finalized + deleted at its terminal `agent_end`.
-   * NOT reset per turn, so it survives an in-process suspend/resume. See
-   * {@link OpenRunSpan}.
+   * Span-summary — the open run spans and the finalized runs (PF-8738). A
+   * span opens at a run's first `agent_start` and closes when the run is
+   * finalized at its terminal `agent_end`; it is NOT reset per turn, so it
+   * survives an in-process suspend/resume. A run is finalized at most once
+   * (within a bounded memory). See {@link RunSpanTracker}.
    */
-  private readonly _openRuns = new Map<string, OpenRunSpan>();
-  /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
-  private readonly _finalizedRunIds = new Set<string>();
+  private readonly _runSpans = new RunSpanTracker<RunSpanIdentity>();
   /** Message result-evidence writes in flight (awaited by close before its pending check). */
   private readonly _resultEvidenceWrites = new Set<Promise<unknown>>();
   /** Orphaned-dispatch recovery in flight (one per session at a time). */
@@ -2476,6 +2459,22 @@ export class Session {
     return emitted;
   }
 
+  /**
+   * Emit a recovered run's terminal `agent_end`, then suppress the next live
+   * terminal `agent_end` for that run: {@link _emitTurnEvent} consumes the
+   * suppression. The suppression is lifted first, so this emission itself is
+   * never swallowed.
+   */
+  private _emitRecoveredAgentEnd(
+    runId: string,
+    finishReason: 'complete' | 'aborted' | 'error' | 'suspended',
+    usage: TokenUsage,
+  ): void {
+    this._recoveredAgentEndRunIds.delete(runId);
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
+    this._recoveredAgentEndRunIds.add(runId);
+  }
+
   private _toolTerminalKey(runId: string, toolCallId: string): string {
     return `${runId}:${toolCallId}`;
   }
@@ -2520,10 +2519,7 @@ export class Session {
     const type = (event as { type?: string }).type;
     if (type === 'tool_start') {
       const e = event as { runId?: string; toolCallId?: string; toolName?: string };
-      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
-      if (span && e.toolCallId !== undefined) {
-        span.activeToolStarts.set(e.toolCallId, { toolName: e.toolName ?? 'unknown', startedAt: Date.now() });
-      }
+      this._runSpans.toolStarted(e.runId, e.toolCallId, e.toolName);
       return event;
     }
     if (type === 'tool_end') {
@@ -2534,27 +2530,7 @@ export class Session {
         isError?: boolean;
         durationMs?: number;
       };
-      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
-      if (!span) return event;
-      const toolName = e.toolName ?? 'unknown';
-      const start = e.toolCallId !== undefined ? span.activeToolStarts.get(e.toolCallId) : undefined;
-      let durationMs: number | undefined = e.durationMs;
-      if (durationMs === undefined && start) durationMs = Math.max(0, Date.now() - start.startedAt);
-      if (e.toolCallId !== undefined) span.activeToolStarts.delete(e.toolCallId);
-      // Fold into the rollup (count every emitted terminal; duration only when known).
-      const r = span.rollup;
-      r.count += 1;
-      const isError = e.isError === true;
-      if (isError) r.errors += 1;
-      if (durationMs !== undefined) {
-        r.totalDurationMs += durationMs;
-        if (durationMs > r.maxDurationMs) r.maxDurationMs = durationMs;
-      }
-      const per = r.perTool.get(toolName) ?? { count: 0, errors: 0, totalDurationMs: 0 };
-      per.count += 1;
-      if (isError) per.errors += 1;
-      if (durationMs !== undefined) per.totalDurationMs += durationMs;
-      r.perTool.set(toolName, per);
+      const durationMs = this._runSpans.toolEnded(e.runId, e);
       return durationMs !== undefined ? ({ ...event, durationMs } as EmitInput) : event;
     }
     return event;
@@ -2568,13 +2544,8 @@ export class Session {
   private _trackRunSpanPostEmit(event: HarnessEvent): void {
     if (event.type === 'agent_start') {
       const runId = event.runId;
-      if (runId !== undefined && !this._openRuns.has(runId)) {
-        this._openRuns.set(runId, {
-          startedAt: this._currentRunStartedAt ?? event.timestamp,
-          identity: this._captureRunSpanIdentity(),
-          activeToolStarts: new Map(),
-          rollup: { count: 0, errors: 0, totalDurationMs: 0, maxDurationMs: 0, perTool: new Map() },
-        });
+      if (runId !== undefined) {
+        this._runSpans.open(runId, this._currentRunStartedAt ?? event.timestamp, () => this._captureRunSpanIdentity());
       }
       return;
     }
@@ -2602,21 +2573,21 @@ export class Session {
 
   /**
    * Emit the canonical `run_completed` event for a terminal run, exactly once.
-   * A run with a live {@link OpenRunSpan} reports trusted start/duration/rollup;
+   * A run with an open span reports trusted start/duration/rollup;
    * a run whose start was lost to a restart is marked `reconstructed` and omits
    * those (usage + identity + finishReason are still reported).
    */
   private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
-    if (this._finalizedRunIds.has(runId)) return;
-    this._markRunFinalized(runId);
+    const finalized = this._runSpans.finalize(runId);
+    if (finalized === undefined) return;
     const { event, status, reconstructed } = this._buildRunCompletedEvent(
       runId,
       finishReason,
       usage,
       completedAt,
+      finalized.span,
       undefined,
     );
-    this._openRuns.delete(runId);
 
     // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
     // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
@@ -2626,24 +2597,19 @@ export class Session {
     this._persistRunSummary(event, status, reconstructed);
   }
 
-  private _markRunFinalized(runId: string): void {
-    if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
-    this._finalizedRunIds.add(runId);
-  }
-
   /** Build a run's canonical `run_completed` event from its span or recovered identity. */
   private _buildRunCompletedEvent(
     runId: string,
     finishReason: string,
     usage: TokenUsage,
     completedAt: number,
+    span: RunSpanSnapshot<RunSpanIdentity> | undefined,
     recoveredIdentity: RunSpanIdentity | undefined,
   ): {
     event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>;
     status: RunCompletedStatus;
     reconstructed: boolean;
   } {
-    const span = this._openRuns.get(runId);
     const reconstructed = span === undefined;
     const identity = span?.identity ?? recoveredIdentity ?? this._captureRunSpanIdentity();
     const status: RunCompletedStatus =
@@ -2670,24 +2636,9 @@ export class Session {
     } else {
       event.startedAt = span!.startedAt;
       event.durationMs = Math.max(0, completedAt - span!.startedAt);
-      event.toolRollup = this._materializeToolRollup(span!.rollup);
+      event.toolRollup = span!.toolRollup;
     }
     return { event, status, reconstructed };
-  }
-
-  /** Convert the in-memory rollup (Maps) into the JSON-safe {@link RunToolRollup}. */
-  private _materializeToolRollup(rollup: OpenRunSpan['rollup']): RunToolRollup {
-    const perTool: RunToolRollup['perTool'] = {};
-    for (const [name, v] of rollup.perTool) {
-      perTool[name] = { count: v.count, errors: v.errors, totalDurationMs: v.totalDurationMs };
-    }
-    return {
-      count: rollup.count,
-      errors: rollup.errors,
-      totalDurationMs: rollup.totalDurationMs,
-      maxDurationMs: rollup.maxDurationMs,
-      perTool,
-    };
   }
 
   /**
@@ -4146,15 +4097,22 @@ export class Session {
           ? 'error'
           : 'aborted';
     const usage = this._runUsage(full);
-    const { event, status, reconstructed } = this._buildRunCompletedEvent(runId, finishReason, usage, Date.now(), {
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
-      modeId,
-      modelId: evidence.modelId ?? this._record.modelId,
-      operationKind: 'signal',
-      ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
-    });
+    const { event, status, reconstructed } = this._buildRunCompletedEvent(
+      runId,
+      finishReason,
+      usage,
+      Date.now(),
+      this._runSpans.snapshot(runId),
+      {
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
+        modeId,
+        modelId: evidence.modelId ?? this._record.modelId,
+        operationKind: 'signal',
+        ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
+      },
+    );
     const summary = this._buildRunSummary(event, status, reconstructed);
     // Session-fenced: storage refuses the summary of a deleted session.
     let saved: HarnessRunSummary | null;
@@ -4171,16 +4129,13 @@ export class Session {
     if (saved.completedAt !== summary.completedAt || saved.reconstructed !== summary.reconstructed) return;
     // A live owner (or an earlier attempt here) already emitted this run's
     // completion; only its summary was missing.
-    if (this._finalizedRunIds.has(runId)) return;
+    if (this._runSpans.isFinalized(runId)) return;
     this._assertNotDeleted();
     // The summary is durable; emit agent_end without finalizing again, then
     // the matching run_completed. Only a later live terminal agent_end for
     // this run is suppressed.
-    this._markRunFinalized(runId);
-    this._recoveredAgentEndRunIds.delete(runId);
-    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
-    this._recoveredAgentEndRunIds.add(runId);
-    this._openRuns.delete(runId);
+    this._runSpans.finalize(runId);
+    this._emitRecoveredAgentEnd(runId, finishReason, usage);
     this._emitTurnEvent(event as EmitInput);
   }
 
@@ -17690,17 +17645,17 @@ export class Session {
     // If the resumed run did NOT suspend again, the turn is complete from
     // the harness's perspective. Surface that to subscribers via agent_end.
     // A settlement retry (committed admission, failed post-commit bookkeeping)
-    // re-enters this helper — `_finalizedRunIds` is populated synchronously by
-    // the first emit, so the guard keeps the terminal event exactly-once while
+    // re-enters this helper — the run is finalized synchronously by the first
+    // emit, so the guard keeps the terminal event exactly-once while
     // the steps below still re-run their own idempotent bookkeeping.
     if (full.finishReason !== 'suspended') {
-      // `_finalizedRunIds` is populated synchronously by `_emitAgentEnd`, so
+      // The run is finalized synchronously by `_emitAgentEnd`, so
       // the flag captured here is true for exactly one caller per completed
       // run. Goal judging joins the same once-scope: a settlement retry that
       // re-enters this helper must not invoke `_runGoalJudge` again — a second
       // 'continue' verdict would consume additional goal budget and enqueue a
       // duplicate continuation.
-      const firstFinalize = full.runId === undefined || !this._finalizedRunIds.has(full.runId);
+      const firstFinalize = full.runId === undefined || !this._runSpans.isFinalized(full.runId);
       if (firstFinalize) {
         this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
       }
@@ -21714,9 +21669,8 @@ export class Session {
   private _clearTeardownCollections(): void {
     // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
     // that will never reach a terminal here) so they cannot accumulate.
-    this._openRuns.clear();
+    this._runSpans.dispose();
     this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
     this._replacementToolSurface.dispose();
   }
 
