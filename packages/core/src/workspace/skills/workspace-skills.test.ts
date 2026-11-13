@@ -669,16 +669,15 @@ user-invocable: false
       await skills.list();
 
       const statMock = filesystem.stat as ReturnType<typeof vi.fn>;
+      const originalStat = statMock.getMockImplementation()!;
+      // The mocked filesystem does not change between the measured walks.
+      statMock.mockImplementation(async (path: string) => ({
+        ...(await originalStat(path)),
+        modifiedAt: new Date(0),
+      }));
       const originalCooldown = WorkspaceSkillsImpl.STALENESS_CHECK_COOLDOWN;
       try {
         (WorkspaceSkillsImpl as any).STALENESS_CHECK_COOLDOWN = 0;
-
-        // Settle any mtime/discovery-time tie left over from initial discovery:
-        // mock entries and #lastDiscoveryTime can land in the same millisecond,
-        // making the first walk short-circuit as stale (1 stat) while the next
-        // walk runs in full (3 stats). One refresh here guarantees both
-        // measurements below observe identical non-stale walks.
-        await skills.maybeRefresh();
 
         const before = statMock.mock.calls.length;
         await Promise.all([skills.maybeRefresh(), skills.maybeRefresh()]);
