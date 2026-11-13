@@ -10,10 +10,8 @@
 import { MessageList } from '@mastra/core/agent';
 import type { MastraDBMessage } from '@mastra/core/agent';
 import { MessageHistory } from '@mastra/core/processors';
-import {
-  ObservationalMemorySourceWriteConflictError,
-  type ObservationalMemorySourceWriteGuard,
-} from '@mastra/core/storage';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
+import type { ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 import { describe, it, expect, vi } from 'vitest';
 
 import { ObservationStrategy } from '../observation-strategies/base';

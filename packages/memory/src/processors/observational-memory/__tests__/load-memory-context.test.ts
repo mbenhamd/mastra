@@ -1,6 +1,8 @@
 import { MessageList } from '@mastra/core/agent';
 import type { MastraDBMessage } from '@mastra/core/agent';
+import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
+import { Memory } from '../../../index';
 import { loadMemoryContextMessages } from '../observation-turn/load-memory-context';
 import type { MemoryContextProvider } from '../processor';
 
@@ -29,6 +31,76 @@ function context(messages: MastraDBMessage[]) {
 }
 
 describe('22573 history loader', () => {
+  it('keeps saved plan-revision feedback in a resumed run while filtering it from the next run', async () => {
+    const memory = new Memory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: { toolCallFilter: { exclude: ['submit_plan'], preserveModelOutputFor: [] } },
+      },
+    });
+    await memory.createThread({ threadId: 'thread', resourceId: 'resource' });
+    const revision = message('revision', 'assistant', 'I will revise the plan.', 2);
+    revision.content.parts.push({
+      type: 'tool-invocation',
+      toolInvocation: {
+        state: 'result',
+        toolCallId: 'rejected-plan',
+        toolName: 'submit_plan',
+        args: { plan: 'Compare the first and second papers.' },
+        result: { approved: false, revision: 'Replace the second paper with the blue-light paper; keep the first.' },
+      },
+    });
+    const list = new MessageList({ threadId: 'thread', resourceId: 'resource' });
+    list.add(message('request', 'user', 'Compare these papers.', 1), 'input');
+    list.add(revision, 'response');
+
+    // PF-8921: suspension flushes and acknowledges the save before serializing the run.
+    const save = list.snapshotUnsavedMessages({ detached: true });
+    await memory.persistMessages(save.messages);
+    save.commit();
+    const resumed = new MessageList().deserialize(structuredClone(list.serialize()));
+    await loadMemoryContextMessages({ memory, messageList: resumed, threadId: 'thread', resourceId: 'resource' });
+
+    expect(resumed.get.all.db().map(message => message.id)).toEqual(['request', 'revision']);
+    const prompt = await resumed.get.all.aiV5.llmPrompt();
+    expect(prompt).toMatchObject([
+      { role: 'user' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'I will revise the plan.' },
+          { type: 'tool-call', toolCallId: 'rejected-plan', toolName: 'submit_plan' },
+        ],
+      },
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: 'rejected-plan',
+            toolName: 'submit_plan',
+            output: {
+              type: 'json',
+              value: {
+                approved: false,
+                revision: 'Replace the second paper with the blue-light paper; keep the first.',
+              },
+            },
+          },
+        ],
+      },
+    ]);
+
+    // A new run has history, not the previous run's response provenance.
+    const nextRun = new MessageList().add(structuredClone(resumed.get.all.db()), 'memory');
+    await loadMemoryContextMessages({ memory, messageList: nextRun, threadId: 'thread', resourceId: 'resource' });
+    expect(await nextRun.get.all.aiV5.llmPrompt()).toMatchObject([
+      { role: 'user' },
+      { role: 'assistant', content: [{ type: 'text', text: 'I will revise the plan.' }] },
+    ]);
+    expect(await nextRun.getRunResponseMessages()).toEqual([]);
+  });
+
   it('preserves incoming same-ID client results without duplicating messages', async () => {
     const pending = message('assistant', 'assistant', '', 2);
     pending.content.parts = [

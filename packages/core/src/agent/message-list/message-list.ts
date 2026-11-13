@@ -3381,11 +3381,12 @@ export class MessageList {
     // the client-supplied content from the prompt. Fold the stored copy into the live one and
     // keep the live message's source so it stays visible to output processing. A client-sent
     // assistant message contributes only tool outcomes for calls the stored copy has pending.
+    // Saving before suspension clears unsaved responses, not their current-run ownership.
     const replacementTargetSource: MessageSource | undefined = !replacementTarget
       ? undefined
       : this.stateManager.isUserMessage(replacementTarget)
         ? 'input'
-        : this.stateManager.isResponseMessage(replacementTarget)
+        : this.newResponseMessagesPersisted.has(replacementTarget)
           ? 'response'
           : this.stateManager.isContextMessage(replacementTarget)
             ? 'context'
