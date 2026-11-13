@@ -1,8 +1,12 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { MessageList } from '../../agent/message-list';
 import type { MastraDBMessage } from '../../agent/message-list';
 import { RequestContext, MASTRA_THREAD_ID_KEY } from '../../request-context';
+import { Workspace, LocalSkillSource } from '../../workspace';
 import type { ProcessInputStepArgs } from '../index';
 import { SkillSearchProcessor } from './skill-search';
 
@@ -139,6 +143,129 @@ function createMockArgs(
     }) as any,
   } as ProcessInputStepArgs;
 }
+
+describe.each([true, false])('SkillSearchProcessor with native Workspace search (bm25: %s)', bm25 => {
+  let directory: string;
+  let workspace: Workspace;
+  let processors: SkillSearchProcessor[];
+  const amberInstructions = Array(10).fill('sharedtoken').join(' ');
+  const blueInstructions = 'sharedtoken filler';
+
+  beforeEach(async () => {
+    processors = [];
+    directory = await mkdtemp(join(tmpdir(), 'mastra-distinct-skills-'));
+    const amber = join(directory, 'amber-guide');
+    const blue = join(directory, 'blue-guide');
+    const foreign = join(directory, 'foreign-guide');
+    await mkdir(join(amber, 'references'), { recursive: true });
+    await mkdir(blue);
+    await mkdir(foreign);
+    await Promise.all([
+      writeFile(join(amber, 'SKILL.md'), `---\nname: amber-guide\ndescription: First guide\n---\n${amberInstructions}`),
+      writeFile(join(amber, 'references/one.md'), amberInstructions),
+      writeFile(join(amber, 'references/two.md'), amberInstructions),
+      writeFile(join(blue, 'SKILL.md'), `---\nname: blue-guide\ndescription: Second guide\n---\n${blueInstructions}`),
+      writeFile(join(foreign, 'SKILL.md'), '---\nname: foreign-guide\ndescription: Other scope\n---\nsharedtoken'),
+    ]);
+    workspace = new Workspace({
+      bm25,
+      skillSource: new LocalSkillSource(),
+      skills: ({ requestContext }) => {
+        if (requestContext?.get('scope') === 'foreign') return [foreign];
+        if (requestContext?.get('scope') === 'restricted') return [amber];
+        return [amber, blue];
+      },
+      tools: { enabled: false },
+    });
+  });
+
+  afterEach(async () => {
+    for (const processor of processors) processor.dispose();
+    await workspace?.destroy();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('loads distinct skills once when one skill has enough matching documents to fill topK', async () => {
+    const firstArgs = createMockArgs('distinct-skills');
+    const skills = await workspace.skills!.getScoped!({ requestContext: firstArgs.requestContext });
+    const documents = await skills.search('sharedtoken', { topK: 3, minScore: 0.1 });
+    expect(documents.map(result => result.skillName)).toEqual(['amber-guide', 'amber-guide', 'amber-guide']);
+    expect(new Set(documents.map(result => result.source))).toEqual(
+      new Set(['SKILL.md', 'references/one.md', 'references/two.md']),
+    );
+
+    const processor = new SkillSearchProcessor({
+      workspace,
+      storage: 'context',
+      blockingRefresh: true,
+      search: { topK: 3, minScore: 0.1, autoLoad: true },
+    });
+    processors.push(processor);
+    const first = await processor.processInputStep(firstArgs);
+    const result = await first.tools?.search_skills!.execute?.({ query: 'sharedtoken' }, undefined);
+
+    expect(result.results.map((skill: { name: string }) => skill.name)).toEqual(['amber-guide', 'blue-guide']);
+    expect(result.activation.loaded.map((skill: { skillName: string }) => skill.skillName)).toEqual([
+      'amber-guide',
+      'blue-guide',
+    ]);
+
+    const nextArgs = createMockArgs('distinct-skills', [createSearchSkillsResultMessage(result)]);
+    await processor.processInputStep(nextArgs);
+    const instructions = nextArgs.messageList.getAllSystemMessages().map(message => message.content);
+    expect(
+      instructions.filter(content => typeof content === 'string' && content.includes(amberInstructions)),
+    ).toHaveLength(1);
+    expect(
+      instructions.filter(content => typeof content === 'string' && content.includes(blueInstructions)),
+    ).toHaveLength(1);
+  });
+
+  it('does not fill distinct skill slots from excluded names, scopes or indexed scores', async () => {
+    const foreignContext = new RequestContext();
+    foreignContext.set('scope', 'foreign');
+    const foreignSkills = await workspace.skills!.getScoped!({ requestContext: foreignContext });
+    await foreignSkills.list();
+    await workspace.skills!.list();
+
+    const named = await workspace.skills!.search('sharedtoken', {
+      topK: 3,
+      distinctSkills: true,
+      skillNames: ['blue-guide'],
+      includeReferences: false,
+    });
+    expect(named.map(result => [result.skillName, result.source])).toEqual([['blue-guide', 'SKILL.md']]);
+
+    const processor = new SkillSearchProcessor({
+      workspace,
+      storage: 'context',
+      blockingRefresh: true,
+      search: { topK: 3, autoLoad: true },
+    });
+    processors.push(processor);
+    const args = createMockArgs('restricted-skills');
+    args.requestContext.set('scope', 'restricted');
+    const step = await processor.processInputStep(args);
+    const result = await step.tools?.search_skills!.execute?.({ query: 'sharedtoken' }, undefined);
+    expect(result.results.map((skill: { name: string }) => skill.name)).toEqual(['amber-guide']);
+    expect(result.activation.loaded.map((skill: { skillName: string }) => skill.skillName)).toEqual(['amber-guide']);
+
+    // The substring fallback has no relevance threshold; indexed searches do.
+    if (bm25) {
+      const strictProcessor = new SkillSearchProcessor({
+        workspace,
+        storage: 'context',
+        blockingRefresh: true,
+        search: { topK: 3, minScore: Number.MAX_SAFE_INTEGER, autoLoad: true },
+      });
+      processors.push(strictProcessor);
+      const strictStep = await strictProcessor.processInputStep(createMockArgs('threshold-skills'));
+      const strictResult = await strictStep.tools?.search_skills!.execute?.({ query: 'sharedtoken' }, undefined);
+      expect(strictResult.results).toEqual([]);
+      expect(strictResult.activation).toBeUndefined();
+    }
+  });
+});
 
 describe('SkillSearchProcessor', () => {
   const testSkills = [

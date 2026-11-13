@@ -121,6 +121,15 @@ When [BM25 or vector search](/docs/sandbox/search) is configured alongside skill
 
 Without BM25 or vector search, `skill_search` falls back to case-insensitive text matching across the instructions and references. This keeps skill search available without a separate search configuration, while indexed search provides ranking and semantic retrieval for larger collections.
 
+By default, `workspace.skills.search()` returns matching documents, so one skill can occupy several result slots. Set `distinctSkills: true` to return at most one matching document per skill before applying `topK`. Results keep their search order and source file. [SkillSearchProcessor](/reference/processors/skill-search-processor) uses this option so its `search.topK` counts distinct skills.
+
+```typescript
+const results = await workspace.skills.search('code review', {
+  topK: 3,
+  distinctSkills: true,
+})
+```
+
 ## Dynamic skill paths
 
 Pass a synchronous or asynchronous function when the available paths depend on request context. This example adds development skills for users with the `developer` role:

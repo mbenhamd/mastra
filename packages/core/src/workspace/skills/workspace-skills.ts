@@ -734,10 +734,10 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
   async #indexedSearch(query: string, options: SkillSearchOptions): Promise<SkillSearchResult[]> {
     await this.#readmitIndexIfReleased();
 
-    const { topK = 5, minScore, skillNames, includeReferences = true, mode } = options;
+    const { topK = 5, minScore, skillNames, includeReferences = true, distinctSkills = false, mode } = options;
 
     // Ask the search engine for enough rows to survive post-search filtering and
-    // canonical alias de-duplication before applying the final topK.
+    // canonical alias or distinct-skill de-duplication before applying the final topK.
     const totalIndexedDocuments = this.#searchNamespace
       ? this.#sharedSearchState.documentIds.size
       : [...this.#skills.values()].reduce(
@@ -755,7 +755,7 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
     });
 
     const results: SkillSearchResult[] = [];
-    const seenCanonicalSources = new Set<string>();
+    const seenResults = new Set<string>();
 
     for (const result of searchResults) {
       const skillPath = result.metadata?.skillPath as string;
@@ -780,11 +780,11 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
         continue;
       }
 
-      const canonicalSourceKey = `${skill.path}:${source}`;
-      if (seenCanonicalSources.has(canonicalSourceKey)) {
+      const resultKey = distinctSkills ? skill.name : `${skill.path}:${source}`;
+      if (seenResults.has(resultKey)) {
         continue;
       }
-      seenCanonicalSources.add(canonicalSourceKey);
+      seenResults.add(resultKey);
 
       results.push({
         skillName: skill.name,
@@ -1539,7 +1539,7 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
    * Simple text search fallback when no search engine is configured
    */
   async #simpleSearch(query: string, options: SkillSearchOptions): Promise<SkillSearchResult[]> {
-    const { topK = 5, skillNames, includeReferences = true } = options;
+    const { topK = 5, skillNames, includeReferences = true, distinctSkills = false } = options;
     const queryLower = query.toLowerCase();
     const results: SkillSearchResult[] = [];
 
@@ -1554,7 +1554,8 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
       }
 
       // Search in instructions
-      if (skill.instructions.toLowerCase().includes(queryLower)) {
+      const matchesInstructions = skill.instructions.toLowerCase().includes(queryLower);
+      if (matchesInstructions) {
         results.push({
           skillName: skill.name,
           skillPath: skill.path,
@@ -1565,7 +1566,7 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
       }
 
       // Search in references if included
-      if (includeReferences) {
+      if (includeReferences && (!distinctSkills || !matchesInstructions)) {
         for (const refPath of skill.references) {
           if (results.length >= topK) break;
           const content = await this.getReference(skill.name, `references/${refPath}`);
@@ -1577,6 +1578,7 @@ export class WorkspaceSkillsImpl implements WorkspaceSkills {
               content: content.substring(0, 200),
               score: 0.8,
             });
+            if (distinctSkills) break;
           }
         }
       }
