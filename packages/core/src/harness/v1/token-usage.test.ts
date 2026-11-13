@@ -361,6 +361,65 @@ describe('Session token usage — durability', () => {
     expect(session.getRecord().pendingResume?.toolCallId).toBe('tc-duplicate-suspend-retry');
   });
 
+  // The order `reserve` protects: a cached duplicate captures the suspended run
+  // first (with its restore fence) and the original continuation, which has no
+  // fence, captures it while the duplicate's save is still in flight. No public
+  // call sequence was found that produces this order (the original continuation
+  // captures a few microtasks after the run completes; a duplicate retry first
+  // reads admission evidence from storage), so the test drives the two
+  // concurrent captures directly.
+  it('counts a suspended run once over two concurrent _captureMessageSuspendWithTokenUsage calls that both succeed, the fenced duplicate first (internal: order not reached through the public API)', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const full = {
+      text: 'suspended run captured twice',
+      finishReason: 'suspended',
+      runId: 'reserve-order-run',
+      usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+      totalUsage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+      suspendPayload: { toolCallId: 'tc-reserve-order', toolName: 'shell', args: { cmd: 'ls' } },
+    } as unknown as FullOutput<unknown>;
+    const saveSession = storage.saveSession.bind(storage);
+    const firstSave = deferred();
+    let pendingResumeSaveCount = 0;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.pendingResume?.toolCallId === 'tc-reserve-order') {
+        pendingResumeSaveCount += 1;
+        if (pendingResumeSaveCount === 1) await firstSave.promise;
+      }
+      return saveSession(record, opts);
+    });
+
+    const capture = (
+      session as unknown as {
+        _captureMessageSuspendWithTokenUsage(
+          full: FullOutput<unknown>,
+          queuedItemId: string | undefined,
+          modeId: string,
+          modelId: string,
+          activeTurnWaiter?: Promise<never>,
+          opts?: { restoreFence?: { expectedKey?: string } },
+        ): Promise<void>;
+      }
+    )._captureMessageSuspendWithTokenUsage.bind(session);
+    const { modeId, modelId } = session.getRecord();
+    // The cached duplicate: fenced on "nothing parked yet".
+    const duplicate = capture(full, undefined, modeId, modelId, undefined, {
+      restoreFence: { expectedKey: undefined },
+    });
+    await vi.waitFor(() => expect(pendingResumeSaveCount).toBe(1));
+    // The original continuation: no fence.
+    const original = capture(full, undefined, modeId, modelId);
+
+    firstSave.resolve();
+    await expect(duplicate).resolves.toBeUndefined();
+    await expect(original).resolves.toBeUndefined();
+
+    expect(session.getTokenUsage()).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
+    expect(session.getRecord().tokenUsage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
+    expect(session.getRecord().pendingResume?.toolCallId).toBe('tc-reserve-order');
+  });
+
   it('persists queued-turn token usage in the same write as the no-replay marker', async () => {
     // Regression guard for the ordering bug surfaced during review:
     // `_finalizeCompletedQueuedTurn` previously wrote `postRunFinalizedAt`
