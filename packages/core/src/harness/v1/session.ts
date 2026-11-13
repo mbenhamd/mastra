@@ -21705,15 +21705,25 @@ export class Session {
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
+    this._clearTeardownCollections();
+    this._drainAllTerminalObservers(new HarnessSessionClosedError(this.id));
+    this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
+    this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
+  }
+
+  /**
+   * The per-session collections that `_markClosed`, `_markDeleted` and
+   * `_markEvicted` all clear, at the same point and in the same order
+   * (PF-8699). Only plain clears belong here: drains, rejections, timer
+   * clears and state transitions stay in each method, in their own order.
+   */
+  private _clearTeardownCollections(): void {
     // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
     // that will never reach a terminal here) so they cannot accumulate.
     this._openRuns.clear();
     this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
     this._replacementToolSurface.dispose();
-    this._drainAllTerminalObservers(new HarnessSessionClosedError(this.id));
-    this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
-    this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
   }
 
   /** @internal — used by Harness hard-delete after storage has removed the row. */
@@ -21722,10 +21732,7 @@ export class Session {
     this._leaseExtensionDeadline = undefined;
     this._clearPendingInteractionExpiryTimer();
     this._state = 'deleted';
-    this._openRuns.clear();
-    this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
-    this._replacementToolSurface.dispose();
+    this._clearTeardownCollections();
     this._drainAllTerminalObservers(err);
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
@@ -21771,10 +21778,7 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;
     this._state = 'evicted';
-    this._openRuns.clear();
-    this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
-    this._replacementToolSurface.dispose();
+    this._clearTeardownCollections();
     this._drainAllTerminalObservers(err);
     this._tearDownThreadSubscription(err);
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
