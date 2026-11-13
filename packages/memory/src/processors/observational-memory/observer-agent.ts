@@ -1,5 +1,6 @@
 import type { MastraDBMessage } from '@mastra/core/agent';
-import { tryFormatTerminalToolResultForModel, type MastraToolInvocation } from '@mastra/core/agent/message-list';
+import type { MastraToolInvocation } from '@mastra/core/agent/message-list';
+import { tryFormatTerminalToolResultForModel } from '@mastra/core/agent/message-list';
 import type { CoreMessage } from '@mastra/core/llm';
 
 import { isSystemReminderMessage } from '../../system-reminders';
