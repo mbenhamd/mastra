@@ -2997,26 +2997,11 @@ export class Session {
    * (`_tokenUsage`) intentionally persist across turns within a session.
    */
   private _resetTurnTracking(): void {
-    if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
-    this._currentRunId = undefined;
+    this._clearTurnIdentity();
     this._currentAssistantDraftRunIds.clear();
-    this._currentRunStartedAt = undefined;
-    this._currentRunModeId = undefined;
-    this._currentRunModelId = undefined;
-    this._currentRunSignalId = undefined;
-    this._ownedSignalTurnOrigin = undefined;
-    this._currentTurnRequestContext = undefined;
-    this._currentAgentRequestContext = undefined;
-    this._currentTurnReplacementToolSurface = undefined;
-    this._currentMessageId = undefined;
-    this._currentTraceId = undefined;
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
     // captured pendingResume below so non-yolo turns never inherit a stale value.
     this._currentTurnYolo = false;
-    this._currentTurnSourceWriteGuard = undefined;
-    this._activeTools.clear();
-    this._toolInputBuffers.clear();
-    this._subagentAnswerDecoders.clear();
     // `_returnedInlineSubagents` is keyed by runId, not by turn (see its field).
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
@@ -3040,24 +3025,33 @@ export class Session {
       // a streaming consumer always gets a terminal for every `tool_start`. On a
       // normal turn the drain already removed every tool, so this is a no-op.
       this._emitAbortedToolEnds();
-      if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
-      this._currentRunId = undefined;
-      this._currentRunStartedAt = undefined;
-      this._currentRunModeId = undefined;
-      this._currentRunModelId = undefined;
-      this._currentRunSignalId = undefined;
-      this._ownedSignalTurnOrigin = undefined;
-      this._currentTurnRequestContext = undefined;
-      this._currentAgentRequestContext = undefined;
-      this._currentTurnReplacementToolSurface = undefined;
-      this._currentTurnSourceWriteGuard = undefined;
-      this._currentMessageId = undefined;
-      this._currentTraceId = undefined;
-      this._activeTools.clear();
-      this._toolInputBuffers.clear();
-      this._subagentAnswerDecoders.clear();
+      this._clearTurnIdentity();
     }
     this._notifyMaybeIdle();
+  }
+
+  /**
+   * The per-turn identity and tool-stream state that both `_resetTurnTracking`
+   * and `_endTurn` clear (PF-8682). The terminal subagent answer of the current
+   * run is dropped first, while `_currentRunId` still names that run.
+   */
+  private _clearTurnIdentity(): void {
+    if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
+    this._currentRunId = undefined;
+    this._currentRunStartedAt = undefined;
+    this._currentRunModeId = undefined;
+    this._currentRunModelId = undefined;
+    this._currentRunSignalId = undefined;
+    this._ownedSignalTurnOrigin = undefined;
+    this._currentTurnRequestContext = undefined;
+    this._currentAgentRequestContext = undefined;
+    this._currentTurnReplacementToolSurface = undefined;
+    this._currentTurnSourceWriteGuard = undefined;
+    this._currentMessageId = undefined;
+    this._currentTraceId = undefined;
+    this._activeTools.clear();
+    this._toolInputBuffers.clear();
+    this._subagentAnswerDecoders.clear();
   }
 
   private _assistantDraftSnapshot(): Record<string, HarnessAssistantDraft> {
