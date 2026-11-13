@@ -165,6 +165,39 @@ describe('resolveAgentSkills', () => {
 });
 
 describe('mergeWorkspaceSkills', () => {
+  it('bounds distinct results across sources and fills slots only from the owning skill source', async () => {
+    const guide = (name: string, instructions: string) => createSkill({ name, description: name, instructions });
+    const agentSkills = resolveAgentSkills([
+      guide('agent-first', 'sharedtoken'),
+      guide('agent-second', 'sharedtoken filler'),
+      guide('shared-guide', 'Read the agent checklist.'),
+    ]);
+    const workspaceSkills = resolveAgentSkills([
+      guide('shared-guide', Array(10).fill('sharedtoken workspaceonly').join(' ')),
+      guide('workspace-first', 'sharedtoken workspaceonly'),
+      guide('workspace-second', 'sharedtoken workspaceonly filler'),
+    ]);
+    const { merged } = await mergeWorkspaceSkills(agentSkills, workspaceSkills);
+
+    const bounded = await merged.search('sharedtoken', { topK: 2, distinctSkills: true });
+    expect(bounded).toHaveLength(2);
+    expect(new Set(bounded.map(result => result.skillName)).size).toBe(2);
+
+    // A matching secondary document cannot stand in for a nonmatching primary skill.
+    const workspaceOnly = await merged.search('workspaceonly', { topK: 2, distinctSkills: true });
+    expect(new Set(workspaceOnly.map(result => result.skillName))).toEqual(
+      new Set(['workspace-first', 'workspace-second']),
+    );
+
+    const named = await merged.search('workspaceonly', {
+      topK: 2,
+      distinctSkills: true,
+      skillNames: ['workspace-second'],
+    });
+    expect(named.map(result => result.skillName)).toEqual(['workspace-second']);
+    expect((await merged.get('shared-guide'))?.instructions).toBe('Read the agent checklist.');
+  });
+
   it('forwards registerLocationAlias so remapped locations resolve on either side', async () => {
     const agentSkills = resolveAgentSkills([
       createSkill({

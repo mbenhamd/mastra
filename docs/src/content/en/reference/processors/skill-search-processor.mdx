@@ -62,7 +62,8 @@ const skillSearch = new SkillSearchProcessor({
           {
             name: 'search.topK',
             type: 'number',
-            description: 'Maximum number of skills to return in search results.',
+            description:
+              'Maximum number of distinct skills to return. Matching references from one skill do not consume additional slots.',
             isOptional: true,
             default: '5',
           },

@@ -608,6 +608,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
         const searchResults = await skills.search(query, {
           topK: this.searchConfig.topK,
           minScore: this.searchConfig.minScore,
+          distinctSkills: true,
         });
 
         if (searchResults.length === 0) {
