@@ -213,10 +213,11 @@ describe('Session token usage — durability', () => {
       }
       return writeMessageResultEvidence(record);
     });
-    (session as unknown as { _completedRuns: Map<string, { ok: true; full: FullOutput<unknown> }> })._completedRuns.set(
-      'duplicate-token-run',
-      { ok: true, full },
-    );
+    (
+      session as unknown as {
+        _runOutcomes: { remember(runId: string, outcome: { ok: true; full: FullOutput<unknown> }): void };
+      }
+    )._runOutcomes.remember('duplicate-token-run', { ok: true, full });
     expect(session.getDisplayState().currentRunId).toBeUndefined();
 
     const duplicate = await (
@@ -272,10 +273,11 @@ describe('Session token usage — durability', () => {
       }
       return writeMessageResultEvidence(record);
     });
-    (session as unknown as { _completedRuns: Map<string, { ok: true; full: FullOutput<unknown> }> })._completedRuns.set(
-      'duplicate-suspend-token-run',
-      { ok: true, full },
-    );
+    (
+      session as unknown as {
+        _runOutcomes: { remember(runId: string, outcome: { ok: true; full: FullOutput<unknown> }): void };
+      }
+    )._runOutcomes.remember('duplicate-suspend-token-run', { ok: true, full });
     const evidence = {
       status: 'pending',
       signalId: 'duplicate-suspend-token-signal',

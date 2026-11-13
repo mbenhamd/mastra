@@ -351,6 +351,7 @@ import { QueueHead } from './session-queue-head';
 import { ReplacementToolSurfaceSlot } from './session-replacement-tool-surface-slot';
 import { ResumeUsageFence } from './session-resume-usage-fence';
 import { RunCompletionWaiters } from './session-run-completion-waiters';
+import { RunOutcomeCache } from './session-run-outcome-cache';
 import { RunSpanTracker } from './session-run-span-tracker';
 import type { RunSpanSnapshot } from './session-run-span-tracker';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
@@ -1762,11 +1763,10 @@ export class Session {
    * `runFailed` marks a failure the run's own output reported (a provider or
    * agent error), as opposed to harness bookkeeping around the run.
    */
-  private readonly _completedRuns = new Map<
-    string,
-    | { ok: true; full: FullOutput<unknown>; resumeAccountingKey?: string }
-    | { ok: false; err: unknown; runFailed?: true }
-  >();
+  private readonly _runOutcomes = new RunOutcomeCache(evicted => {
+    this._messageTokenLedger.evict(evicted);
+    this._runToolReceipts.delete(evicted);
+  });
   /** Runs of aborted native terminal turns whose output had not settled yet (bounded). */
   private readonly _abortedTerminalRunIds = new Set<string>();
   /** PF-8451: the message-token ledger (runs counted here, runs a suspended capture is counting). */
@@ -3997,7 +3997,7 @@ export class Session {
     }
     if (agent?.getRunOutput(runId)) return 'active';
     if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
-    const completed = this._completedRuns.get(runId);
+    const completed = this._runOutcomes.get(runId);
     if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
   }
@@ -4672,7 +4672,7 @@ export class Session {
           const full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
           // Repopulate the local run cache so the per-generation usage marker
           // still dedupes a concurrent settlement retry.
-          this._rememberCompletedRun(parked.runId, { ok: true, full });
+          this._runOutcomes.remember(parked.runId, { ok: true, full });
           const pendingQueuedItemId = this._queuedItemIdForPendingResume(parked);
           const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(parked);
           // The resume-data payload lived in the dead caller, but a
@@ -5052,7 +5052,7 @@ export class Session {
       this._noteAbortedTerminalRun(runId);
       return false;
     }
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     return cached !== undefined && !cached.ok && cached.runFailed === true && cached.err === err;
   }
 
@@ -5063,11 +5063,7 @@ export class Session {
    * not marked, and a same-admission retry never commits it as failed.
    */
   private _noteAbortedTerminalRun(runId: string): void {
-    const cached = this._completedRuns.get(runId);
-    if (cached !== undefined) {
-      if (!cached.ok) delete cached.runFailed;
-      return;
-    }
+    if (this._runOutcomes.demoteRunFailure(runId)) return;
     this._abortedTerminalRunIds.add(runId);
     while (this._abortedTerminalRunIds.size > 64) {
       const oldest = this._abortedTerminalRunIds.values().next().value;
@@ -7151,7 +7147,7 @@ export class Session {
     // Keep the cached result reusable so duplicate admission callers that
     // converge on the same runId can still observe the terminal output even
     // if another waiter arrived first.
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     if (cached) {
       return cached.ok
         ? this._stageCompletedTerminalOutput(runId, cached.full, { tolerateUnknownRun: true }).then(() => cached.full)
@@ -7176,7 +7172,7 @@ export class Session {
    * Canonical completion watcher. Acquires the run's `MastraModelOutput`
    * from the runtime via `waitForRunOutput()` (event-driven — no polling),
    * awaits `_waitUntilFinished()`, then settles the outstanding completion
-   * promise (or stashes the result in `_completedRuns` if the waiter has not
+   * promise (or stashes the result in the run outcome cache if the waiter has not
    * been registered yet, e.g. for very fast runs).
    *
    * The captured `out` reference is threaded through to `_handleRunTerminal`
@@ -7193,7 +7189,7 @@ export class Session {
       };
     } catch (err) {
       this._runCompletionWaiters.fail(runId, err);
-      this._rememberCompletedRun(runId, { ok: false, err });
+      this._runOutcomes.remember(runId, { ok: false, err });
       return;
     }
     // Stage the provider's completed output as soon as the run has it, before
@@ -7239,7 +7235,7 @@ export class Session {
               if (lease) clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, runId, lease);
             }
             this._runCompletionWaiters.fail(runId, terminalError);
-            this._rememberCompletedRun(runId, { ok: false, err: terminalError });
+            this._runOutcomes.remember(runId, { ok: false, err: terminalError });
             return;
           }
           // Subscription teardown wakes the barrier. Since the model output is
@@ -7338,14 +7334,14 @@ export class Session {
    * already dropped it from `getRunOutput()` by now).
    *
    * If no waiter is registered yet (very fast run), the result is stashed
-   * in `_completedRuns` so later `_awaitRunCompletion(runId)` calls can
+   * in the run outcome cache so later `_awaitRunCompletion(runId)` calls can
    * observe it.
    */
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
     const waiter = this._runCompletionWaiters.promiseFor(runId);
     // Share this waiter through output collection and durable staging: the
     // runtime may already have cleared its output when another caller joins.
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     if (cached && !cached.ok) {
       this._runToolReceipts.delete(runId);
       this._runCompletionWaiters.fail(runId, cached.err);
@@ -7365,9 +7361,9 @@ export class Session {
       const aborted = this._abortedTerminalRunIds.delete(runId);
       const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
-      this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
+      this._runOutcomes.remember(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
       // Remember before `fail`, as the base did here, while the other failure
-      // sites `fail` first. Either order is the same: `_rememberCompletedRun`
+      // sites `fail` first. Either order is the same: remembering an outcome
       // never reads the waiters, and a rejection runs no continuation synchronously.
       this._runCompletionWaiters.fail(runId, err);
       return;
@@ -7382,14 +7378,14 @@ export class Session {
       }
       full = this._materializeHarnessRunOutput(runId, rawFull);
       await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true });
-      this._rememberCompletedRun(runId, { ok: true, full });
+      this._runOutcomes.remember(runId, { ok: true, full });
       this._runCompletionWaiters.resolveIfCurrent(runId, waiter, full);
     } catch (err) {
       this._runToolReceipts.delete(runId);
       // A staging failure is pending settlement of concrete output. Keep that
       // output available to a same-admission retry, which must stage it before
       // delivering completion or accounting usage.
-      this._rememberCompletedRun(runId, full === undefined ? { ok: false, err } : { ok: true, full });
+      this._runOutcomes.remember(runId, full === undefined ? { ok: false, err } : { ok: true, full });
       this._runCompletionWaiters.rejectIfCurrent(runId, waiter, err);
     } finally {
       this._runCompletionWaiters.dropIfCurrent(runId, waiter);
@@ -7568,31 +7564,6 @@ export class Session {
       const pending = this._terminalFailure(error, undefined, runId);
       this._terminalStagingFailuresAwaitingObserver.add(pending);
       throw pending;
-    }
-  }
-
-  private _rememberCompletedRun(
-    runId: string,
-    entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown; runFailed?: true },
-  ): void {
-    const existing = this._completedRuns.get(runId);
-    if (existing !== undefined) {
-      // A resumed run produces a new output for the same runId each time it
-      // ends. A cached 'suspended' entry is an intermediate generation, not a
-      // terminal result — replace it so retries and settlement observe the
-      // newest suspension/terminal output instead of reverting to an obsolete
-      // earlier suspension point.
-      const existingSuspended = existing.ok && existing.full.finishReason === 'suspended';
-      if (!existingSuspended) return;
-      this._completedRuns.delete(runId);
-    }
-    this._completedRuns.set(runId, entry);
-    while (this._completedRuns.size > 64) {
-      const oldest = this._completedRuns.keys().next().value;
-      if (oldest === undefined) return;
-      this._completedRuns.delete(oldest);
-      this._messageTokenLedger.evict(oldest);
-      this._runToolReceipts.delete(oldest);
     }
   }
 
@@ -9022,7 +8993,7 @@ export class Session {
       rejectMessageAdmissionStart(failure);
       void completion.catch(() => {});
       this._runCompletionWaiters.fail(signal.runId, failure);
-      this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
+      this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
       if (
         admissionIdentity !== undefined &&
         terminalIdentity === undefined &&
@@ -9085,7 +9056,7 @@ export class Session {
           finishOwnedMessageTurn();
           void completion.catch(() => {});
           this._runCompletionWaiters.fail(signal.runId, failure);
-          this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
+          this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
           if (
             admissionIdentity !== undefined &&
             terminalIdentity === undefined &&
@@ -9362,7 +9333,7 @@ export class Session {
       if (!streamStarted) {
         void completion.catch(() => {});
         this._runCompletionWaiters.fail(signal.runId, failure);
-        this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
+        this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
       }
       if (
         admissionIdentity !== undefined &&
@@ -9635,8 +9606,8 @@ export class Session {
             const agent = this._harness.getAgentForMode(duplicateModeId);
             await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
             const runId = await this._pendingMessageRunId(evidence);
-            if (runId && this._completedRuns.has(runId)) {
-              const cached = this._completedRuns.get(runId);
+            if (runId && this._runOutcomes.has(runId)) {
+              const cached = this._runOutcomes.get(runId);
               // A run whose own output rejected in this process: commit its
               // durable failed terminal instead of leaving it pending.
               if (cached !== undefined && !cached.ok && cached.runFailed === true) {
@@ -9775,7 +9746,7 @@ export class Session {
                 .catch(async err => {
                   // A run whose own output rejected commits its durable failed
                   // terminal (the commit drains the retained observers).
-                  const cached = this._completedRuns.get(runId!);
+                  const cached = this._runOutcomes.get(runId!);
                   if (
                     identity !== undefined &&
                     cached !== undefined &&
@@ -9850,7 +9821,7 @@ export class Session {
           const duplicateModelId = this._messageDuplicateModelId(evidence, opts);
           const agent = this._harness.getAgentForMode(duplicateModeId);
           await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
-          const cached = this._completedRuns.get(runId);
+          const cached = this._runOutcomes.get(runId);
           if (cached) {
             if (!cached.ok) {
               // A run whose own output rejected in this process: commit its
@@ -9922,7 +9893,7 @@ export class Session {
           } catch (err) {
             // A live run whose own output rejected: commit (or replay) its
             // durable failed terminal for this retry, then report the failure.
-            const rejected = this._completedRuns.get(runId);
+            const rejected = this._runOutcomes.get(runId);
             if (rejected !== undefined && !rejected.ok && rejected.runFailed === true && rejected.err === err) {
               await this._commitCachedDuplicateTerminal(new RejectedTerminalRun(err), evidence, opts, activeDeleted);
             }
@@ -10280,9 +10251,8 @@ export class Session {
       const queuedUsagePersisted =
         queuedId !== undefined && this._record.queueAdmissionReceipts?.[queuedId]?.postRunFinalizedAt !== undefined;
       // Resumed finalization and this path share one once-only marker.
-      const cached = this._completedRuns.get(runId);
-      const finalizationAccounted = cached?.ok === true && cached.resumeAccountingKey === generationKey;
-      if (cached?.ok === true) cached.resumeAccountingKey = generationKey;
+      const finalizationAccounted = this._runOutcomes.isResumeAccounted(runId, generationKey);
+      this._runOutcomes.noteResumeAccounted(runId, generationKey);
       if (!queuedUsagePersisted && !finalizationAccounted && !this._resumeUsageFence.isArmedFor(generationKey)) {
         this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
         const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
@@ -10572,7 +10542,7 @@ export class Session {
     if (!admission || (admission.status !== 'pending' && admission.status !== 'committed')) {
       return undefined;
     }
-    const cached = this._completedRuns.get(pending.runId);
+    const cached = this._runOutcomes.get(pending.runId);
     let full: FullOutput<unknown>;
     if (cached !== undefined && cached.ok && cached.full.finishReason !== 'suspended') {
       full = cached.full;
@@ -10600,7 +10570,7 @@ export class Session {
         return undefined;
       }
       full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
-      this._rememberCompletedRun(pending.runId, { ok: true, full });
+      this._runOutcomes.remember(pending.runId, { ok: true, full });
     }
 
     const { expectedKind, responseMode, responseId } = options;
@@ -10691,9 +10661,7 @@ export class Session {
   }
 
   private _hasLiveMessageRun(agent: Agent, runId: string): boolean {
-    return Boolean(
-      agent.getRunOutput(runId) || this._runCompletionWaiters.has(runId) || this._completedRuns.has(runId),
-    );
+    return Boolean(agent.getRunOutput(runId) || this._runCompletionWaiters.has(runId) || this._runOutcomes.has(runId));
   }
 
   private async _awaitDurableMessageResult(
@@ -12310,7 +12278,7 @@ export class Session {
       const duplicateModeId = evidence.modeId ?? opts.mode ?? this._record.modeId;
       const agent = this._harness.getAgentForMode(duplicateModeId);
       const subscription = await this._ensureThreadSubscription(agent);
-      const cached = this._completedRuns.get(evidence.runId);
+      const cached = this._runOutcomes.get(evidence.runId);
       if (cached) {
         const admission =
           evidence.admissionId !== undefined && evidence.admissionHash !== undefined
@@ -12859,7 +12827,7 @@ export class Session {
       );
     };
     const canAttachSignalRun = (runId: string) =>
-      isSignalRunActive(runId) || this._completedRuns.has(runId) || agent.getRunOutput(runId) !== undefined;
+      isSignalRunActive(runId) || this._runOutcomes.has(runId) || agent.getRunOutput(runId) !== undefined;
 
     const returnClaimOutcome = async (
       claim:
@@ -17252,7 +17220,7 @@ export class Session {
     // durable `resumedAt` marker rightly blocks a second provider call. Caching
     // the materialized output gives the settlement-only retry below a concrete
     // result to commit without re-running the provider.
-    this._rememberCompletedRun(pending.runId, { ok: true, full });
+    this._runOutcomes.remember(pending.runId, { ok: true, full });
 
     // Clear pending + apply any remaining mode flip in a single CAS write. A
     // queued terminal resume has already persisted its completed receipt before
@@ -17382,12 +17350,10 @@ export class Session {
       requestedAt: pending.requestedAt,
     });
     const resumeAccountingDone = (): boolean => {
-      const entry = this._completedRuns.get(pending.runId);
-      return entry !== undefined && entry.ok === true && entry.resumeAccountingKey === resumeAccountingKey;
+      return this._runOutcomes.isResumeAccounted(pending.runId, resumeAccountingKey);
     };
     const markResumeAccountingDone = (): void => {
-      const entry = this._completedRuns.get(pending.runId);
-      if (entry !== undefined && entry.ok === true) entry.resumeAccountingKey = resumeAccountingKey;
+      this._runOutcomes.noteResumeAccounted(pending.runId, resumeAccountingKey);
       // This run's usage is now part of the session total — mark the
       // message-side memo too, or a cached-duplicate replay of the resumed
       // output re-adds the run's cumulative usage.
@@ -23221,7 +23187,7 @@ export class Session {
       this._record.pendingResume?.runId === runId ||
       this._messageAdmissionStarts.has(admissionId) ||
       this._runCompletionWaiters.has(runId) ||
-      this._completedRuns.has(runId)
+      this._runOutcomes.has(runId)
     ) {
       return 'reattach';
     }
