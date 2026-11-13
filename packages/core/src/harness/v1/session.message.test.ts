@@ -949,7 +949,7 @@ describe('Session.message() — default path', () => {
       if (evidence.sessionId !== session.id || evidence.status !== 'completed') continue;
       Object.assign(evidence, { result: undefined, erased: true });
     }
-    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+    (session as unknown as { _runOutcomes: { _entries: Map<string, unknown> } })._runOutcomes._entries.clear();
 
     const receipts: string[] = [];
     await expect(
@@ -996,7 +996,7 @@ describe('Session.message() — default path', () => {
     const completed = { ...row };
     Object.assign(row, { status: 'pending' });
     delete row.result;
-    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+    (session as unknown as { _runOutcomes: { _entries: Map<string, unknown> } })._runOutcomes._entries.clear();
     const waiter = vi.spyOn(
       session as unknown as { _awaitDurableMessageResult: () => unknown },
       '_awaitDurableMessageResult',
@@ -1055,7 +1055,7 @@ describe('Session.message() — default path', () => {
       if (evidence.sessionId !== session.id || evidence.status !== 'completed') continue;
       Object.assign(evidence, { result: undefined, erased: true });
     }
-    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+    (session as unknown as { _runOutcomes: { _entries: Map<string, unknown> } })._runOutcomes._entries.clear();
 
     // The stream retry (the path PapersFlow uses) gets the durable receipt,
     // then the typed erased error rather than an empty or stale result.
@@ -3408,7 +3408,7 @@ describe('Session.message() — default path', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     vi.spyOn(agent, 'getRunOutput').mockReturnValue(undefined);
     vi.spyOn(agent, 'waitForRunOutput').mockRejectedValue(new Error('raw runtime tombstone'));
-    (session as any)._completedRuns.set('rejected-run', { ok: false, err: new Error('cached failed run') });
+    (session as any)._runOutcomes.remember('rejected-run', { ok: false, err: new Error('cached failed run') });
 
     await expect(
       (session as any)._returnDuplicateMessageResult(
@@ -3443,7 +3443,7 @@ describe('Session.message() — default path', () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const waitForRunOutput = vi.spyOn(agent, 'waitForRunOutput');
-    (session as any)._completedRuns.set('completed-pending-run', { ok: true, full: agent.fullOutput });
+    (session as any)._runOutcomes.remember('completed-pending-run', { ok: true, full: agent.fullOutput });
 
     await expect(
       (session as any)._returnDuplicateMessageResult(
@@ -3463,8 +3463,8 @@ describe('Session.message() — default path', () => {
     const startupError = new Error('post-dispatch pending evidence unavailable');
     const watcherError = new Error('Agent thread run id "startup-failed-run" has been aborted');
 
-    (session as any)._rememberCompletedRun('startup-failed-run', { ok: false, err: startupError });
-    (session as any)._rememberCompletedRun('startup-failed-run', { ok: false, err: watcherError });
+    (session as any)._runOutcomes.remember('startup-failed-run', { ok: false, err: startupError });
+    (session as any)._runOutcomes.remember('startup-failed-run', { ok: false, err: watcherError });
 
     await expect(
       (session as any)._returnDuplicateMessageResult(
@@ -3479,8 +3479,8 @@ describe('Session.message() — default path', () => {
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const watcherError = new Error('Agent thread run id "completed-run" has been aborted');
 
-    (session as any)._rememberCompletedRun('completed-run', { ok: true, full: agent.fullOutput });
-    (session as any)._rememberCompletedRun('completed-run', { ok: false, err: watcherError });
+    (session as any)._runOutcomes.remember('completed-run', { ok: true, full: agent.fullOutput });
+    (session as any)._runOutcomes.remember('completed-run', { ok: false, err: watcherError });
 
     await expect(
       (session as any)._returnDuplicateMessageResult(
@@ -3514,17 +3514,11 @@ describe('Session.message() — default path', () => {
   it('short-circuits duplicate stream retries when pending run completion settles first', async () => {
     const { harness, agent } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    let resolveCompletion!: (full: unknown) => void;
-    const completion = new Promise<unknown>(resolve => {
-      resolveCompletion = resolve;
-    });
     vi.spyOn(agent, 'getRunOutput').mockReturnValue(undefined);
     vi.spyOn(agent, 'waitForRunOutput').mockReturnValue(new Promise(() => {}));
-    (session as any)._runCompletionPromises.set('settling-pending-run', {
-      promise: completion,
-      resolve: resolveCompletion,
-      reject: vi.fn(),
-    });
+    const waiters = (session as any)._runCompletionWaiters;
+    const { promise: completion } = waiters.register('settling-pending-run');
+    const resolveCompletion = (full: unknown) => waiters.resolveIfCurrent('settling-pending-run', completion, full);
 
     const retry = (session as any)._returnDuplicateMessageResult(
       { status: 'pending', signalId: 'signal-1', runId: 'settling-pending-run' },
@@ -4548,15 +4542,9 @@ describe('Session.message() — default path', () => {
     // commit helper.
     const output = buildFakeOutput({ runId: 'adopted-run', fullOutput: agent.fullOutput });
     vi.spyOn(agent, 'getRunOutput').mockReturnValue(output);
-    let rejectCompletion!: (err: unknown) => void;
-    const completionPromise = new Promise<unknown>((_, reject) => {
-      rejectCompletion = reject;
-    });
-    (session as any)._runCompletionPromises.set('adopted-run', {
-      promise: completionPromise,
-      resolve: vi.fn(),
-      reject: rejectCompletion,
-    });
+    const waiters = (session as any)._runCompletionWaiters;
+    waiters.register('adopted-run');
+    const rejectCompletion = (err: unknown) => waiters.fail('adopted-run', err);
     const failures: Error[] = [];
     const adopted = await (session as any)._returnDuplicateMessageResult(
       {
@@ -4949,7 +4937,7 @@ describe('Session.message() — default path', () => {
     // admission probe must not resurrect 'builder' now that its pending
     // generation is gone.
     await session.switchMode({ mode: 'planner' });
-    const full = (session as any)._completedRuns.get(pending.runId)!.full;
+    const full = (session as any)._runOutcomes.get(pending.runId)!.full;
     await (session as any)._finalizeResumedTurnOutcome(pending, full, {
       previousModeId: 'planner',
       resumeModeId: 'planner',

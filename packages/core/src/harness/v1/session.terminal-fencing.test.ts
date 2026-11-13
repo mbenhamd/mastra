@@ -588,7 +588,7 @@ describe('rejected provider runs commit a durable failed terminal', () => {
       session.abort();
       await expect(turn).resolves.toMatchObject({ name: 'HarnessTerminalHandoffError:harness.terminal_pending' });
       releaseOutput();
-      await vi.waitFor(() => expect((session as any)._completedRuns.size).toBeGreaterThan(0));
+      await vi.waitFor(() => expect((session as any)._runOutcomes._entries.size).toBeGreaterThan(0));
 
       // A same-admission retry reports the failure but leaves the aborted
       // turn's outcome to reconciliation instead of committing it as failed.

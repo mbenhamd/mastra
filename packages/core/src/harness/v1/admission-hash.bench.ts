@@ -1,16 +1,17 @@
 /**
  * Harness v1 — ADMISSION HASHING benchmark (canonical-json.ts).
  *
- * `Session._computeMessageAdmissionHashes` (session.ts) computes a primary +
- * legacy-compatible hashes, each `sha256CanonicalJson(_messageAdmissionHashInput(...))`.
- * `_messageAdmissionHashInput` maps over every attachment (incl. a deep clone of
+ * `computeMessageAdmissionHashes` (session-admission-reservation.ts) computes a primary +
+ * legacy-compatible hashes, each `sha256CanonicalJson(messageAdmissionHashInput(...))`.
+ * `messageAdmissionHashInput` maps over every attachment (incl. a deep clone of
  * `metadata`), so cost scales with attachment count + metadata size, then
  * `canonicalJson` sorts keys and `sha256` digests the serialized form
  * (canonical-json.ts:71,90).
  *
- * `_messageAdmissionHashInput` is private, so this bench isolates the flagged
- * cost via the PUBLIC `sha256CanonicalJson`, fed structures shaped exactly like
- * the hash input the private method builds (small vs many-large-attachment).
+ * `messageAdmissionHashInput` is internal and reads the session through its
+ * port, so this bench isolates the flagged cost via the PUBLIC
+ * `sha256CanonicalJson`, fed structures shaped exactly like the hash input that
+ * function builds (small vs many-large-attachment).
  * Fully synchronous, zero harness/network state — the most deterministic of the
  * suite.
  *
@@ -25,7 +26,7 @@ import { bench, describe } from 'vitest';
 import type { JsonValue } from '../../storage/domains/harness';
 import { sha256CanonicalJson } from './canonical-json';
 
-/** Build a hash-input shaped object mirroring `_messageAdmissionHashInput`. */
+/** Build a hash-input shaped object mirroring `messageAdmissionHashInput`. */
 function hashInput(opts: { content: string; attachmentCount: number; metadataKeys: number }): JsonValue {
   const attachments: JsonValue[] = [];
   for (let i = 0; i < opts.attachmentCount; i++) {

@@ -432,6 +432,15 @@ function collectToolReceipts(value: unknown): {
   };
 }
 
+/** Framework-minted receipts only, in recorded order; never run tool-result fallbacks. */
+function frameworkToolReceipts(value: unknown): HarnessSubagentToolReceipt[] {
+  if (!isRecord(value)) return [];
+  return itemArray(value[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD]).flatMap(candidate => {
+    const receipt = normalizeToolReceipt(candidate);
+    return receipt === undefined ? [] : [receipt];
+  });
+}
+
 function truncateUtf8(value: string, maxBytes: number, marker = HARNESS_SUBAGENT_TEXT_TRUNCATION_MARKER) {
   const encoder = new TextEncoder();
   const encoded = encoder.encode(value);
@@ -548,10 +557,18 @@ export function summarizeHarnessSubagentResult(
     isError?: boolean;
     error?: { code: string; message: string };
     budgetExhausted?: z.infer<typeof harnessSubagentBudgetExhaustedSchema>;
+    /**
+     * Append a direct delivery's earlier framework receipts to the evidence.
+     * Only the inline `spawn_subagent` result opts in: its envelope is the one
+     * the trace budget below reserves. Persisted plan-task results keep the
+     * required evidence only, so their views never grow.
+     */
+    includeEarlierReceipts?: boolean;
   } = {},
 ): HarnessSubagentResultSummary {
   const record = isRecord(value) ? value : undefined;
-  const report = verifyHarnessSubagentTerminalCompletion(value);
+  const completion = resolveHarnessSubagentTerminalCompletion(value);
+  const report = completion?.report;
   const finishReason = boundedLabel(record?.finishReason, options.isError ? 'error' : 'unknown');
   const status =
     options.isError === true ||
@@ -597,18 +614,30 @@ export function summarizeHarnessSubagentResult(
     ...(usage ? { usage } : {}),
     ...(status === 'error' && options.budgetExhausted ? { budgetExhausted: { ...options.budgetExhausted } } : {}),
     ...(artifacts ? { artifacts } : {}),
-    ...(report ? { evidence: report.evidence } : {}),
+    ...(report ? { evidence: report.evidence.slice(0, completion!.requiredEvidenceCount) } : {}),
     ...(report?.issue ? { issue: report.issue } : {}),
     ...(error ? { error } : {}),
   };
+  // Earlier receipts appended to a direct delivery's evidence only use room
+  // the rest of the summary leaves inside the envelope the trace budget below
+  // assumes. A receipt that does not fit is skipped and stays unproven; the
+  // required evidence always stays.
+  const withEvidence =
+    report === undefined || options.includeEarlierReceipts !== true
+      ? draft
+      : fitAppendedEvidence(
+          draft,
+          report.evidence.slice(completion!.requiredEvidenceCount),
+          MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES,
+        );
   // A budget-stopped child's partial text is arbitrary interim prose whose JSON
   // escaping can double it; fit the serialized summary to the room the trace
   // budget below assumes, so the partial result never outgrows the envelope.
   const summary =
-    draft.budgetExhausted === undefined
-      ? draft
+    withEvidence.budgetExhausted === undefined
+      ? withEvidence
       : fitSummaryText(
-          draft,
+          withEvidence,
           MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES,
         );
   // The trace only uses room the rest of the summary leaves inside the 64 KiB
@@ -637,6 +666,28 @@ export function summarizeHarnessSubagentResult(
 
 function jsonBytes(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Add `appended` evidence items to `summary.evidence` in order while the
+ * serialized summary stays within `maxBytes`, skipping any item that does not
+ * fit. The existing evidence array is non-empty, so each item adds a comma.
+ */
+function fitAppendedEvidence(
+  summary: HarnessSubagentResultSummary,
+  appended: HarnessSubagentOutcomeReport['evidence'],
+  maxBytes: number,
+): HarnessSubagentResultSummary {
+  if (appended.length === 0 || summary.evidence === undefined) return summary;
+  const evidence = [...summary.evidence];
+  let bytes = jsonBytes(summary);
+  for (const item of appended) {
+    const itemBytes = jsonBytes(item) + 1;
+    if (bytes + itemBytes > maxBytes) continue;
+    bytes += itemBytes;
+    evidence.push(item);
+  }
+  return { ...summary, evidence };
 }
 
 /**
@@ -926,8 +977,20 @@ export function parseHarnessTerminalToolResultText(value: unknown): string | und
  * receipt; provider-shaped data cannot mint completion authority.
  */
 export function verifyHarnessSubagentTerminalCompletion(value: unknown): HarnessSubagentOutcomeReport | undefined {
+  return resolveHarnessSubagentTerminalCompletion(value)?.report;
+}
+
+/**
+ * The verified completion plus how many leading evidence items are required:
+ * every item of an outcome report, or the terminal items of a direct delivery.
+ * Items after those are earlier framework receipts appended to a direct
+ * delivery, which a summary may skip when they do not fit its envelope.
+ */
+function resolveHarnessSubagentTerminalCompletion(
+  value: unknown,
+): { report: HarnessSubagentOutcomeReport; requiredEvidenceCount: number } | undefined {
   const reported = verifyHarnessSubagentOutcomeReport(value);
-  if (reported !== undefined) return reported;
+  if (reported !== undefined) return { report: reported, requiredEvidenceCount: reported.evidence.length };
 
   const terminal = parseGenericHarnessTerminalToolResult(value);
   const summary = terminal === undefined ? undefined : parseHarnessTerminalToolResultText(terminal);
@@ -965,6 +1028,42 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
       description: `Framework-observed terminal result from ${item.toolName}.`,
     });
   }
+  // The terminal items prove only the call that delivered the answer. The
+  // child's other framework-minted receipts are Harness-observed too, so they
+  // join the evidence in call order: a caller that requires every delegated
+  // call to be proven can then verify a multi-call direct delivery. Run
+  // tool-result fallbacks are never appended, and an ambiguous earlier call id
+  // is skipped. Appending stops at the report's item bound and skips any
+  // receipt that would break its byte bound, so a terminal-only report that
+  // verified before still verifies; a call left out stays unproven for the
+  // caller.
+  const requiredEvidenceCount = evidence.length;
+  const encoder = new TextEncoder();
+  let reportBytes = encoder.encode(
+    JSON.stringify({ kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND, outcome: 'completed', summary, evidence }),
+  ).byteLength;
+  for (const receipt of frameworkToolReceipts(value)) {
+    if (evidence.length >= MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS) break;
+    if (seenCallIds.has(receipt.toolCallId) || byCallId.get(receipt.toolCallId)?.length !== 1) continue;
+    const parsed = harnessSubagentOutcomeEvidenceSchema.safeParse({
+      kind: 'tool-result',
+      toolName: receipt.toolName,
+      toolCallId: receipt.toolCallId,
+      status: receipt.status,
+      description: `Framework-observed result from ${receipt.toolName}.`,
+    });
+    // An optional receipt the report schema would reject is skipped, so it
+    // can never invalidate the verified terminal completion.
+    if (!parsed.success) continue;
+    const item = parsed.data;
+    // One more array element serializes as a comma plus the item.
+    const itemBytes = encoder.encode(JSON.stringify(item)).byteLength + 1;
+    // Skip a receipt that does not fit; a smaller later one still may.
+    if (reportBytes + itemBytes > MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES) continue;
+    reportBytes += itemBytes;
+    seenCallIds.add(receipt.toolCallId);
+    evidence.push(item);
+  }
 
   const projected = harnessSubagentOutcomeReportSchema.safeParse({
     kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
@@ -972,7 +1071,7 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
     summary,
     evidence,
   });
-  return projected.success ? projected.data : undefined;
+  return projected.success ? { report: projected.data, requiredEvidenceCount } : undefined;
 }
 
 /**

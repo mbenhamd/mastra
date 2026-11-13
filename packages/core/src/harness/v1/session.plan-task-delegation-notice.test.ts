@@ -2430,6 +2430,50 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       }
     });
 
+    // PF-8457: when storage refuses the cancel, the wake admission is released
+    // to dispatch recovery, which settles it as an orphan. The native mark that
+    // this process set when it admitted the wake is then dropped as well. Only
+    // the ledger's own count shows it: the mark's one reader looks at a run
+    // only when that run stages again, which a settled run does not.
+    it('a wake released to recovery after a refused cancel leaves no native mark behind', async () => {
+      const db = new InMemoryDB();
+      const a = realParent(true, { db }, true);
+      const held = holdWakeClaimAck(a);
+      const cancel = a.storage.cancelTerminalHandoff.bind(a.storage);
+      let refused = 0;
+      vi.spyOn(a.storage, 'cancelTerminalHandoff').mockImplementation(async (input: any) => {
+        if (refused === 0 && String(input.admissionId).startsWith('harness-wake:')) {
+          refused += 1;
+          throw new Error('cancel refused');
+        }
+        return cancel(input);
+      });
+      try {
+        const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(a, parent);
+        await endR0();
+        releaseChild();
+        await held.written;
+        await parent.abortActiveWork({ reason: 'user_requested' });
+        held.release();
+        await poll(() => refused === 1, 3000);
+        await poll(() => (parent as any)._wakeAdmissions.releasedSnapshot().length === 1, 3000);
+        // Resolving the live session runs the recovery that the release scheduled.
+        await a.harness.session({ sessionId: parent.id, resourceId: 'u1' });
+        await poll(() => wakeAdmissions(db).length === 1 && wakeAdmissions(db)[0]!.status !== 'pending', 3000);
+        await poll(() => (parent as any)._wakeAdmissions.inFlightCount === 0, 3000);
+        await deliveryFinished(parent, taskId);
+
+        expect((parent as any)._wakeAdmissions.releasedSnapshot()).toEqual([]);
+        expect((parent as any)._terminalStagingLedger.admissionCount).toBe(0);
+        expect((parent as any)._terminalStagingLedger.nativeRunCount).toBe(0);
+      } finally {
+        held.release();
+        a.releaseAll();
+        await a.harness.shutdown().catch(() => {});
+      }
+    });
+
     it('a Stop during a wake admission leaves no per-run grant state behind', async () => {
       const db = new InMemoryDB();
       const a = realParent(true, { db }, true);

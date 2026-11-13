@@ -261,6 +261,112 @@ describe('Harness subagent outcome terminal contract', () => {
     });
   });
 
+  it('proves every framework-observed call of a multi-call direct delivery, terminal call first', () => {
+    const terminalToolResult = {
+      status: 'success',
+      items: [
+        {
+          toolName: 'run_python_analysis',
+          toolCallId: 'python-3',
+          status: 'success',
+          value: { text: 'Profiled the dataset.' },
+        },
+      ],
+    };
+    const rawResult = withHarnessSubagentToolReceipts({ finishReason: 'tool-calls', terminalToolResult }, [
+      { toolCallId: 'python-1', toolName: 'run_python_analysis', status: 'success' },
+      { toolCallId: 'python-2', toolName: 'run_python_analysis', status: 'success' },
+      { toolCallId: 'python-3', toolName: 'run_python_analysis', status: 'success' },
+    ]);
+
+    const completion = verifyHarnessSubagentTerminalCompletion(rawResult);
+    expect(completion?.outcome).toBe('completed');
+    expect(completion?.evidence.map(item => [item.toolCallId, item.status])).toEqual([
+      ['python-3', 'success'],
+      ['python-1', 'success'],
+      ['python-2', 'success'],
+    ]);
+    expect(
+      summarizeHarnessSubagentResult(rawResult, { includeEarlierReceipts: true }).evidence?.map(
+        item => item.toolCallId,
+      ),
+    ).toEqual(['python-3', 'python-1', 'python-2']);
+    expect(summarizeHarnessSubagentResult(rawResult).evidence?.map(item => item.toolCallId)).toEqual(['python-3']);
+  });
+
+  it('adds no fallback-only, ambiguous or out-of-schema call to direct-delivery evidence, and keeps a failed call as an error', () => {
+    const terminalToolResult = {
+      status: 'success',
+      items: [
+        {
+          toolName: 'run_python_analysis',
+          toolCallId: 'python-final',
+          status: 'success',
+          value: { text: 'Profiled the dataset.' },
+        },
+      ],
+    };
+    const rawResult = withHarnessSubagentToolReceipts(
+      {
+        finishReason: 'tool-calls',
+        terminalToolResult,
+        toolResults: [{ toolCallId: 'provider-only', toolName: 'run_python_analysis', result: { success: true } }],
+      },
+      [
+        { toolCallId: 'python-failed', toolName: 'run_python_analysis', status: 'error' },
+        { toolCallId: 'python-ambiguous', toolName: 'run_python_analysis', status: 'success' },
+        { toolCallId: 'python-ambiguous', toolName: 'run_python_analysis', status: 'error' },
+        { toolCallId: 'x'.repeat(1_025), toolName: 'run_python_analysis', status: 'success' },
+        { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
+      ],
+    );
+
+    expect(
+      verifyHarnessSubagentTerminalCompletion(rawResult)?.evidence.map(item => [item.toolCallId, item.status]),
+    ).toEqual([
+      ['python-final', 'success'],
+      ['python-failed', 'error'],
+    ]);
+  });
+
+  it('keeps a near-limit direct delivery valid by leaving out only the earlier receipts that do not fit the report', () => {
+    const answer = 'a'.repeat(47 * 1024);
+    const terminalToolResult = {
+      status: 'success',
+      items: [
+        {
+          toolName: 'run_python_analysis',
+          toolCallId: 'python-final',
+          status: 'success',
+          value: { text: answer },
+        },
+      ],
+    };
+    const earlier = Array.from({ length: 23 }, (_, index) => ({
+      toolCallId: `${String(index).padStart(2, '0')}${'x'.repeat(1_022)}`,
+      toolName: 'run_python_analysis',
+      status: 'success' as const,
+    }));
+    const rawResult = withHarnessSubagentToolReceipts({ finishReason: 'tool-calls', terminalToolResult }, [
+      ...earlier,
+      { toolCallId: 'python-short', toolName: 'run_python_analysis', status: 'success' },
+      { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
+    ]);
+
+    const completion = verifyHarnessSubagentTerminalCompletion(rawResult);
+    expect(completion?.outcome).toBe('completed');
+    expect(completion?.evidence[0]?.toolCallId).toBe('python-final');
+    expect(completion?.evidence.length).toBeGreaterThan(1);
+    expect(completion?.evidence.length).toBeLessThan(24);
+    expect(completion?.evidence.at(-1)?.toolCallId).toBe('python-short');
+    const summary = summarizeHarnessSubagentResult(rawResult, { includeEarlierReceipts: true });
+    expect(summary).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
+    expect(projectHarnessSpawnSubagentResult({ subagentSessionId: 'child-session-1', result: summary })).toMatchObject({
+      kind: 'subagent-direct-answer',
+      text: answer,
+    });
+  });
+
   it('drops oversized or unprojected terminal artifact metadata without rejecting the verified text', () => {
     const oversizedTerminal = {
       status: 'success',

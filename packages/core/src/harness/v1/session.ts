@@ -39,16 +39,13 @@ import {
   AGENT_RESPONSE_RECOVERY_STEP,
 } from '../../agent/merge-execution-options';
 import type { AgentExecutionOptionComposers } from '../../agent/merge-execution-options';
-import { normalizeLogicalMessageIdentity } from '../../agent/message-list';
 import type { LogicalMessageIdentity } from '../../agent/message-list';
-import { createSignal } from '../../agent/signals';
 import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
 import {
   AgentThreadOutputDrainError,
   AgentThreadSignalAdmissionError,
   isAgentThreadOutputDrainTeardownError,
 } from '../../agent/thread-stream-runtime';
-import { parseToolApprovalDecision } from '../../agent/tool-call-identity';
 import type { ToolApprovalDecision } from '../../agent/tool-call-identity';
 import {
   ON_BEFORE_TOOL_EXECUTION_KEY,
@@ -62,7 +59,6 @@ import {
   clearSuspendedToolSurfaceFence,
   createToolSurfaceFence,
   materializeToolSurfaceFence,
-  readToolSurfaceFence,
   stageToolSurfaceFenceRestore,
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
@@ -72,7 +68,6 @@ import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
 import { RequestContext } from '../../request-context';
 import {
-  HarnessStorageAdmissionConflictError,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionClosedError,
   HarnessStorageSessionEventReplayUnsupportedError,
@@ -90,7 +85,6 @@ import {
   HarnessTerminalHandoffValidationError,
   HarnessTerminalFinalizationPendingError,
   assertJsonValue as assertBoundedTerminalJsonValue,
-  harnessWakeExecutionGrant,
   isHarnessDelegatedSettlementOutcome,
   isHarnessWakeReservedKey,
   validateHarnessTerminalExecutionGrant,
@@ -103,7 +97,6 @@ import type {
   AgentSignalResultStatus,
   CompareAndSwapSignalDispatchResult,
   HarnessAssistantDraft,
-  HarnessPlanTask,
   HarnessPlanTaskStatus,
   HarnessRunSummary,
   HarnessStorage,
@@ -122,7 +115,6 @@ import type {
   HarnessRuntimeDependencyRefs,
   InboxResponseReceipt,
   PendingInteractionExpiryGeneration,
-  PendingMessageAdmission,
   PendingMessageAdmissionScanCursor,
   QueueAdmissionReceipt,
   PendingResume,
@@ -141,8 +133,6 @@ import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import {
-  getTransformedToolPayload,
-  hasTransformedToolPayload,
   normalizeToolPayloadTransformPolicy,
   toolPayloadTransformPolicyPassesThrough,
 } from '../../tools/payload-transform';
@@ -168,7 +158,6 @@ import {
   HarnessConfigError,
   HarnessError,
   HarnessInboxItemNotFoundError,
-  HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
   HarnessOverrideConflictError,
   HarnessPendingInteractionDiscardedError,
@@ -179,8 +168,6 @@ import {
   HarnessQueuedTurnDeferredError,
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
-  HarnessSessionCorruptError,
-  HarnessSessionClosingError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessMessageResultErasedError,
@@ -188,8 +175,6 @@ import {
   HarnessStateConflictError,
   HarnessStateSerializationError,
   HarnessStorageError,
-  HarnessSubagentConcurrencyLimitError,
-  HarnessSubagentDepthExceededError,
   HarnessValidationError,
   redactPublicBoundaryRejection,
 } from './errors';
@@ -210,7 +195,6 @@ import type {
   HarnessEventUnsubscribe,
   RunCompletedEvent,
   RunCompletedStatus,
-  RunToolRollup,
   SubagentEndEvent,
   SubagentReasoningDeltaEvent,
   SubagentAnswerDeltaEvent,
@@ -222,12 +206,10 @@ import type {
 import type { Harness } from './harness';
 import type { StoredMessageRow } from './message-conversion';
 import { convertStoredMessageToHarnessMessage } from './message-conversion';
-import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import type {
   AddTaskInput,
   CheckInput,
   DecomposeChildInput,
-  DelegatedSettlementNoticeMode,
   DelegatedSubagentOutcome,
   PendingDelegationSettlementNotice,
   PlanTaskSessionPort,
@@ -237,45 +219,94 @@ import type {
   UpdateTaskInput,
 } from './plan-task-session';
 import {
-  capturePlanTaskDelegationScope,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
   planTaskDecompose,
-  planTaskDelegate,
   planTaskDowngradeDelegationWakeNotices,
-  planTaskReconcileDelegation,
   planTaskReparent,
   planTaskReset,
   planTaskUpdate,
-  PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
   PLAN_TASK_UPDATED_EVENT,
-  readDelegationAttemptMetadata,
-  readPendingDelegationSettlementNotice,
 } from './plan-task-session';
 import { createPlanTaskTools, TASK_CHECK_TOOL_ID } from './plan-task-tool';
 import {
   callerRequestContextToPersisted,
-  projectInheritedRequestContextApp,
   projectInheritedRequestContextAppBag,
   validateCallerRequestContext,
 } from './request-context-input';
 import {
-  admissionLost,
-  DELEGATED_SUBAGENT_CANCELLED_ERROR,
-  DELEGATED_SUBTREE_MAX_NODES,
-  DELEGATION_DEADLINE_REACHED,
-  DELEGATION_RECONCILE_RETRY_BASE_MS,
-  DELEGATION_RECONCILE_RETRY_MAX_MS,
+  activeWorkAdmissionIsCurrent,
+  assertActiveWorkAdmission,
+  awaitDurableMessageResult,
+  beginActiveWorkInvalidation,
+  captureActiveWorkAdmission,
+  completedEvidenceResult,
+  computeMessageAdmissionHashes,
+  hasLiveMessageRun,
+  messageAdmissionIdentity,
+  messageDuplicateModeId,
+  messageDuplicateModelId,
+  resolveMessageAdmissionDuplicate,
+  returnDuplicateMessageResult,
+  writeMessageResultEvidence,
+  writeMessageResultEvidenceBestEffort,
+  writeMessageResultEvidenceBestEffortInBackground,
+} from './session-admission-reservation';
+import type { AdmissionReservationSessionPort } from './session-admission-reservation';
+import {
+  cancelAndCloseDelegatedChildForDeadline,
+  cancelOwnedSubagentSessions,
+  cancelSubagent,
+  cascadeCancellationToOwnedSubagents,
+  clearDelegationReconcileTimers,
   delegationAdmissionId,
+  delegationLinkIsCurrent,
   delegationSignalId,
-  isParentRequestedSubagentCancel,
+  driveDelegatedSubagent,
+  emitSubagentEvent,
+  internalAssertSubagentControlAdmitted,
+  internalCancelOwnedSubagent,
+  internalOnDelegatedSettlement,
+  internalRearmDelegationReconcile,
+  internalReleaseSubagentExecution,
+  internalTryReserveSubagentExecution,
+  internalUpdateSubagentProgress,
+  listDelegatedSubagentSessionIds,
+  loadDelegationOutcomeFromEvidence,
   owesRecoveredCompletion,
-  summarizeDelegationDeadline,
-  waitForDelegationResult,
+  planTaskDelegatePreflight,
+  publishOwedDelegationCompletions,
+  reconcileDelegatedTask,
+  reconcileDelegationsOnHydrate,
+  reconcileDelegationsOnHydratePass,
+  scheduleDelegationReconcileRetry,
+  sessionPlanTaskDelegate,
 } from './session-delegation';
-import { MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS, pendingResumeForDisplay } from './session-display';
+import type { DelegationDriverSessionPort } from './session-delegation';
+import {
+  harnessDisplayToolPayload,
+  MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS,
+  pendingResumeForDisplay,
+} from './session-display';
 import type { SessionDisplayState, SessionRunProjection } from './session-display';
+import {
+  createDeferred,
+  delay,
+  MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS,
+  MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS,
+  MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS,
+  ORPHANED_DISPATCH_RETRY_MS,
+  QUEUE_ACCEPTED_RECOVERY_STALE_MS,
+  QUEUE_POST_RUN_FINALIZATION_RETRY_MS,
+} from './session-durable-wait';
+import type { Deferred } from './session-durable-wait';
+import {
+  HARNESS_RUN_INTERRUPTED_MESSAGE,
+  publicErrorProjectionToError,
+  QueuePostRunFinalizationPendingError,
+  ResumeRecoveryStaleError,
+} from './session-errors';
 import {
   clearSessionGoal,
   createGoalJudgeAgent,
@@ -288,6 +319,7 @@ import {
   updateGoalJudgeDefaults,
 } from './session-goal-judge';
 import type { GoalJudgeSessionPort } from './session-goal-judge';
+import { MessageTokenLedger } from './session-message-token-ledger';
 import {
   currentMode,
   currentModeId,
@@ -316,25 +348,85 @@ import {
 } from './session-observational-memory';
 import type { ObservationalMemorySessionPort } from './session-observational-memory';
 import {
-  ASK_USER_TOOL_NAME,
-  cancelledPendingAudit,
-  compactJsonObject,
-  DISCARD_PENDING_INTERACTION_KINDS,
-  discardReceiptResult,
-  MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH,
-  preRegistrationSlot,
-  SUBMIT_PLAN_TOOL_NAME,
+  interruptOrphanedMessageDispatch,
+  recheckOrphanedDispatchesIfDue,
+  recoverOrphanedMessageDispatches,
+  scheduleOrphanRecheck,
+} from './session-orphan-recovery';
+import type { OrphanRecoverySessionPort } from './session-orphan-recovery';
+import {
+  appendExpiredPendingInteraction,
+  applyInboxReceiptFromCompletedQueue,
+  assertMatchingInboxReceipt,
+  captureMessageSuspendWithTokenUsage,
+  clearPendingInteractionExpiryTimer,
+  completeDiscardedPendingInteraction,
+  computeInboxResponseHash,
+  discardClaimForPending,
+  discardedErrorForReceipt,
+  discardPendingInteraction,
+  discardPendingInteractionForAbort,
+  discardReceiptForAnswer,
+  emitPendingEvent,
+  expirePendingInteraction,
+  findDiscardReceipt,
+  findDiscardReceiptIn,
+  getOwnRecordValue,
+  inboxReceiptResult,
+  internalExpirePendingInteractionGeneration,
+  markInboxResponseApplied,
+  MAX_INBOX_RESPONSE_RECEIPTS,
+  maybeCaptureSuspend,
+  maybeFinalizeRetriedResumedTerminal,
+  maybeRecoverStaleQueuedResume,
+  messageSuspendedTokenUsageDelta,
+  modeIdForPendingResume,
+  pendingInteractionDueAt,
+  pendingInteractionExpiresAt,
+  pendingInteractionGeneration,
+  pendingInteractionGenerationKey,
+  pendingResumeFromSuspendedOutput,
+  pendingRunToolReceiptProjection,
+  probeResumeAdmissionByRun,
+  pruneInboxResponseReceipts,
+  queuedItemIdForPendingResume,
+  receiptGenerationDiscarded,
+  reconcilePendingInteractionDeadlineGeneration,
+  reconcilePendingInteractionExpiryOnHydrate,
+  recordInboxResponsePreDispatchFailure,
+  recoverStaleResumeAdmission,
+  registerPlanApproval,
+  registerQuestion,
+  registerSandboxAccess,
+  resolvePlanApprovalModeFlipTarget,
+  resolveStoredInboxResponse,
+  respondToPlanApproval,
+  respondToQuestion,
+  respondToSandboxAccess,
+  respondToToolApproval,
+  respondToToolSuspension,
+  runtimeDependenciesForPendingResume,
+  settlePendingInteractionCancellation,
+  settleResumedTerminalHandoff,
+  syncPendingInteractionExpiryTimer,
+  throwIfPendingGenerationDiscarded,
+  throwStoredInboxResponseFailure,
+  tokenUsageDeltaFromFullOutput,
+  waitForMessageSuspendedTokenUsageOwner,
 } from './session-pending-interactions';
 import type {
+  DiscardGeneration,
   InboxReceiptResponseOptions,
   LegacyInboxResponseOptions,
   PendingExpiryOutcome,
+  PendingInteractionsSessionPort,
   QueueResumeRecoveryResult,
 } from './session-pending-interactions';
 import {
   ASSISTANT_DRAFT_FLUSH_DELAY_MS,
   ASSISTANT_DRAFT_TEXT_DECODER,
   ASSISTANT_DRAFT_TEXT_ENCODER,
+  firstNonJsonStatePath,
   isPlainStateObject,
   MAX_ASSISTANT_DRAFT_FIELD_BYTES,
   MAX_PENDING_FAILED_EVENT_APPENDS,
@@ -348,14 +440,14 @@ import {
   UNSUSPENDED_AGENTIC_LOOP_STATUSES,
 } from './session-persistence';
 import { QueueHead } from './session-queue-head';
+import { ReplacementToolSurfaceSlot } from './session-replacement-tool-surface-slot';
+import { ResumeUsageFence } from './session-resume-usage-fence';
+import { RunCompletionWaiters } from './session-run-completion-waiters';
+import { RunOutcomeCache } from './session-run-outcome-cache';
+import { RunSpanTracker } from './session-run-span-tracker';
+import type { RunSpanSnapshot } from './session-run-span-tracker';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
-import {
-  DelegationNoticeWakeNotSentError,
-  WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS,
-  WAKE_TERMINAL_COMMIT_RETRY_BASE_MS,
-  WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
-} from './session-settlement-notices';
 import type {
   DelegationNoticeOutcome,
   NoticeDelivery,
@@ -363,10 +455,40 @@ import type {
   NoticeFenceSite,
   WakeReminderRowOrigin,
 } from './session-settlement-notices';
-import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
+import {
+  lineagedSignalAcceptanceError,
+  lineagedSignalRunMismatchError,
+  NativeSignalAcceptanceTimeoutError,
+  SIGNAL_DISPATCH_CLAIM_TTL_MS,
+} from './session-signal-acceptance';
+import {
+  acceptSignalDispatch,
+  adoptSignalSettlement,
+  awaitDurableSignalResult,
+  awaitSignalNativeAcceptance,
+  buildSignalContentsWithAttachments,
+  channelSignalAdmissionHash,
+  claimSignalDispatch,
+  commitWakeTerminalWithRetry,
+  compareAndSwapSignalDispatch,
+  computeSignalAdmissionHash,
+  deletedOperationEvidenceSignalIds,
+  injectSystemReminder,
+  loadSignalAdmissionEvidence,
+  returnDuplicateSignalResult,
+  sessionInjectSystemReminder,
+  settleSignalResult,
+  signalAdmissionIdentity,
+  signalDispatchState,
+  startSignalDispatchClaimHeartbeat,
+  wakeGrantAllowed,
+} from './session-signals';
+import type { SignalsSessionPort } from './session-signals';
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
+import { RejectedTerminalRun, terminalFinalizerKey } from './session-terminal-finalizers';
 import { TerminalStagingLedger } from './session-terminal-staging-ledger';
+import { TerminalSubagentAnswers } from './session-terminal-subagent-answers';
 import {
   assertPolicy,
   assertToolCategory,
@@ -374,10 +496,17 @@ import {
   UNGATED_HARNESS_BUILTIN_TOOL_IDS,
 } from './session-tool-surface';
 import {
+  assertCallerAdmissionIdNotReserved,
   assertCallerGrantKeyNotReserved,
   boundInboxReceiptResult,
+  cloneAttachmentMetadata,
+  clonePersistedRequestContext,
+  HARNESS_SESSION_MAX_STEPS,
   HarnessResponseRecoveryAlreadyPreparedError,
+  normalizeObservationalMemorySourceWriteGuard,
+  normalizeSessionLogicalMessageIdentity,
   normalizeSessionLogicalMessageInputIdentity,
+  sameObservationalMemorySourceWriteGuard,
 } from './session-turn-options';
 import type {
   HarnessExecutionHookErrorReporter,
@@ -390,29 +519,17 @@ import { SessionWorkspace } from './session-workspace';
 import type { WorkspaceSessionPort } from './session-workspace';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
-import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
+import { createHarnessSubagentBudgetMeter } from './subagent-budget';
 import type { HarnessSubagentBudgetExhaustion, HarnessSubagentBudgetMeter } from './subagent-budget';
 import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
-import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
-import type { DelegationDriveSettlement } from './subagent-tracing';
-import type {
-  HarnessSubagentDirectAnswer,
-  HarnessSubagentResultSummary,
-  HarnessSubagentToolReceipt,
-} from './terminal-subagent-result';
+import type { HarnessSubagentResultSummary, HarnessSubagentToolReceipt } from './terminal-subagent-result';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   harnessSubagentOutcomeReportSchema,
   MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
   materializeHarnessTerminalText,
-  parseHarnessSubagentBudgetExhausted,
-  parseHarnessSubagentOutcomeReport,
   parseHarnessSubagentTerminalResult,
-  parseHarnessTerminalToolResultText,
-  summarizeHarnessSubagentEventResult,
-  summarizeHarnessSubagentResult,
-  verifyHarnessSubagentTerminalCompletion,
   withHarnessSubagentBudgetExhausted,
   withHarnessSubagentToolReceipts,
 } from './terminal-subagent-result';
@@ -448,7 +565,6 @@ import type {
   SessionSignalOptions,
   SessionSignalResult,
   SetStateOptions,
-  SubagentDefinition,
   ToolCategory,
   ActivityTimelineOptions,
   SessionActivityTimeline,
@@ -462,17 +578,17 @@ export type {
   SessionRunProjection,
 } from './session-display';
 
-type MessageAdmissionIdentity = {
+export type MessageAdmissionIdentity = {
   signalId: string;
   runId: string;
 };
 
-type SignalAdmissionIdentity = {
+export type SignalAdmissionIdentity = {
   signalId: string;
   idleRunId: string;
 };
 
-type SignalAdmission = {
+export type SignalAdmission = {
   admissionId: string;
   admissionHash: string;
   modeId: string;
@@ -482,70 +598,12 @@ type SignalAdmission = {
   dispatch: AgentSignalDispatchState;
 };
 
-type SignalDispatchingState = Extract<AgentSignalDispatchState, { state: 'dispatching' }>;
-type SignalAcceptedDispatchState = Extract<AgentSignalDispatchState, { state: 'accepted' }>;
-type SignalSettlementAdmission = Pick<
+export type SignalDispatchingState = Extract<AgentSignalDispatchState, { state: 'dispatching' }>;
+export type SignalAcceptedDispatchState = Extract<AgentSignalDispatchState, { state: 'accepted' }>;
+export type SignalSettlementAdmission = Pick<
   SignalAdmission,
   'admissionId' | 'admissionHash' | 'modeId' | 'modelId' | 'dispatch'
 >;
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason: unknown) => void;
-};
-
-/**
- * Validate and clone the native OM source-write fence at a Harness boundary.
- * The fence is an execution identity, so accepting a partial or malformed
- * value would turn a retry into an unbound write.
- */
-function normalizeObservationalMemorySourceWriteGuard(
-  value: ObservationalMemorySourceWriteGuard | undefined,
-  field: string,
-): ObservationalMemorySourceWriteGuard | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new HarnessValidationError(field, 'must be an object with recordId, threadId, and resourceId');
-  }
-  if (typeof value.recordId !== 'string' || value.recordId.length === 0) {
-    throw new HarnessValidationError(`${field}.recordId`, 'must be a non-empty string');
-  }
-  if (value.threadId !== null && typeof value.threadId !== 'string') {
-    throw new HarnessValidationError(`${field}.threadId`, 'must be a string or null');
-  }
-  if (typeof value.resourceId !== 'string' || value.resourceId.length === 0) {
-    throw new HarnessValidationError(`${field}.resourceId`, 'must be a non-empty string');
-  }
-  return {
-    recordId: value.recordId,
-    threadId: value.threadId,
-    resourceId: value.resourceId,
-  };
-}
-
-function sameObservationalMemorySourceWriteGuard(
-  left: ObservationalMemorySourceWriteGuard | undefined,
-  right: ObservationalMemorySourceWriteGuard | undefined,
-): boolean {
-  return (
-    left?.recordId === right?.recordId && left?.threadId === right?.threadId && left?.resourceId === right?.resourceId
-  );
-}
-
-function harnessDisplayToolPayload(
-  metadata: unknown,
-  phase: 'input-delta' | 'input-available' | 'output-available' | 'error',
-  fallback: unknown,
-): unknown {
-  const transformed = getTransformedToolPayload(metadata, 'display', phase);
-  if (hasTransformedToolPayload(transformed)) return transformed.transformed;
-  // A display policy may intentionally suppress a payload. Never fall back to
-  // the raw value in that case, because Harness events are durable/replayable
-  // display records rather than the model's private transcript.
-  if (transformed?.suppress === true) return { suppressed: true };
-  return fallback;
-}
 
 /**
  * §S4.1 — a pending event-ledger append awaiting transient-failure retry. Everything
@@ -564,7 +622,7 @@ type PendingEventAppend = {
   emittedAt: number;
 };
 
-type MessageAdmissionStart = {
+export type MessageAdmissionStart = {
   admissionHash: string;
   modeId: string;
   modelId: string;
@@ -580,12 +638,12 @@ type MessageAdmissionStart = {
   duplicate?: boolean;
 };
 
-type MessageAdmissionHashes = {
+export type MessageAdmissionHashes = {
   primary: string;
   legacyCompatible: readonly string[];
 };
 
-type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
+export type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 
 /**
  * Tool IDs the harness translates from `tool-call-approval` /
@@ -597,21 +655,6 @@ type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
 const MAX_ABORTED_TOOL_TOMBSTONES = 4096;
 /** Defensive cap on exact-once tool-terminal observations across resumed segments. */
 const MAX_EMITTED_TOOL_TERMINALS = 4096;
-/** One session can expose only one pending interaction at a time; keep a small
- * durable tail so late reconnect responses receive an exact expiry result
- * without allowing tombstones to grow without bound. */
-const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
-
-// Step ceiling for every harness-driven agent turn. Without an explicit
-// `maxSteps`, `agent.stream()`/`agent.generate()` fall back to the agent's
-// small default (5), and a tool-heavy turn terminates CLEANLY at the step
-// boundary with no synthesis text — live-diagnosed as a silent empty chat
-// turn: 5 tool-only steps, `finish-step`×5, `finish`, zero text deltas
-// (models that batch small parallel tool calls burn the budget fastest).
-// agent-controller.ts centralizes the same guarantee for CLI-harness runs
-// (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
-// budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
-const HARNESS_SESSION_MAX_STEPS = 1000;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -913,14 +956,6 @@ class HarnessOrdinaryStepBudgetExhaustedError extends Error {
   }
 }
 
-// §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
-// itself is idempotency state, so only a recent window is needed, and a stored
-// result must never carry provider payloads large enough to push the session
-// record past a storage document limit (Azure Responses reasoning blobs made a
-// single applied receipt ~400KB and broke every later saveSession with an
-// HTTP 500).
-const MAX_INBOX_RESPONSE_RECEIPTS = 64;
-
 function pruneQueueAdmissionReceipts(
   receipts: Record<string, QueueAdmissionReceipt>,
 ): Record<string, QueueAdmissionReceipt> {
@@ -930,48 +965,8 @@ function pruneQueueAdmissionReceipts(
   return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
 }
 
-function pruneInboxResponseReceipts(
-  receipts: Record<string, InboxResponseReceipt>,
-): Record<string, InboxResponseReceipt> {
-  const entries = Object.entries(receipts);
-  if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
-  entries.sort((left, right) => (right[1].updatedAt ?? 0) - (left[1].updatedAt ?? 0));
-  // `discardPendingInteraction` receipts are the durable replay and
-  // crash-recovery record of a discard. Its claim converts the generation's
-  // other receipts in the same write (sharing its timestamp), so plain recency
-  // could evict it at once. Retain the newest few discard receipts first; the
-  // remaining slots keep the ordinary recency order.
-  const pinned = entries
-    .filter(([, receipt]) => receipt.discardedAt !== undefined)
-    .slice(0, MAX_RETAINED_DISCARD_RECEIPTS);
-  const pinnedIds = new Set(pinned.map(([responseId]) => responseId));
-  const rest = entries.filter(([responseId]) => !pinnedIds.has(responseId));
-  return Object.fromEntries([...pinned, ...rest.slice(0, MAX_INBOX_RESPONSE_RECEIPTS - pinned.length)]);
-}
-
-/** Discard receipts retained ahead of recency pruning (bounded). */
-const MAX_RETAINED_DISCARD_RECEIPTS = 8;
-
 /** Backoff before the one retry of a failed provider-result stage. */
 const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
-const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
-const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
-const MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS = 1_000;
-const MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS = 15_000;
-const SIGNAL_DISPATCH_CLAIM_TTL_MS = 30_000;
-const SIGNAL_DISPATCH_CLAIM_RENEW_MS = 10_000;
-const SIGNAL_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
-const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
-/**
- * Settlement message recorded (with `HARNESS_RUN_INTERRUPTED_ERROR_CODE`) when
- * recovery finds an admitted `message()` dispatch whose owner died mid-run.
- */
-const HARNESS_RUN_INTERRUPTED_MESSAGE =
-  'The run was interrupted when the process that owned it stopped; it was not re-run.';
-/** Back-off before recovery retries a turn whose settlement did not commit. */
-const ORPHANED_DISPATCH_RETRY_MS = 1_000;
 // Cap explicit extensions to one day so a lost worker cannot pin a session indefinitely.
 const MAX_LEASE_EXTENSION_MS = 24 * 60 * 60 * 1_000;
 
@@ -1010,89 +1005,6 @@ function diffStateKeys(prev: unknown, next: unknown): string[] {
   return changed;
 }
 
-/**
- * §5.1 state-shape validation. Returns the dotted path (`$` for the root) of the
- * FIRST value in a candidate `session.state` that cannot round-trip through
- * `JSON.stringify`/`JSON.parse` as plain JSON, or `undefined` when the whole
- * value is valid. Valid = `null`, string, boolean, FINITE number, plain array,
- * or PLAIN object whose values are all valid.
- *
- * The check is descriptor-STRICT — it rejects everything `JSON.stringify` would
- * silently DROP or TRANSFORM, not just obviously-bad scalar values:
- *   - scalar: `undefined`, `function`, `symbol`, `bigint`, `NaN`/`Infinity`
- *   - circular references
- *   - non-plain objects (`Date`/`Map`/`Set`/`RegExp`/class instances) — these
- *     either throw, serialize as `{}`, or transform via `toJSON`
- *   - symbol-keyed properties (dropped by JSON)
- *   - non-enumerable own properties (dropped by JSON)
- *   - accessor properties (getters/setters) — not data, and a getter would run
- *     arbitrary/throwing code; we reject WITHOUT invoking it
- *   - arrays with non-index own properties or sparse holes (dropped / become null)
- * Traversal is deterministic (`Reflect.ownKeys` order) so the reported path is
- * stable, and a data value is only READ after its descriptor is confirmed safe.
- */
-function firstNonJsonStatePath(value: unknown, path: string, seen: Set<object>): string | undefined {
-  if (value === null) return undefined;
-  const t = typeof value;
-  if (t === 'string' || t === 'boolean') return undefined;
-  if (t === 'number') return Number.isFinite(value as number) ? undefined : path;
-  if (t === 'undefined' || t === 'function' || t === 'symbol' || t === 'bigint') return path;
-  if (t !== 'object') return path;
-  const obj = value as object;
-  if (seen.has(obj)) return path; // circular reference
-
-  if (Array.isArray(obj)) {
-    seen.add(obj);
-    const len = obj.length;
-    // Reject any own key that isn't a dense [0, len) index (extra props +
-    // accessors are dropped/transformed by JSON; `length` is intrinsic).
-    for (const key of Reflect.ownKeys(obj)) {
-      if (key === 'length') continue;
-      if (typeof key === 'symbol') return done(seen, obj, path);
-      // Only CANONICAL dense indices are real array elements; `"01"`/`"1.0"`/
-      // `""`/`" "` etc. coerce into range but are non-index props JSON drops.
-      const idx = Number(key);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= len || String(idx) !== key) return done(seen, obj, path);
-      const desc = Object.getOwnPropertyDescriptor(obj, key);
-      if (desc === undefined || desc.get !== undefined || desc.set !== undefined) {
-        return done(seen, obj, path === '$' ? String(idx) : `${path}.${idx}`);
-      }
-    }
-    for (let i = 0; i < len; i++) {
-      const childPath = path === '$' ? String(i) : `${path}.${i}`;
-      if (!(i in obj)) return done(seen, obj, childPath); // sparse hole (JSON → null)
-      const r = firstNonJsonStatePath((obj as unknown[])[i], childPath, seen);
-      if (r !== undefined) return done(seen, obj, r);
-    }
-    seen.delete(obj);
-    return undefined;
-  }
-
-  // Only plain objects (Object.prototype or null prototype) are valid JSON
-  // containers; Date/Map/Set/class instances etc. are not round-trippable.
-  const proto = Object.getPrototypeOf(obj);
-  if (proto !== Object.prototype && proto !== null) return path;
-  seen.add(obj);
-  for (const key of Reflect.ownKeys(obj)) {
-    if (typeof key === 'symbol') return done(seen, obj, path); // symbol-keyed prop (dropped)
-    const childPath = path === '$' ? key : `${path}.${key}`;
-    const desc = Object.getOwnPropertyDescriptor(obj, key);
-    if (desc === undefined) return done(seen, obj, childPath);
-    if (!desc.enumerable) return done(seen, obj, childPath); // dropped by JSON
-    if (desc.get !== undefined || desc.set !== undefined) return done(seen, obj, childPath); // accessor — never invoked
-    const r = firstNonJsonStatePath((obj as Record<string, unknown>)[key], childPath, seen);
-    if (r !== undefined) return done(seen, obj, r);
-  }
-  seen.delete(obj);
-  return undefined;
-}
-
-/** Pop the circular-tracking frame and return the offending path. */
-function done(seen: Set<object>, obj: object, path: string): string {
-  seen.delete(obj);
-  return path;
-}
-
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
 export interface QueueBackpressureDrop {
@@ -1125,7 +1037,7 @@ function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorag
  * the notice and the settlement the wake delivers; the finalizer receives it
  * and the wake payload envelope is built from it.
  */
-interface HarnessWakeTerminalSeed {
+export interface HarnessWakeTerminalSeed {
   [key: string]: JsonValue;
   origin: 'wake';
   wakeNoticeId: string;
@@ -1175,18 +1087,6 @@ function wakeTerminalFinalizer(finalizer: HarnessTerminalFinalizer): HarnessTerm
       return { projectionKind: projection.projectionKind, projectionId: projection.projectionId, payload };
     },
   };
-}
-
-/**
- * PF-7631: the `harness-wake:` namespace is minted only by the Harness, one
- * grant per settlement wake turn. Every public admission boundary shares the
- * session's admission-id space (message, queue and signal evidence), so each
- * rejects a caller id in it before any evidence is written.
- */
-function assertCallerAdmissionIdNotReserved(field: string, admissionId: string | undefined): void {
-  if (admissionId !== undefined && isHarnessWakeReservedKey(admissionId)) {
-    throw new HarnessValidationError(field, 'admissionId uses the Harness-reserved wake namespace');
-  }
 }
 
 /**
@@ -1267,7 +1167,7 @@ interface IdleWaiter {
   cleanup: () => void;
 }
 
-interface ActiveTurnWaiter {
+export interface ActiveTurnWaiter {
   promise: Promise<never>;
   controller?: AbortController;
   reject: (err: unknown) => void;
@@ -1278,13 +1178,13 @@ export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 
 
 // ---------------------------------------------------------------------------
 // Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
-// `run_completed` event + the durable run summary. An OpenRunSpan is opened at
+// `run_completed` event + the durable run summary. A run span is opened at
 // the run's FIRST `agent_start` (agent_start is emitted ONCE per run; a resume
 // reuses the runId and emits only the terminal `agent_end`) and finalized +
 // removed at the run's terminal `agent_end`. It is intentionally NOT cleared by
 // `_resetTurnTracking`/`_endTurn`, so it survives an in-process suspend/resume
 // and the duration spans the whole run (including any HITL wait). A run whose
-// original start was lost to a process restart has NO OpenRunSpan when its
+// original start was lost to a process restart has NO open span when its
 // terminal fires post-restart → the summary is marked `reconstructed` and omits
 // the start/duration/rollup rather than publishing falsely precise metrics.
 // ---------------------------------------------------------------------------
@@ -1301,23 +1201,6 @@ interface RunSpanIdentity {
   operationKind?: HarnessRunOperationRefKind;
 }
 
-/** @internal — in-memory accumulator for one in-flight run's span + tool rollup. */
-interface OpenRunSpan {
-  startedAt: number;
-  identity: RunSpanIdentity;
-  /** Per-tool-call start times (runId-scoped), used to compute `tool_end.durationMs` even across an in-process suspend. */
-  activeToolStarts: Map<string, { toolName: string; startedAt: number }>;
-  rollup: {
-    count: number;
-    errors: number;
-    totalDurationMs: number;
-    maxDurationMs: number;
-    perTool: Map<string, { count: number; errors: number; totalDurationMs: number }>;
-  };
-}
-
-/** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
-const MAX_FINALIZED_RUN_IDS = 4096;
 /** Bounded safe receipt evidence retained per run for subagent settlement. */
 const MAX_HARNESS_RUN_TOOL_RECEIPTS = 256;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES = 64 * 1024;
@@ -1357,25 +1240,6 @@ export interface SessionInternals {
    * including settle-only versions, commit a `HarnessWakeTerminalPayload`.
    */
   terminalWakeFinalizer?: HarnessTerminalFinalizer;
-}
-
-/** Lookup key for a terminal finalizer registration by its id and version. */
-export function terminalFinalizerKey(id: string, version: string): string {
-  return JSON.stringify([id, version]);
-}
-
-function normalizeSessionLogicalMessageIdentity(
-  value: LogicalMessageIdentity | undefined,
-  methodName: string,
-): LogicalMessageIdentity | undefined {
-  try {
-    return normalizeLogicalMessageIdentity(value);
-  } catch (error) {
-    throw new HarnessValidationError(
-      `${methodName}.logicalMessageIdentity`,
-      error instanceof Error ? error.message : 'must contain valid input and response ids',
-    );
-  }
 }
 
 /**
@@ -1519,19 +1383,18 @@ export class Session {
     toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
     fence: ToolSurfaceFence;
   };
-  /** At most one process-local replacement snapshot per Session pending slot. */
-  private readonly _pendingReplacementToolSurfaces = new Map<string, ToolSurfaceFence>();
+  /** PF-8547: at most one process-local replacement snapshot per Session pending slot. */
+  private readonly _replacementToolSurface = new ReplacementToolSurfaceSlot();
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
-   * Span-summary — in-flight run span accumulators, keyed by runId. Opened at a
-   * run's first `agent_start`, finalized + deleted at its terminal `agent_end`.
-   * NOT reset per turn, so it survives an in-process suspend/resume. See
-   * {@link OpenRunSpan}.
+   * Span-summary — the open run spans and the finalized runs (PF-8738). A
+   * span opens at a run's first `agent_start` and closes when the run is
+   * finalized at its terminal `agent_end`; it is NOT reset per turn, so it
+   * survives an in-process suspend/resume. A run is finalized at most once
+   * (within a bounded memory). See {@link RunSpanTracker}.
    */
-  private readonly _openRuns = new Map<string, OpenRunSpan>();
-  /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
-  private readonly _finalizedRunIds = new Set<string>();
+  private readonly _runSpans = new RunSpanTracker<RunSpanIdentity>();
   /** Message result-evidence writes in flight (awaited by close before its pending check). */
   private readonly _resultEvidenceWrites = new Set<Promise<unknown>>();
   /** Orphaned-dispatch recovery in flight (one per session at a time). */
@@ -1554,7 +1417,7 @@ export class Session {
    * the still-parked pending generation so the durable watermark advances
    * atomically with whichever write commits first.
    */
-  private _resumeUsageBaseline: { generationKey: string; runUsage: TokenUsage } | undefined;
+  private readonly _resumeUsageFence = new ResumeUsageFence();
   /** Span-summary — tail promise serializing best-effort durable run-summary writes (Slice B). */
   private _runSummaryPersistence: Promise<void> = Promise.resolve();
   private readonly _activeTurnWaiters = new Set<ActiveTurnWaiter>();
@@ -1650,10 +1513,7 @@ export class Session {
    */
   private _modeSwitchEpoch = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
-  private readonly _pendingTerminalSubagentAnswers = new Map<
-    string,
-    { partId: string; answer: HarnessSubagentDirectAnswer }
-  >();
+  private readonly _terminalSubagentAnswers = new TerminalSubagentAnswers();
   /** `${runId}:${partId}` deduplication for duplicate/replayed terminal frames. */
   private readonly _deliveredTerminalSubagentAnswers = new Set<string>();
   private readonly _assistantDrafts = new Map<string, HarnessAssistantDraft>();
@@ -1761,19 +1621,8 @@ export class Session {
   /** True once the subscription has been torn down (by close or eviction).
    *  Guards re-opens and re-entrant teardown. */
   private _threadSubscriptionClosed = false;
-  /**
-   * Per-run completion promises, keyed by `runId`. `_watchRunCompletion()`
-   * resolves or rejects the matching entry after the runtime output finishes.
-   * Entries left over on `close()` are rejected so callers don't hang.
-   */
-  private readonly _runCompletionPromises = new Map<
-    string,
-    {
-      promise: Promise<FullOutput<unknown>>;
-      resolve: (full: FullOutput<unknown>) => void;
-      reject: (err: unknown) => void;
-    }
-  >();
+  /** PF-8485: the per-run completion waiters `_awaitRunCompletion()` callers share. */
+  private readonly _runCompletionWaiters = new RunCompletionWaiters();
   /**
    * Runs whose model output has reached its terminal boundary but whose
    * subscription events are still draining. Closing the subscription must not
@@ -1792,21 +1641,14 @@ export class Session {
    * `runFailed` marks a failure the run's own output reported (a provider or
    * agent error), as opposed to harness bookkeeping around the run.
    */
-  private readonly _completedRuns = new Map<
-    string,
-    | { ok: true; full: FullOutput<unknown>; resumeAccountingKey?: string }
-    | { ok: false; err: unknown; runFailed?: true }
-  >();
+  private readonly _runOutcomes = new RunOutcomeCache(evicted => {
+    this._messageTokenLedger.evict(evicted);
+    this._runToolReceipts.delete(evicted);
+  });
   /** Runs of aborted native terminal turns whose output had not settled yet (bounded). */
   private readonly _abortedTerminalRunIds = new Set<string>();
-  /**
-   * Message admission retries can observe `_completedRuns` before the original
-   * message continuation has accounted usage. Track run ids accounted through
-   * either path so the retry can persist before writing evidence without the
-   * original continuation double-counting later.
-   */
-  private readonly _messageTokenAccountedRunIds = new Set<string>();
-  private readonly _messageTokenAccountingRunIds = new Set<string>();
+  /** PF-8451: the message-token ledger (runs counted here, runs a suspended capture is counting). */
+  private readonly _messageTokenLedger = new MessageTokenLedger();
   /** §10.5: when false, transient streaming deltas are not persisted (live-only). */
   private readonly _persistTransientStreamingEvents: boolean;
   /** Registered opt-in sanitizer for the native terminal transaction. */
@@ -1821,7 +1663,6 @@ export class Session {
   private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
   /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
   private readonly _wakeAdmissions = new WakeAdmissions();
-  private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /**
    * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
    * native admission mark, cached pending admission).
@@ -2077,10 +1918,107 @@ export class Session {
     return this._subagentBudget;
   }
 
-  /** Spend to persist with a pending interaction, so a restart cannot reset it. */
-  private _subagentBudgetSpentProjection(): Pick<PendingResume, 'subagentBudgetSpent'> {
-    const meter = this._subagentBudgetMeter();
-    return meter === undefined ? {} : { subagentBudgetSpent: meter.spent() };
+  /** Build the port the pending-interactions-resume functions reach the session through. */
+  private _pendingInteractionsPort(): PendingInteractionsSessionPort {
+    const session = this;
+    return {
+      emitter: this._emitter,
+      harness: this._harness,
+      id: this.id,
+      messageTokenLedger: this._messageTokenLedger,
+      queueHead: this._queueHead,
+      replacementToolSurface: this._replacementToolSurface,
+      resourceId: this.resourceId,
+      runOutcomes: this._runOutcomes,
+      runToolReceipts: this._runToolReceipts,
+      subagentDepth: this.subagentDepth,
+      threadId: this.threadId,
+      get currentAgentRequestContext() {
+        return session._currentAgentRequestContext;
+      },
+      get currentRunId() {
+        return session._currentRunId;
+      },
+      get currentTurnAbortController() {
+        return session._currentTurnAbortController;
+      },
+      get currentTurnReplacementToolSurface() {
+        return session._currentTurnReplacementToolSurface;
+      },
+      get currentTurnRequestContext() {
+        return session._currentTurnRequestContext;
+      },
+      get currentTurnSourceWriteGuard() {
+        return session._currentTurnSourceWriteGuard;
+      },
+      get currentTurnYolo() {
+        return session._currentTurnYolo;
+      },
+      get ownedSignalTurnOrigin() {
+        return session._ownedSignalTurnOrigin;
+      },
+      get pendingInteractionExpiryAt() {
+        return session._pendingInteractionExpiryAt;
+      },
+      set pendingInteractionExpiryAt(value) {
+        session._pendingInteractionExpiryAt = value;
+      },
+      get pendingInteractionExpiryTimer() {
+        return session._pendingInteractionExpiryTimer;
+      },
+      set pendingInteractionExpiryTimer(value) {
+        session._pendingInteractionExpiryTimer = value;
+      },
+      get queuedResumeRecoveryTimer() {
+        return session._queuedResumeRecoveryTimer;
+      },
+      set queuedResumeRecoveryTimer(value) {
+        session._queuedResumeRecoveryTimer = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get storage() {
+        return session._storage;
+      },
+      get subagentParentToolCallId() {
+        return session._subagentParentToolCallId;
+      },
+      accountStagedTerminalUsage: (...args) => session._accountStagedTerminalUsage(...args),
+      assertLive: (...args) => session._assertLive(...args),
+      assertOpenForTurn: (...args) => session._assertOpenForTurn(...args),
+      cancelTerminalizedPendingAdmission: (...args) => session._cancelTerminalizedPendingAdmission(...args),
+      captureTurnRunId: (...args) => session._captureTurnRunId(...args),
+      clearPendingDurableTurnFlushErrorIfRepaired: (...args) =>
+        session._clearPendingDurableTurnFlushErrorIfRepaired(...args),
+      commitTerminalHandoff: (...args) => session._commitTerminalHandoff(...args),
+      commitWakeTerminalWithRetry: (...args) => session._commitWakeTerminalWithRetry(...args),
+      deferQueuedTurnRetry: (...args) => session._deferQueuedTurnRetry(...args),
+      emit: (...args) => session._emit(...args),
+      emitAbortedToolEnds: (...args) => session._emitAbortedToolEnds(...args),
+      emitAgentEnd: (...args) => session._emitAgentEnd(...args),
+      emitTurnEvent: (...args) => session._emitTurnEvent(...args),
+      ensureQueuedItemContext: (...args) => session._ensureQueuedItemContext(...args),
+      finalizeQueuedRunCompletion: (...args) => session._finalizeQueuedRunCompletion(...args),
+      finalizeResumedTurnOutcome: (...args) => session._finalizeResumedTurnOutcome(...args),
+      flushUpdate: (...args) => session._flushUpdate(...args),
+      markQueuedPostRunFinalized: (...args) => session._markQueuedPostRunFinalized(...args),
+      maybeDrainQueue: (...args) => session._maybeDrainQueue(...args),
+      modelIdForQueuedItem: (...args) => session._modelIdForQueuedItem(...args),
+      notifyMaybeIdle: (...args) => session._notifyMaybeIdle(...args),
+      persistTokenUsageDelta: (...args) => session._persistTokenUsageDelta(...args),
+      raceActiveTurnWaiter: (...args) => session._raceActiveTurnWaiter(...args),
+      resume: (...args) => session._resume(...args),
+      settleSignalResult: (...args) => session._settleSignalResult(...args),
+      stageCompletedTerminalOutput: (...args) => session._stageCompletedTerminalOutput(...args),
+      subagentBudgetMeter: (...args) => session._subagentBudgetMeter(...args),
+      terminalFailure: (...args) => session._terminalFailure(...args),
+      withActiveDeletedWaiter: (...args) => session._withActiveDeletedWaiter(...args),
+      writeQueueSignalResultEvidence: (...args) => session._writeQueueSignalResultEvidence(...args),
+    };
   }
 
   /** @internal — the budget that stopped this child, if one did. */
@@ -2496,6 +2434,22 @@ export class Session {
     return emitted;
   }
 
+  /**
+   * Emit a recovered run's terminal `agent_end`, then suppress the next live
+   * terminal `agent_end` for that run: {@link _emitTurnEvent} consumes the
+   * suppression. The suppression is lifted first, so this emission itself is
+   * never swallowed.
+   */
+  private _emitRecoveredAgentEnd(
+    runId: string,
+    finishReason: 'complete' | 'aborted' | 'error' | 'suspended',
+    usage: TokenUsage,
+  ): void {
+    this._recoveredAgentEndRunIds.delete(runId);
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
+    this._recoveredAgentEndRunIds.add(runId);
+  }
+
   private _toolTerminalKey(runId: string, toolCallId: string): string {
     return `${runId}:${toolCallId}`;
   }
@@ -2540,10 +2494,7 @@ export class Session {
     const type = (event as { type?: string }).type;
     if (type === 'tool_start') {
       const e = event as { runId?: string; toolCallId?: string; toolName?: string };
-      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
-      if (span && e.toolCallId !== undefined) {
-        span.activeToolStarts.set(e.toolCallId, { toolName: e.toolName ?? 'unknown', startedAt: Date.now() });
-      }
+      this._runSpans.toolStarted(e.runId, e.toolCallId, e.toolName);
       return event;
     }
     if (type === 'tool_end') {
@@ -2554,27 +2505,7 @@ export class Session {
         isError?: boolean;
         durationMs?: number;
       };
-      const span = e.runId !== undefined ? this._openRuns.get(e.runId) : undefined;
-      if (!span) return event;
-      const toolName = e.toolName ?? 'unknown';
-      const start = e.toolCallId !== undefined ? span.activeToolStarts.get(e.toolCallId) : undefined;
-      let durationMs: number | undefined = e.durationMs;
-      if (durationMs === undefined && start) durationMs = Math.max(0, Date.now() - start.startedAt);
-      if (e.toolCallId !== undefined) span.activeToolStarts.delete(e.toolCallId);
-      // Fold into the rollup (count every emitted terminal; duration only when known).
-      const r = span.rollup;
-      r.count += 1;
-      const isError = e.isError === true;
-      if (isError) r.errors += 1;
-      if (durationMs !== undefined) {
-        r.totalDurationMs += durationMs;
-        if (durationMs > r.maxDurationMs) r.maxDurationMs = durationMs;
-      }
-      const per = r.perTool.get(toolName) ?? { count: 0, errors: 0, totalDurationMs: 0 };
-      per.count += 1;
-      if (isError) per.errors += 1;
-      if (durationMs !== undefined) per.totalDurationMs += durationMs;
-      r.perTool.set(toolName, per);
+      const durationMs = this._runSpans.toolEnded(e.runId, e);
       return durationMs !== undefined ? ({ ...event, durationMs } as EmitInput) : event;
     }
     return event;
@@ -2588,13 +2519,8 @@ export class Session {
   private _trackRunSpanPostEmit(event: HarnessEvent): void {
     if (event.type === 'agent_start') {
       const runId = event.runId;
-      if (runId !== undefined && !this._openRuns.has(runId)) {
-        this._openRuns.set(runId, {
-          startedAt: this._currentRunStartedAt ?? event.timestamp,
-          identity: this._captureRunSpanIdentity(),
-          activeToolStarts: new Map(),
-          rollup: { count: 0, errors: 0, totalDurationMs: 0, maxDurationMs: 0, perTool: new Map() },
-        });
+      if (runId !== undefined) {
+        this._runSpans.open(runId, this._currentRunStartedAt ?? event.timestamp, () => this._captureRunSpanIdentity());
       }
       return;
     }
@@ -2622,21 +2548,21 @@ export class Session {
 
   /**
    * Emit the canonical `run_completed` event for a terminal run, exactly once.
-   * A run with a live {@link OpenRunSpan} reports trusted start/duration/rollup;
+   * A run with an open span reports trusted start/duration/rollup;
    * a run whose start was lost to a restart is marked `reconstructed` and omits
    * those (usage + identity + finishReason are still reported).
    */
   private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
-    if (this._finalizedRunIds.has(runId)) return;
-    this._markRunFinalized(runId);
+    const finalized = this._runSpans.finalize(runId);
+    if (finalized === undefined) return;
     const { event, status, reconstructed } = this._buildRunCompletedEvent(
       runId,
       finishReason,
       usage,
       completedAt,
+      finalized.span,
       undefined,
     );
-    this._openRuns.delete(runId);
 
     // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
     // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
@@ -2646,24 +2572,19 @@ export class Session {
     this._persistRunSummary(event, status, reconstructed);
   }
 
-  private _markRunFinalized(runId: string): void {
-    if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
-    this._finalizedRunIds.add(runId);
-  }
-
   /** Build a run's canonical `run_completed` event from its span or recovered identity. */
   private _buildRunCompletedEvent(
     runId: string,
     finishReason: string,
     usage: TokenUsage,
     completedAt: number,
+    span: RunSpanSnapshot<RunSpanIdentity> | undefined,
     recoveredIdentity: RunSpanIdentity | undefined,
   ): {
     event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>;
     status: RunCompletedStatus;
     reconstructed: boolean;
   } {
-    const span = this._openRuns.get(runId);
     const reconstructed = span === undefined;
     const identity = span?.identity ?? recoveredIdentity ?? this._captureRunSpanIdentity();
     const status: RunCompletedStatus =
@@ -2690,24 +2611,9 @@ export class Session {
     } else {
       event.startedAt = span!.startedAt;
       event.durationMs = Math.max(0, completedAt - span!.startedAt);
-      event.toolRollup = this._materializeToolRollup(span!.rollup);
+      event.toolRollup = span!.toolRollup;
     }
     return { event, status, reconstructed };
-  }
-
-  /** Convert the in-memory rollup (Maps) into the JSON-safe {@link RunToolRollup}. */
-  private _materializeToolRollup(rollup: OpenRunSpan['rollup']): RunToolRollup {
-    const perTool: RunToolRollup['perTool'] = {};
-    for (const [name, v] of rollup.perTool) {
-      perTool[name] = { count: v.count, errors: v.errors, totalDurationMs: v.totalDurationMs };
-    }
-    return {
-      count: rollup.count,
-      errors: rollup.errors,
-      totalDurationMs: rollup.totalDurationMs,
-      maxDurationMs: rollup.maxDurationMs,
-      perTool,
-    };
   }
 
   /**
@@ -2768,6 +2674,92 @@ export class Session {
   }
 
   /**
+   * Build the port the delegation driver reaches the session through. Two
+   * driver members stay on `Session`: `_interruptOrphanedDelegationSignal` and
+   * the one-line getter `_internalSettlingDelegations`.
+   */
+  private _delegationDriverPort(): DelegationDriverSessionPort {
+    const session = this;
+    return {
+      id: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      subagentDepth: this.subagentDepth,
+      harness: this._harness,
+      get storage() {
+        return session._storage;
+      },
+      emitter: this._emitter,
+      queueHead: this._queueHead,
+      activeSubagents: this._activeSubagents,
+      delegatedSettlementListeners: this._delegatedSettlementListeners,
+      delegationDriverClaims: this._delegationDriverClaims,
+      delegationNoticeWatches: this._delegationNoticeWatches,
+      delegationReconcileRetryTimers: this._delegationReconcileRetryTimers,
+      remindSettlementsStarting: this._remindSettlementsStarting,
+      settlingDelegations: this._settlingDelegations,
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get activeWorkAdmissionEpoch() {
+        return session._activeWorkAdmissionEpoch;
+      },
+      get delegationReconcileCapacityBlocked() {
+        return session._delegationReconcileCapacityBlocked;
+      },
+      set delegationReconcileCapacityBlocked(value) {
+        session._delegationReconcileCapacityBlocked = value;
+      },
+      get delegationReconcileInFlight() {
+        return session._delegationReconcileInFlight;
+      },
+      set delegationReconcileInFlight(value) {
+        session._delegationReconcileInFlight = value;
+      },
+      get delegationReconcileRerunRequested() {
+        return session._delegationReconcileRerunRequested;
+      },
+      set delegationReconcileRerunRequested(value) {
+        session._delegationReconcileRerunRequested = value;
+      },
+      get subagentExecutionsInFlight() {
+        return session._subagentExecutionsInFlight;
+      },
+      set subagentExecutionsInFlight(value) {
+        session._subagentExecutionsInFlight = value;
+      },
+      activeWorkAdmissionIsCurrent: (...args) => session._activeWorkAdmissionIsCurrent(...args),
+      assertActiveWorkAdmission: (...args) => session._assertActiveWorkAdmission(...args),
+      assertLive: (...args) => session._assertLive(...args),
+      assertNotDeleted: (...args) => session._assertNotDeleted(...args),
+      captureActiveWorkAdmission: (...args) => session._captureActiveWorkAdmission(...args),
+      delegationNoticeClaimable: (...args) => session._delegationNoticeClaimable(...args),
+      disposeKeptDelegationNoticeWatches: (...args) => session._disposeKeptDelegationNoticeWatches(...args),
+      notifyDisplayRefresh: (...args) => session._notifyDisplayRefresh(...args),
+      notifyMaybeIdle: (...args) => session._notifyMaybeIdle(...args),
+      planTaskPort: (...args) => session._planTaskPort(...args),
+      publishRecoveredRunCompletion: (...args) => session._publishRecoveredRunCompletion(...args),
+      serializePlanTaskWrite: (...args) => session._serializePlanTaskWrite(...args),
+      signalAdmissionIdentity: (...args) => session._signalAdmissionIdentity(...args),
+      startDelegationSettlementNotice: (...args) => session._startDelegationSettlementNotice(...args),
+      cancelOwnedSubagentSessions: (...args) => session._cancelOwnedSubagentSessions(...args),
+      driveDelegatedSubagent: (...args) => session._driveDelegatedSubagent(...args),
+      cancelAndCloseDelegatedChildForDeadline: (...args) => session._cancelAndCloseDelegatedChildForDeadline(...args),
+      listDelegatedSubagentSessionIds: (...args) => session._listDelegatedSubagentSessionIds(...args),
+      delegationLinkIsCurrent: (...args) => session._delegationLinkIsCurrent(...args),
+      reconcileDelegationsOnHydratePass: (...args) => session._reconcileDelegationsOnHydratePass(...args),
+      reconcileDelegationsOnHydrate: (...args) => session._reconcileDelegationsOnHydrate(...args),
+      get currentRunModeId() {
+        return session._currentRunModeId;
+      },
+      delegatingRunSourceWriteGuard: (...args) => session._delegatingRunSourceWriteGuard(...args),
+    };
+  }
+
+  /**
    * @internal — publish a `subagent_*` event on this session's emitter.
    * Called by the spawn-subagent bridge when forwarding a child session's
    * own `agent_start` / `text_delta` / `tool_start` / `tool_end` /
@@ -2790,11 +2782,7 @@ export class Session {
       | Omit<SubagentToolEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
   ): HarnessEvent {
-    const stamped = { ...event, parentId: this.id } as EmitInput;
-    if (this._queueHead.currentId !== undefined && (stamped as { queuedItemId?: string }).queuedItemId === undefined) {
-      return this._emitter.emit({ ...stamped, queuedItemId: this._queueHead.currentId } as EmitInput);
-    }
-    return this._emitter.emit(stamped);
+    return emitSubagentEvent(this._delegationDriverPort(), event);
   }
 
   /**
@@ -2806,71 +2794,7 @@ export class Session {
    * delegate `delegate:<childId>` key.
    */
   _internalUpdateSubagentProgress(key: string, event: HarnessEvent): void {
-    const entry = this._activeSubagents.get(key);
-    if (!entry) return;
-    switch (event.type) {
-      case 'agent_start':
-        entry.status = 'running';
-        break;
-      case 'tool_approval_required':
-      case 'tool_suspension_required':
-      case 'question_pending':
-      case 'plan_approval_required':
-        entry.status = 'awaiting_input';
-        break;
-      case 'tool_start':
-        entry.currentToolName = event.toolName;
-        entry.toolCalls = (entry.toolCalls ?? 0) + 1;
-        break;
-      case 'tool_end':
-        // Best-effort clear: only when the ending tool is the one we last showed
-        // (concurrent inner tools just leave the most-recent name until it ends).
-        if (entry.currentToolName === event.toolName) entry.currentToolName = undefined;
-        break;
-      case 'agent_end':
-        entry.status =
-          event.finishReason === 'error' || event.finishReason === 'aborted'
-            ? 'failed'
-            : event.finishReason === 'complete'
-              ? 'completed'
-              : entry.status;
-        entry.usage = event.usage;
-        break;
-      default:
-        return; // text/reasoning deltas don't change the projection
-    }
-    entry.updatedAt = Date.now();
-    this._notifyDisplayRefresh();
-  }
-
-  /**
-   * @internal — mirror a delegated child's pending interaction onto the
-   * PARENT event stream. The owning inbox remains the child session; the
-   * bridged event only supplies parent activity/replay consumers with the
-   * correlation needed to render the wait and route the response correctly.
-   */
-  private _emitDelegatedSubagentPendingEvent(
-    event: Extract<
-      HarnessEvent,
-      {
-        type: 'tool_approval_required' | 'tool_suspension_required' | 'question_pending' | 'plan_approval_required';
-      }
-    >,
-    correlation: { parentToolCallId: string; subagentSessionId: string },
-  ): void {
-    const { id: _id, timestamp: _timestamp, sessionId: _sessionId, source: _source, ...payload } = event;
-    // SuspensionSource is a discriminated union: parent events do not declare
-    // the child-only correlation keys, so strip them from a widened copy rather
-    // than destructuring properties that are absent on one union member.
-    const bridgedPayload = { ...payload } as Record<string, unknown>;
-    delete bridgedPayload.subagentToolCallId;
-    delete bridgedPayload.subagentSessionId;
-    this._emitter.emit({
-      ...bridgedPayload,
-      source: 'subagent',
-      subagentToolCallId: correlation.parentToolCallId,
-      subagentSessionId: correlation.subagentSessionId,
-    } as EmitInput);
+    return internalUpdateSubagentProgress(this._delegationDriverPort(), key, event);
   }
 
   /**
@@ -2895,28 +2819,12 @@ export class Session {
   _internalTryReserveSubagentExecution():
     | { reserved: true; inFlight: number; maxConcurrent?: number }
     | { reserved: false; inFlight: number; maxConcurrent: number } {
-    const maxConcurrent = this._harness._getSubagentMaxConcurrent();
-    if (maxConcurrent !== undefined && this._subagentExecutionsInFlight >= maxConcurrent) {
-      return { reserved: false, inFlight: this._subagentExecutionsInFlight, maxConcurrent };
-    }
-    this._subagentExecutionsInFlight += 1;
-    return {
-      reserved: true,
-      inFlight: this._subagentExecutionsInFlight,
-      ...(maxConcurrent !== undefined ? { maxConcurrent } : {}),
-    };
+    return internalTryReserveSubagentExecution(this._delegationDriverPort());
   }
 
   /** @internal — release a slot previously returned by the reservation method. */
   _internalReleaseSubagentExecution(): void {
-    // Every caller releases in a `finally`. Clamp defensively so a late cleanup
-    // can never turn an accidental duplicate release into an unlimited bypass.
-    this._subagentExecutionsInFlight = Math.max(0, this._subagentExecutionsInFlight - 1);
-    if (this._delegationReconcileCapacityBlocked && this._state === 'live') {
-      this._delegationReconcileCapacityBlocked = false;
-      this._scheduleDelegationReconcileRetry(0);
-    }
-    this._notifyMaybeIdle();
+    return internalReleaseSubagentExecution(this._delegationDriverPort());
   }
 
   /**
@@ -3012,26 +2920,11 @@ export class Session {
    * (`_tokenUsage`) intentionally persist across turns within a session.
    */
   private _resetTurnTracking(): void {
-    if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
-    this._currentRunId = undefined;
+    this._clearTurnIdentity();
     this._currentAssistantDraftRunIds.clear();
-    this._currentRunStartedAt = undefined;
-    this._currentRunModeId = undefined;
-    this._currentRunModelId = undefined;
-    this._currentRunSignalId = undefined;
-    this._ownedSignalTurnOrigin = undefined;
-    this._currentTurnRequestContext = undefined;
-    this._currentAgentRequestContext = undefined;
-    this._currentTurnReplacementToolSurface = undefined;
-    this._currentMessageId = undefined;
-    this._currentTraceId = undefined;
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
     // captured pendingResume below so non-yolo turns never inherit a stale value.
     this._currentTurnYolo = false;
-    this._currentTurnSourceWriteGuard = undefined;
-    this._activeTools.clear();
-    this._toolInputBuffers.clear();
-    this._subagentAnswerDecoders.clear();
     // `_returnedInlineSubagents` is keyed by runId, not by turn (see its field).
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
@@ -3055,24 +2948,33 @@ export class Session {
       // a streaming consumer always gets a terminal for every `tool_start`. On a
       // normal turn the drain already removed every tool, so this is a no-op.
       this._emitAbortedToolEnds();
-      if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
-      this._currentRunId = undefined;
-      this._currentRunStartedAt = undefined;
-      this._currentRunModeId = undefined;
-      this._currentRunModelId = undefined;
-      this._currentRunSignalId = undefined;
-      this._ownedSignalTurnOrigin = undefined;
-      this._currentTurnRequestContext = undefined;
-      this._currentAgentRequestContext = undefined;
-      this._currentTurnReplacementToolSurface = undefined;
-      this._currentTurnSourceWriteGuard = undefined;
-      this._currentMessageId = undefined;
-      this._currentTraceId = undefined;
-      this._activeTools.clear();
-      this._toolInputBuffers.clear();
-      this._subagentAnswerDecoders.clear();
+      this._clearTurnIdentity();
     }
     this._notifyMaybeIdle();
+  }
+
+  /**
+   * The per-turn identity and tool-stream state that both `_resetTurnTracking`
+   * and `_endTurn` clear (PF-8682). The terminal subagent answer of the current
+   * run is dropped first, while `_currentRunId` still names that run.
+   */
+  private _clearTurnIdentity(): void {
+    if (this._currentRunId !== undefined) this._terminalSubagentAnswers.drop(this._currentRunId);
+    this._currentRunId = undefined;
+    this._currentRunStartedAt = undefined;
+    this._currentRunModeId = undefined;
+    this._currentRunModelId = undefined;
+    this._currentRunSignalId = undefined;
+    this._ownedSignalTurnOrigin = undefined;
+    this._currentTurnRequestContext = undefined;
+    this._currentAgentRequestContext = undefined;
+    this._currentTurnReplacementToolSurface = undefined;
+    this._currentTurnSourceWriteGuard = undefined;
+    this._currentMessageId = undefined;
+    this._currentTraceId = undefined;
+    this._activeTools.clear();
+    this._toolInputBuffers.clear();
+    this._subagentAnswerDecoders.clear();
   }
 
   private _assistantDraftSnapshot(): Record<string, HarnessAssistantDraft> {
@@ -3463,7 +3365,7 @@ export class Session {
 
   /** §10.2 `agent_end.usage`: the run's token usage (zero when unavailable, e.g. an error path with no terminal output). */
   private _runUsage(full?: FullOutput<unknown>): TokenUsage {
-    const delta = full ? this._tokenUsageDeltaFromFullOutput(full) : undefined;
+    const delta = full ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full) : undefined;
     return delta ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   }
 
@@ -3480,15 +3382,7 @@ export class Session {
     // which (for the long-lived thread subscription) do NOT carry their own
     // runId — can be attributed to this run by `_emitForChunk` (§10.2
     // text_delta/tool_start/tool_end all require a runId).
-    if (this._currentRunId === undefined) {
-      this._currentRunId = id;
-      // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
-      // is the canonical run-start choke for all entry paths.
-      this._currentRunStartedAt = Date.now();
-      // §5.1b: a signal-backed run records its originating signalId so the live
-      // projection's `operation` can link to the durable signal row.
-      this._currentRunSignalId = signalId;
-    }
+    this._adoptRunId(id, { signalId });
     this._emitTurnEvent(
       wakeNoticeId === undefined
         ? { type: 'agent_start', runId: id }
@@ -3511,151 +3405,12 @@ export class Session {
     });
   }
 
-  private _pendingInteractionExpiresAt(pending: PendingResume): number {
-    if (
-      !Number.isSafeInteger(pending.expiresAt) ||
-      pending.expiresAt < 0 ||
-      !Number.isSafeInteger(pending.requestedAt) ||
-      pending.requestedAt < 0 ||
-      pending.expiresAt < pending.requestedAt
-    ) {
-      throw new HarnessSessionCorruptError({
-        reason: 'pending_state_corrupt',
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-      });
-    }
-    return pending.expiresAt;
-  }
-
-  private _pendingInteractionDueAt(pending: PendingResume): number {
-    if (pending.resumedAt === undefined) return this._pendingInteractionExpiresAt(pending);
-    if (pending.resumeRecoveryAt === undefined) {
-      // At-least-once resume marker without a recovery stamp: rows written by
-      // builds that predate `resumeRecoveryAt` (the admission CAS now stamps
-      // both fields atomically, so current code can no longer produce this
-      // shape). The marker stays RECOVERABLE — its effective deadline is the
-      // admission time plus the accepted-recovery stale window, exactly what
-      // the stamping writer would have persisted. Classifying it corrupt would
-      // permanently wedge the session on hydrate, the precise outcome the
-      // crash-mid-resume recovery contract forbids (queue not parked).
-      if (!Number.isSafeInteger(pending.resumedAt) || pending.resumedAt < 0) {
-        throw new HarnessSessionCorruptError({
-          reason: 'pending_state_corrupt',
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-        });
-      }
-      return pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    }
-    if (!Number.isSafeInteger(pending.resumeRecoveryAt) || pending.resumeRecoveryAt < pending.resumedAt) {
-      throw new HarnessSessionCorruptError({
-        reason: 'pending_state_corrupt',
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-      });
-    }
-    return pending.resumeRecoveryAt;
-  }
-
   private _pendingInteractionGeneration(pending: PendingResume): PendingInteractionExpiryGeneration {
-    const dueAt = this._pendingInteractionDueAt(pending);
-    return {
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      kind: pending.kind,
-      itemId: pending.itemId ?? pending.toolCallId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      requestedAt: pending.requestedAt,
-      dueAt,
-      expiresAt: pending.expiresAt,
-      ...(pending.expiryStartedAt !== undefined ? { expiryStartedAt: pending.expiryStartedAt } : {}),
-      ...(pending.resumedAt !== undefined ? { resumedAt: pending.resumedAt } : {}),
-      ...(pending.resumeRecoveryAt !== undefined ? { resumeRecoveryAt: pending.resumeRecoveryAt } : {}),
-      ...(pending.resumeRecoveryStartedAt !== undefined
-        ? { resumeRecoveryStartedAt: pending.resumeRecoveryStartedAt }
-        : {}),
-    };
-  }
-
-  /**
-   * Freeze this interaction's deadline onto the pending row. The TTL is
-   * resolved per kind (`sessions.pendingInteractionTtlMsByKind`, falling back
-   * to `sessions.pendingInteractionTtlMs`) at capture time only, so a later
-   * config change never moves an already-parked interaction's deadline and a
-   * restart reads the same `expiresAt` back out of storage.
-   */
-  private _newPendingInteractionTiming(kind: PendingResume['kind']): Pick<PendingResume, 'requestedAt' | 'expiresAt'> {
-    const requestedAt = Date.now();
-    return {
-      requestedAt,
-      expiresAt: requestedAt + this._harness._internalPendingInteractionTtlMsForKind(kind),
-    };
+    return pendingInteractionGeneration(this._pendingInteractionsPort(), pending);
   }
 
   private _clearPendingInteractionExpiryTimer(): void {
-    if (this._pendingInteractionExpiryTimer !== undefined) {
-      clearTimeout(this._pendingInteractionExpiryTimer);
-      this._pendingInteractionExpiryTimer = undefined;
-    }
-    this._pendingInteractionExpiryAt = undefined;
-  }
-
-  /**
-   * The timer is only a liveness wake-up. The callback re-checks the exact
-   * pending identity inside `_flushUpdate`, which is the authority for an
-   * expiry-vs-response race and remains correct after a restart.
-   */
-  private _syncPendingInteractionExpiryTimer(): void {
-    const pending = this._record.pendingResume;
-    if (this._state !== 'live' || pending === undefined) {
-      this._clearPendingInteractionExpiryTimer();
-      return;
-    }
-    const dueAt = this._pendingInteractionDueAt(pending);
-    if (this._pendingInteractionExpiryTimer !== undefined && this._pendingInteractionExpiryAt === dueAt) return;
-    this._clearPendingInteractionExpiryTimer();
-    this._pendingInteractionExpiryAt = dueAt;
-    const identity = this._pendingInteractionGeneration(pending);
-    this._pendingInteractionExpiryTimer = setTimeout(
-      () => {
-        this._pendingInteractionExpiryTimer = undefined;
-        this._pendingInteractionExpiryAt = undefined;
-        void this._reconcilePendingInteractionDeadlineGeneration(identity).catch(err => {
-          console.error('[harness/v1] pending interaction expiry persistence failed:', err);
-          if (this._state !== 'live') return;
-          this._emitter.emit({
-            type: 'storage_error',
-            operation: 'session_save',
-            retryable: true,
-            error: { code: 'harness.storage', message: 'pending interaction expiry persistence failed' },
-            resourceId: this.resourceId,
-            threadId: this.threadId,
-            harnessName: this._record.harnessName,
-          } as EmitInput);
-          // A transient save failure must retry without requiring another user
-          // action. Back off before re-arming: the persisted deadline is now in
-          // the past, so an immediate `_sync` would otherwise create a hot
-          // zero-delay retry loop while storage remains unavailable.
-          this._pendingInteractionExpiryAt = dueAt;
-          this._pendingInteractionExpiryTimer = setTimeout(() => {
-            this._pendingInteractionExpiryTimer = undefined;
-            this._pendingInteractionExpiryAt = undefined;
-            this._syncPendingInteractionExpiryTimer();
-          }, 1_000);
-          this._pendingInteractionExpiryTimer.unref?.();
-        });
-      },
-      pending.expiryStartedAt !== undefined || pending.resumeRecoveryStartedAt !== undefined
-        ? 1_000
-        : Math.max(0, dueAt - Date.now()),
-    );
-    this._pendingInteractionExpiryTimer.unref?.();
+    return clearPendingInteractionExpiryTimer(this._pendingInteractionsPort());
   }
 
   /**
@@ -3695,30 +3450,54 @@ export class Session {
   }
 
   /** @internal — called after the Harness has installed its event bridge. */
-  async _reconcilePendingInteractionExpiryOnHydrate(): Promise<void> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) {
-      this._clearPendingInteractionExpiryTimer();
-      return;
-    }
-    if (pending.resumedAt !== undefined) {
-      const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
-      if (recovery.status !== 'none') return;
-      if (pending.resumeRecoveryAt === undefined) {
-        // Legacy at-least-once marker (no recovery stamp): resolution belongs
-        // to the interactive lanes — the next respond surfaces the
-        // deterministic `harness.resume_recovery_stale` outcome and durably
-        // clears the marker. Hydration only adopts; it neither terminalizes
-        // the marker nor races the caller's next respond with an expiry timer.
-        return;
-      }
-    }
-    const dueAt = this._pendingInteractionDueAt(pending);
-    if (Date.now() < dueAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return;
-    }
-    await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(pending));
+  _reconcilePendingInteractionExpiryOnHydrate(): Promise<void> {
+    return reconcilePendingInteractionExpiryOnHydrate(this._pendingInteractionsPort());
+  }
+
+  /** Build the port the orphan-recovery functions reach the session through. */
+  private _orphanRecoveryPort(): OrphanRecoverySessionPort {
+    const session = this;
+    return {
+      harness: this._harness,
+      id: this.id,
+      messageAdmissionStarts: this._messageAdmissionStarts,
+      resourceId: this.resourceId,
+      runCompletionWaiters: this._runCompletionWaiters,
+      runOutcomes: this._runOutcomes,
+      terminalStagingLedger: this._terminalStagingLedger,
+      threadId: this.threadId,
+      wakeAdmissions: this._wakeAdmissions,
+      get orphanRecheckAt() {
+        return session._orphanRecheckAt;
+      },
+      set orphanRecheckAt(value) {
+        session._orphanRecheckAt = value;
+      },
+      get orphanRecheckSchedules() {
+        return session._orphanRecheckSchedules;
+      },
+      set orphanRecheckSchedules(value) {
+        session._orphanRecheckSchedules = value;
+      },
+      get orphanRecovery() {
+        return session._orphanRecovery;
+      },
+      set orphanRecovery(value) {
+        session._orphanRecovery = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get storage() {
+        return session._storage;
+      },
+      commitInterruptedTerminalHandoff: (...args) => session._commitInterruptedTerminalHandoff(...args),
+      emitTurnEvent: (...args) => session._emitTurnEvent(...args),
+      publishRecoveredRunCompletion: (...args) => session._publishRecoveredRunCompletion(...args),
+    };
   }
 
   /**
@@ -3752,19 +3531,8 @@ export class Session {
    * Returns what blocks a close: another process's live claim, or a turn whose
    * settlement did not commit.
    */
-  async _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
-    if (this._orphanRecovery !== undefined) return this._orphanRecovery;
-    const recovery = this._recoverOrphanedMessageDispatchesOnce()
-      .catch(error => {
-        // A failed attempt stays due, so the next resolution or close retries it.
-        this._scheduleOrphanRecheck(Date.now());
-        throw error;
-      })
-      .finally(() => {
-        if (this._orphanRecovery === recovery) this._orphanRecovery = undefined;
-      });
-    this._orphanRecovery = recovery;
-    return recovery;
+  _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
+    return recoverOrphanedMessageDispatches(this._orphanRecoveryPort());
   }
 
   /**
@@ -3789,7 +3557,7 @@ export class Session {
     // would let it land pending on a closed session.
     if (phase === 'after-drain' && !(await this._awaitInFlightTurnsSettled())) {
       const blocked = { holder: 'in-flight-result-write', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-      this._scheduleOrphanRecheck(blocked.retryAt);
+      scheduleOrphanRecheck(this._orphanRecoveryPort(), blocked.retryAt);
       return blocked;
     }
     // An interaction already due is expired first — or, when its response was
@@ -3797,19 +3565,23 @@ export class Session {
     // terminal admission is cancelled and its turn settled, and it no longer
     // blocks the close. A resume still running here is left to finish.
     const due = this._record.pendingResume;
-    if (due !== undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
+    if (due !== undefined && pendingInteractionDueAt(this._pendingInteractionsPort(), due) <= Date.now()) {
       try {
-        await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
-          drainQueue: false,
-          whileClosing: true,
-        });
+        await reconcilePendingInteractionDeadlineGeneration(
+          this._pendingInteractionsPort(),
+          this._pendingInteractionGeneration(due),
+          {
+            drainQueue: false,
+            whileClosing: true,
+          },
+        );
       } catch (error) {
         // PF-7631: a resumed wake turn has no caller to report to. When its
         // stale-resume settlement does not commit, the failure is surfaced,
         // the interaction stays parked, and the scan below refuses the close
         // typed, as for an orphaned wake. The re-drive emits per attempt only
         // while live, so a closing session reports the failure here.
-        const admission = await this._probeResumeAdmissionByRun(due).catch(() => undefined);
+        const admission = await probeResumeAdmissionByRun(this._pendingInteractionsPort(), due).catch(() => undefined);
         if (!admission || !isHarnessWakeReservedKey(admission.admissionId)) throw error;
         if (this._state !== 'live') {
           this._emitTurnEvent({
@@ -3826,7 +3598,7 @@ export class Session {
     // A delegated child's recovered completion is published before any close
     // (explicit, cancellation, Stop or settlement): once closed, no recovery
     // publishes it. A failure refuses the close, as message recovery's does.
-    if (phase === 'before-drain') await this._publishOwedDelegationCompletions();
+    if (phase === 'before-drain') await publishOwedDelegationCompletions(this._delegationDriverPort());
     const parkedRunId = this._record.pendingResume?.runId;
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
@@ -3846,7 +3618,7 @@ export class Session {
         if (parked) {
           // Answerable until it is due; one that could not be expired above
           // is retried shortly.
-          const dueAt = this._pendingInteractionDueAt(this._record.pendingResume!);
+          const dueAt = pendingInteractionDueAt(this._pendingInteractionsPort(), this._record.pendingResume!);
           return {
             holder: 'parked-admission',
             retryAt: dueAt > Date.now() ? dueAt : Date.now() + ORPHANED_DISPATCH_RETRY_MS,
@@ -3859,7 +3631,7 @@ export class Session {
           claim?.state === 'dispatching' && dispatchClaim === 'live'
             ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
             : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-        this._scheduleOrphanRecheck(blocked.retryAt);
+        scheduleOrphanRecheck(this._orphanRecoveryPort(), blocked.retryAt);
         return blocked;
       }
       cursor = page.nextCursor;
@@ -3915,174 +3687,13 @@ export class Session {
    * to leave (a claim that has since expired, or a settlement that did not
    * commit) is due. A failure keeps it due, so the next resolution retries.
    */
-  async _recheckOrphanedDispatchesIfDue(): Promise<void> {
-    if (this._orphanRecheckAt === undefined || Date.now() < this._orphanRecheckAt) return;
-    if (this._state !== 'live') return;
-    await this._recoverOrphanedMessageDispatches();
+  _recheckOrphanedDispatchesIfDue(): Promise<void> {
+    return recheckOrphanedDispatchesIfDue(this._orphanRecoveryPort());
   }
 
   /** Keep the earliest pending recheck. */
   private _scheduleOrphanRecheck(at: number): void {
-    this._orphanRecheckAt = this._orphanRecheckAt === undefined ? at : Math.min(this._orphanRecheckAt, at);
-    this._orphanRecheckSchedules++;
-  }
-
-  private async _recoverOrphanedMessageDispatchesOnce(): Promise<{
-    blockedBy?: { holder: string; retryAt: number };
-  }> {
-    if (!this._storage.supportsDispatchRecovery) return {};
-    const schedulesAtStart = this._orphanRecheckSchedules;
-    const orphaned: AgentSignalResultEvidence[] = [];
-    const unpublished: AgentSignalResultEvidence[] = [];
-    let blockedBy: { holder: string; retryAt: number } | undefined;
-    const block = (holder: string, retryAt: number) => {
-      if (blockedBy === undefined || retryAt < blockedBy.retryAt) blockedBy = { holder, retryAt };
-    };
-    // Released wake admissions this full scan still lists as pending. Only ids
-    // released before the scan began can be judged by it.
-    const releasedAtScanStart = this._wakeAdmissions.releasedSnapshot();
-    const releasedStillPending = new Set<string>();
-    let cursor: PendingMessageAdmissionScanCursor | undefined;
-    do {
-      const page = await this._storage.listPendingMessageAdmissions({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        now: Date.now(),
-        limit: HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT,
-        ...(cursor !== undefined ? { cursor } : {}),
-      });
-      for (const admission of page.items) {
-        const { evidence } = admission;
-        if (evidence.admissionId !== undefined && this._wakeAdmissions.isReleased(evidence.admissionId)) {
-          releasedStillPending.add(evidence.admissionId);
-        }
-        if (
-          evidence.status === 'completed' ||
-          (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
-        ) {
-          unpublished.push(evidence);
-          continue;
-        }
-        const state = this._classifyPendingMessageDispatch(admission);
-        if (state === 'orphaned') orphaned.push(evidence);
-        if (state === 'claimed' && evidence.dispatch?.state === 'dispatching') {
-          block(evidence.dispatch.attemptId, evidence.dispatch.claimExpiresAt);
-        }
-        if (state === 'finished') block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-      }
-      cursor = page.nextCursor;
-    } while (cursor !== undefined);
-    // A released wake admission settled by any path (its own detached commit,
-    // another owner, or a settlement below) leaves the set, so it stays bounded
-    // by the wakes still pending here.
-    for (const admissionId of releasedAtScanStart) {
-      if (!releasedStillPending.has(admissionId)) this._wakeAdmissions.forgetReleased(admissionId);
-    }
-    for (const evidence of orphaned) {
-      const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
-      let settled: boolean;
-      try {
-        settled = await this._interruptOrphanedMessageDispatch(evidence);
-      } catch (error) {
-        // PF-7631: a wake turn has no caller to report to. Its settlement
-        // failure is surfaced, and it blocks a close (typed refusal) while
-        // its admission stays durable for a retry or the next owner.
-        if (!wakeAdmission) throw error;
-        this._emitTurnEvent({
-          type: 'error',
-          ...(evidence.runId !== undefined ? { runId: evidence.runId } : {}),
-          signalId: evidence.signalId,
-          error: projectHarnessPublicError(error),
-        });
-        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-        continue;
-      }
-      if (settled && wakeAdmission) this._wakeAdmissions.forgetReleased(evidence.admissionId!);
-      const latest = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
-      if (settled && latest !== null && 'status' in latest && latest.status !== 'pending') {
-        // Cancellation may have won over a staged output. Publish the settled
-        // canonical result, never the pending snapshot recovery started with.
-        unpublished.push(latest);
-        continue;
-      }
-      // The settlement did not commit (a fresh claim, a moved lease, or a
-      // finalizer this process cannot run). A turn still pending blocks.
-      if (latest === null || !('status' in latest) || latest.status !== 'pending') continue;
-      const claim = latest.dispatch;
-      if (claim?.state === 'dispatching' && claim.claimExpiresAt > Date.now()) {
-        block(claim.attemptId, claim.claimExpiresAt);
-      } else {
-        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-      }
-    }
-    for (const evidence of unpublished) {
-      await this._publishRecoveredRunCompletion(evidence);
-    }
-    // This recovery replaces the recheck it ran for, but a recheck scheduled
-    // while it ran is for a turn it may not have seen: keep the earliest.
-    if (this._orphanRecheckSchedules === schedulesAtStart) {
-      this._orphanRecheckAt = blockedBy?.retryAt;
-    } else if (blockedBy !== undefined) {
-      this._scheduleOrphanRecheck(blockedBy.retryAt);
-    }
-    return blockedBy !== undefined ? { blockedBy } : {};
-  }
-
-  /**
-   * `active`: a run for it is in flight in this process (close drains it and
-   * its own abort settles the turn), it awaits a response, or the row is
-   * malformed — left alone. `finished`: its run finished here but the result
-   * was never recorded — never interrupted (a same-admission retry completes
-   * it from this process's cache), but it blocks a close. A suspended output
-   * is not a result: once its interaction is gone the turn is settled like
-   * any other. `claimed`: another process's dispatch claim is still live —
-   * left alone until it expires.
-   * `orphaned`: interrupt it.
-   */
-  private _classifyPendingMessageDispatch({
-    evidence,
-    dispatchClaim,
-  }: PendingMessageAdmission): 'active' | 'finished' | 'claimed' | 'orphaned' {
-    const runId = evidence.runId;
-    if (
-      evidence.status !== 'pending' ||
-      evidence.operationKind !== 'message' ||
-      evidence.admissionId === undefined ||
-      evidence.admissionHash === undefined ||
-      runId === undefined
-    ) {
-      return 'active';
-    }
-    // A suspension parked for resume is waiting on a response, not orphaned.
-    if (this._record.pendingResume?.runId === runId) return 'active';
-    // A run in flight here is live (or settling) in this process.
-    if (
-      this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._wakeAdmissions.isInFlight(evidence.admissionId) ||
-      this._runCompletionPromises.has(runId)
-    ) {
-      return 'active';
-    }
-    let agent: Agent | undefined;
-    try {
-      agent = this._harness.getAgentForMode(evidence.modeId ?? this._record.modeId);
-    } catch (error) {
-      // An unregistered mode/agent cannot be running this run in this process.
-      if (!(error instanceof HarnessConfigError)) throw error;
-    }
-    if (agent?.getRunOutput(runId)) return 'active';
-    if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
-    const completed = this._completedRuns.get(runId);
-    if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
-    return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
+    return scheduleOrphanRecheck(this._orphanRecoveryPort(), at);
   }
 
   /** A dispatch claim this process stamped may still be dispatched on (fresh clock). */
@@ -4096,41 +3707,8 @@ export class Session {
   }
 
   /** Returns true when this process's settlement committed. */
-  private async _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<boolean> {
-    const runId = evidence.runId!;
-    const error = { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE };
-    // The adapter judges the lease when the settlement commits.
-    const leaseOwner = { ownerId: this._harness.ownerId };
-    const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error, leaseOwner);
-    if (terminal === 'completed' || terminal === 'committed') return true;
-    if (terminal === 'skipped') return false;
-    const swapped = await this._storage.compareAndSwapSignalTerminal({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: evidence.signalId,
-      admissionId: evidence.admissionId!,
-      admissionHash: evidence.admissionHash!,
-      operationKind: 'message',
-      expected: evidence.dispatch ?? { state: 'reserved' },
-      leaseOwner,
-      terminal: {
-        status: 'failed',
-        signalId: evidence.signalId,
-        runId,
-        error,
-        ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
-        ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
-      },
-      updatedAt: Date.now(),
-    });
-    // A lost CAS means the dispatch changed or the lease moved: its new owner
-    // settles and reports the turn.
-    if (swapped.applied) {
-      this._terminalStagingLedger.forgetStaging(runId);
-    }
-    return swapped.applied;
+  private _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<boolean> {
+    return interruptOrphanedMessageDispatch(this._orphanRecoveryPort(), evidence);
   }
 
   /**
@@ -4180,15 +3758,22 @@ export class Session {
           ? 'error'
           : 'aborted';
     const usage = this._runUsage(full);
-    const { event, status, reconstructed } = this._buildRunCompletedEvent(runId, finishReason, usage, Date.now(), {
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
-      modeId,
-      modelId: evidence.modelId ?? this._record.modelId,
-      operationKind: 'signal',
-      ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
-    });
+    const { event, status, reconstructed } = this._buildRunCompletedEvent(
+      runId,
+      finishReason,
+      usage,
+      Date.now(),
+      this._runSpans.snapshot(runId),
+      {
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
+        modeId,
+        modelId: evidence.modelId ?? this._record.modelId,
+        operationKind: 'signal',
+        ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
+      },
+    );
     const summary = this._buildRunSummary(event, status, reconstructed);
     // Session-fenced: storage refuses the summary of a deleted session.
     let saved: HarnessRunSummary | null;
@@ -4205,16 +3790,13 @@ export class Session {
     if (saved.completedAt !== summary.completedAt || saved.reconstructed !== summary.reconstructed) return;
     // A live owner (or an earlier attempt here) already emitted this run's
     // completion; only its summary was missing.
-    if (this._finalizedRunIds.has(runId)) return;
+    if (this._runSpans.isFinalized(runId)) return;
     this._assertNotDeleted();
     // The summary is durable; emit agent_end without finalizing again, then
     // the matching run_completed. Only a later live terminal agent_end for
     // this run is suppressed.
-    this._markRunFinalized(runId);
-    this._recoveredAgentEndRunIds.delete(runId);
-    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
-    this._recoveredAgentEndRunIds.add(runId);
-    this._openRuns.delete(runId);
+    this._runSpans.finalize(runId);
+    this._emitRecoveredAgentEnd(runId, finishReason, usage);
     this._emitTurnEvent(event as EmitInput);
   }
 
@@ -4278,7 +3860,7 @@ export class Session {
       // fence until the canonical evidence is terminal, or a restart would
       // account the still-staged output again.
       if (admission.status === 'committed') {
-        this._terminalStagingLedger.forgetStaging(runId);
+        this._terminalStagingLedger.forgetRun(runId);
       }
       return 'unowned';
     }
@@ -4363,7 +3945,7 @@ export class Session {
       recovery: { expectedDispatch: evidence.dispatch ?? null, leaseOwner },
     });
     if (receipt.status === 'committed') {
-      this._terminalStagingLedger.forgetStaging(runId);
+      this._terminalStagingLedger.forgetRun(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -4396,58 +3978,14 @@ export class Session {
    * sweep sessions suppress queue draining; any surviving backlog starts on a
    * later normal hydration after the expired pending row has been cleared.
    */
-  async _internalExpirePendingInteractionGeneration(
+  _internalExpirePendingInteractionGeneration(
     expected: PendingInteractionExpiryGeneration,
     opts: { drainQueue?: boolean } = {},
   ): Promise<boolean> {
-    if (
-      expected.harnessName !== this._record.harnessName ||
-      expected.sessionId !== this.id ||
-      expected.resourceId !== this.resourceId
-    ) {
-      return false;
-    }
-    return this._reconcilePendingInteractionDeadlineGeneration(expected, opts);
+    return internalExpirePendingInteractionGeneration(this._pendingInteractionsPort(), expected, opts);
   }
 
-  private async _reconcilePendingInteractionDeadlineGeneration(
-    expected: PendingInteractionExpiryGeneration,
-    opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
-  ): Promise<boolean> {
-    // A `discardPendingInteraction` claim whose clear did not commit (crash or
-    // storage failure between its phases) completes as that discard, not as
-    // an expiry. Only rows carrying a matching discard receipt reach this.
-    const current = this._record.pendingResume;
-    const discardClaim = current === undefined ? undefined : this._discardClaimForPending(current);
-    if (
-      current !== undefined &&
-      discardClaim !== undefined &&
-      current.kind === expected.kind &&
-      (current.itemId ?? current.toolCallId) === expected.itemId &&
-      current.runId === expected.runId &&
-      current.toolCallId === expected.toolCallId &&
-      current.requestedAt === expected.requestedAt
-    ) {
-      return this._completeDiscardedPendingInteraction(current, discardClaim, { drainQueue: opts.drainQueue });
-    }
-    if (expected.resumedAt !== undefined) {
-      return this._recoverStaleResumeAdmission(expected, opts);
-    }
-    const outcome = await this._expirePendingInteraction(
-      {
-        kind: expected.kind,
-        itemId: expected.itemId,
-        runId: expected.runId,
-        toolCallId: expected.toolCallId,
-        requestedAt: expected.requestedAt,
-        expiresAt: expected.expiresAt,
-      },
-      opts,
-    );
-    return outcome !== 'none';
-  }
-
-  private async _expirePendingInteraction(
+  private _expirePendingInteraction(
     expected: {
       kind: PendingResume['kind'];
       itemId: string;
@@ -4458,610 +3996,7 @@ export class Session {
     },
     opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
   ): Promise<PendingExpiryOutcome> {
-    // A close may expire an overdue interaction: the parked turn could never
-    // be answered once the session closes.
-    if (this._state !== 'live' && !(opts.whileClosing === true && this._state === 'closing')) return 'none';
-    const expiredAt = Date.now();
-    if (expiredAt < expected.expiresAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return 'none';
-    }
-    const expiryError = new HarnessPendingInteractionExpiredError(this.id, expected.itemId, expected.expiresAt);
-    const projectedError = projectHarnessPublicError(expiryError);
-    const generationKey = pendingInteractionGenerationKey(expected);
-    let expiryStarted = false;
-    let expiredPending: PendingResume | undefined;
-    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
-    let discardOwned: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
-
-    await this._flushUpdate(prev => {
-      expiryStarted = false;
-      expiredPending = undefined;
-      failedQueueReceipt = undefined;
-      discardOwned = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        (current.resumedAt !== undefined && current.expiryStartedAt === undefined) ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt
-      ) {
-        return prev;
-      }
-      // A `discardPendingInteraction` claim owns this generation (its claim
-      // moved `expiresAt`, so an expiry captured earlier still lands here):
-      // never record expiry evidence for it; finish it as the discard below.
-      const discardReceipt = discardClaimReceipt(prev, current);
-      if (discardReceipt !== undefined) {
-        discardOwned = { pending: current, receipt: discardReceipt };
-        return prev;
-      }
-      if (this._pendingInteractionExpiresAt(current) !== expected.expiresAt) return prev;
-
-      expiryStarted = true;
-      const expiryStartedAt = current.expiryStartedAt ?? expiredAt;
-      expiredPending = { ...current, expiryStartedAt };
-      const next: SessionRecord = { ...prev, pendingResume: expiredPending };
-      next.expiredPendingInteractions = appendExpiredPendingInteraction(prev.expiredPendingInteractions, {
-        generationKey,
-        itemId: expected.itemId,
-        kind: expected.kind,
-        runId: expected.runId,
-        toolCallId: expected.toolCallId,
-        requestedAt: expected.requestedAt,
-        expiresAt: expected.expiresAt,
-        expiredAt: expiryStartedAt,
-        error: projectedError,
-      });
-
-      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
-        if (
-          receipt.itemId !== expected.itemId ||
-          receipt.kind !== expected.kind ||
-          receipt.runId !== expected.runId ||
-          receipt.toolCallId !== expected.toolCallId ||
-          receipt.pendingRequestedAt !== expected.requestedAt ||
-          receipt.status !== 'failed' ||
-          receipt.retryable !== true
-        ) {
-          continue;
-        }
-        next.inboxResponseReceipts = {
-          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            retryable: false,
-            failedAt: receipt.failedAt ?? expiryStartedAt,
-            updatedAt: expiryStartedAt,
-          },
-        };
-      }
-
-      if (current.queuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== current.queuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[current.queuedItemId];
-        failedQueueReceipt = receipt;
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          failedQueueReceipt = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? expiredAt,
-            updatedAt: expiredAt,
-          };
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [current.queuedItemId]: failedQueueReceipt,
-          };
-        }
-      }
-      return next;
-    });
-
-    if (discardOwned !== undefined) {
-      const owned: { pending: PendingResume; receipt: InboxResponseReceipt } = discardOwned;
-      await this._completeDiscardedPendingInteraction(owned.pending, owned.receipt, { drainQueue: opts.drainQueue });
-      return 'discarded';
-    }
-    if (!expiryStarted || expiredPending === undefined) return 'none';
-    this._pendingReplacementToolSurfaces.delete(expiredPending.runId);
-    const activeController = this._currentTurnAbortController;
-    if (activeController !== undefined) activeController.abort(expiryError);
-
-    const queuedItemId = expiredPending.queuedItemId;
-    if (queuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
-      if (settledReceipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: settledReceipt.signalId,
-          runId: settledReceipt.runId,
-          error: projectedError,
-        });
-      }
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(expiryError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-    }
-
-    if (expiredPending.originSignalId !== undefined) {
-      await this._settleSignalResult(expiredPending.originSignalId, {
-        status: 'failed',
-        runId: expiredPending.runId,
-        error: projectedError,
-      });
-    }
-    // An expired suspension may have deferred a terminal admission — settle the
-    // pending grant alongside the signal evidence so the handoff cannot strand
-    // pending forever behind an interaction that no longer exists.
-    await this._cancelTerminalizedPendingAdmission(expiredPending, projectedError);
-
-    // Phase two clears the still-discoverable pending row only after every
-    // durable queue/signal settlement has succeeded. A crash or storage error
-    // before this CAS leaves `expiryStartedAt` indexed for hydrate/sweep retry.
-    let finalized = false;
-    await this._flushUpdate(prev => {
-      finalized = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.expiryStartedAt !== expiredPending!.expiryStartedAt
-      ) {
-        return prev;
-      }
-      finalized = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      return next;
-    });
-    if (!finalized) return 'none';
-
-    if (queuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
-        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
-        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: expiredPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    // An already-running pre-registered ask/plan tool owns its terminal event;
-    // the abort above makes that path finish. A parked suspension has no live
-    // owner, so expiry closes its run here.
-    if (activeController === undefined) {
-      this._releaseParkedRun(expiredPending);
-      this._emitAgentEnd({ runId: expiredPending.runId, finishReason: 'error' });
-    }
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return 'expired';
-  }
-
-  /**
-   * Resolve a response admission whose owner disappeared after persisting
-   * `resumedAt` but before committing terminal provider evidence. Re-dispatch
-   * is intentionally forbidden: the provider/tool may already have performed
-   * side effects. Instead, a two-phase exact-generation transition fails all
-   * related receipts/signals and terminalizes the abandoned run.
-   */
-  private async _recoverStaleResumeAdmission(
-    expected: PendingInteractionExpiryGeneration,
-    opts: { drainQueue?: boolean } = {},
-  ): Promise<boolean> {
-    if (expected.resumedAt === undefined) return false;
-    // Legacy at-least-once markers carry no recovery stamp; their effective
-    // deadline is the synthesized one `_pendingInteractionDueAt` folded into
-    // `dueAt` (admission + stale window). Stamped rows keep the exact-identity
-    // requirement between the generation's dueAt and the persisted stamp.
-    const expectedRecoveryDueAt = expected.resumeRecoveryAt ?? expected.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    if (expected.dueAt !== expectedRecoveryDueAt) {
-      return false;
-    }
-    const currentPending = this._record.pendingResume;
-    let expectedQueuedItemId: string | undefined;
-    if (
-      currentPending?.resumedAt === expected.resumedAt &&
-      currentPending.runId === expected.runId &&
-      currentPending.toolCallId === expected.toolCallId
-    ) {
-      const queuedItemId = this._queuedItemIdForPendingResume(currentPending);
-      expectedQueuedItemId = queuedItemId;
-      if (queuedItemId !== undefined && this._record.queueAdmissionReceipts?.[queuedItemId]?.status === 'completed') {
-        const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: opts.drainQueue !== false });
-        return recovery.status === 'completed';
-      }
-    }
-    if (Date.now() < expectedRecoveryDueAt) {
-      this._syncPendingInteractionExpiryTimer();
-      return false;
-    }
-    // A legitimately slow resume still owns this live session. Only a cold
-    // owner (or a hydrated session with no active turn) may classify the
-    // persisted admission as abandoned.
-    if (this._currentTurnAbortController !== undefined) {
-      this._pendingInteractionExpiryAt = expectedRecoveryDueAt;
-      this._pendingInteractionExpiryTimer = setTimeout(() => {
-        this._pendingInteractionExpiryTimer = undefined;
-        this._pendingInteractionExpiryAt = undefined;
-        this._syncPendingInteractionExpiryTimer();
-      }, 1_000);
-      this._pendingInteractionExpiryTimer.unref?.();
-      return false;
-    }
-
-    // A committed admission or staged completed output means the provider run
-    // finished before its owner died. Recover it and finish settlement and
-    // bookkeeping instead of failing the interaction as abandoned.
-    const recoveryIncarnation = this._record.sessionIncarnation;
-    if (
-      this._storage.supportsTerminalHandoff &&
-      recoveryIncarnation !== undefined &&
-      currentPending !== undefined &&
-      currentPending.resumedAt === expected.resumedAt &&
-      currentPending.runId === expected.runId &&
-      currentPending.toolCallId === expected.toolCallId
-    ) {
-      const boundAdmission = await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        runId: expected.runId,
-        sessionIncarnation: recoveryIncarnation,
-      });
-      if (boundAdmission?.status === 'committed' || boundAdmission?.status === 'pending') {
-        const stored = await this._storage.loadMessageResultEvidence({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-          signalId: boundAdmission.signalId,
-        });
-        const parked = this._record.pendingResume;
-        if (
-          stored !== null &&
-          'status' in stored &&
-          ((stored.status === 'completed' && stored.result !== undefined) ||
-            (stored.status === 'pending' && stored.stagedResult !== undefined)) &&
-          parked !== undefined &&
-          parked.runId === expected.runId &&
-          parked.toolCallId === expected.toolCallId &&
-          parked.resumedAt === expected.resumedAt
-        ) {
-          const full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
-          // Repopulate the local run cache so the per-generation usage marker
-          // still dedupes a concurrent settlement retry.
-          this._rememberCompletedRun(parked.runId, { ok: true, full });
-          const pendingQueuedItemId = this._queuedItemIdForPendingResume(parked);
-          const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(parked);
-          // The resume-data payload lived in the dead caller, but a
-          // `responseId` respond persisted it on the generation's inbox
-          // receipt — recover an approved plan transition from there (and the
-          // pending's declared fallback) instead of clearing the interaction
-          // while leaving the old mode and permission policy active.
-          let modeFlipTarget: string | undefined;
-          if (parked.kind === 'plan-approval') {
-            const generationReceipt = Object.values(this._record.inboxResponseReceipts ?? {}).find(
-              candidate =>
-                candidate.status === 'accepted' &&
-                candidate.kind === parked.kind &&
-                candidate.runId === parked.runId &&
-                candidate.toolCallId === parked.toolCallId &&
-                candidate.pendingRequestedAt === parked.requestedAt &&
-                candidate.itemId === (parked.itemId ?? parked.toolCallId),
-            );
-            try {
-              modeFlipTarget = this._resolvePlanApprovalModeFlipTarget(
-                parked,
-                generationReceipt?.response as { approved?: boolean; transitionToMode?: string } | undefined,
-              );
-            } catch {
-              // The target mode vanished from config since admission —
-              // recovery must stay total; skip the flip rather than brick the
-              // session on a mode that no longer exists.
-            }
-          }
-          await this._withActiveDeletedWaiter(async activeTurnWaiter => {
-            await this._finalizeResumedTurnOutcome(parked, full, {
-              pendingQueuedItemId,
-              completingQueuedItemId: expectedQueuedItemId,
-              modeFlipTarget,
-              previousModeId: this._record.modeId,
-              resumeModeId: this._modeIdForPendingResume(parked),
-              resumeModelId: resumeRuntimeDependencies.modelId,
-              deletedTurnWaiter: activeTurnWaiter,
-            });
-          });
-          if (expectedQueuedItemId !== undefined) void this._maybeDrainQueue();
-          return true;
-        }
-      }
-    }
-
-    const recoveryError = new ResumeRecoveryStaleError();
-    const projectedError = projectHarnessPublicError(recoveryError);
-    const recoveryAt = Date.now();
-    let recoveryStarted = false;
-    let recoveringPending: PendingResume | undefined;
-    let recoveringQueuedItemId: string | undefined;
-    let failedQueueReceipt: QueueAdmissionReceipt | undefined;
-
-    await this._flushUpdate(prev => {
-      recoveryStarted = false;
-      recoveringPending = undefined;
-      recoveringQueuedItemId = undefined;
-      failedQueueReceipt = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.expiryStartedAt !== expected.expiryStartedAt ||
-        current.resumedAt !== expected.resumedAt ||
-        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
-        current.resumeRecoveryStartedAt !== expected.resumeRecoveryStartedAt
-      ) {
-        return prev;
-      }
-
-      recoveryStarted = true;
-      const resumeRecoveryStartedAt = current.resumeRecoveryStartedAt ?? recoveryAt;
-      recoveringPending = { ...current, resumeRecoveryStartedAt };
-      const next: SessionRecord = { ...prev, pendingResume: recoveringPending };
-
-      for (const [responseId, receipt] of Object.entries(prev.inboxResponseReceipts ?? {})) {
-        if (
-          receipt.itemId !== expected.itemId ||
-          receipt.kind !== expected.kind ||
-          receipt.runId !== expected.runId ||
-          receipt.toolCallId !== expected.toolCallId ||
-          receipt.pendingRequestedAt !== expected.requestedAt ||
-          receipt.status !== 'accepted'
-        ) {
-          continue;
-        }
-        next.inboxResponseReceipts = {
-          ...(next.inboxResponseReceipts ?? prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            retryable: false,
-            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
-            updatedAt: resumeRecoveryStartedAt,
-          },
-        };
-      }
-
-      recoveringQueuedItemId =
-        current.queuedItemId ??
-        (prev.pendingQueue ?? []).find(item => {
-          const receipt = prev.queueAdmissionReceipts?.[item.id];
-          return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === current.runId;
-        })?.id;
-      if (recoveringQueuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== recoveringQueuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[recoveringQueuedItemId];
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          failedQueueReceipt = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? resumeRecoveryStartedAt,
-            updatedAt: resumeRecoveryStartedAt,
-          };
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [recoveringQueuedItemId]: failedQueueReceipt,
-          };
-        }
-      }
-      return next;
-    });
-
-    if (!recoveryStarted || recoveringPending === undefined) {
-      if (
-        expectedQueuedItemId !== undefined &&
-        this._queueHead.currentId === expectedQueuedItemId &&
-        this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
-        !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
-      ) {
-        this._queueHead.release();
-        this._notifyMaybeIdle();
-      }
-      return false;
-    }
-
-    await this._accountStagedResumeUsage(recoveringPending, recoveringQueuedItemId);
-
-    if (recoveringQueuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
-      if (settledReceipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: settledReceipt.signalId,
-          runId: settledReceipt.runId,
-          error: projectedError,
-        });
-      }
-    }
-    if (recoveringPending.originSignalId !== undefined) {
-      await this._settleSignalResult(recoveringPending.originSignalId, {
-        status: 'failed',
-        runId: recoveringPending.runId,
-        error: projectedError,
-      });
-    }
-    // The abandoned resume may have deferred a terminal admission — settle the
-    // pending grant alongside the signal evidence so the handoff cannot strand
-    // pending forever behind an interaction being terminalized here.
-    await this._cancelTerminalizedPendingAdmission(recoveringPending, projectedError);
-
-    let finalized = false;
-    await this._flushUpdate(prev => {
-      finalized = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== expected.kind ||
-        current.runId !== expected.runId ||
-        current.toolCallId !== expected.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        current.expiresAt !== expected.expiresAt ||
-        current.resumedAt !== expected.resumedAt ||
-        current.resumeRecoveryAt !== expected.resumeRecoveryAt ||
-        current.resumeRecoveryStartedAt !== recoveringPending!.resumeRecoveryStartedAt
-      ) {
-        return prev;
-      }
-      finalized = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      return next;
-    });
-    if (!finalized) return false;
-
-    this._pendingReplacementToolSurfaces.delete(recoveringPending.runId);
-    if (recoveringQueuedItemId !== undefined) {
-      const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId: recoveringQueuedItemId,
-        ...(settledReceipt?.runId ? { runId: settledReceipt.runId } : {}),
-        ...(settledReceipt?.signalId ? { signalId: settledReceipt.signalId } : {}),
-        ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-      const resolver = this._queueHead.takeResolver(recoveringQueuedItemId);
-      if (resolver) {
-        resolver.reject(recoveryError);
-      }
-      this._queueHead.releaseIf(recoveringQueuedItemId);
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: recoveringPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    this._emitAgentEnd({ runId: recoveringPending.runId, finishReason: 'error' });
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return true;
-  }
-
-  /**
-   * §10.2 suspension event: project a captured `PendingResume` into the matching
-   * pending shape (tool_approval_required / tool_suspension_required /
-   * question_pending / plan_approval_required). Sandbox/path-access prompts
-   * project to `question_pending` (§10.2 defines no dedicated sandbox event).
-   * Emitted after the durable-parking barrier so subscribers can reconstruct
-   * the pending state from storage.
-   */
-  private _emitPendingEvent(pending: PendingResume): void {
-    const sourceFields =
-      pending.source === 'subagent'
-        ? {
-            source: 'subagent' as const,
-            subagentToolCallId: pending.subagentToolCallId ?? '',
-            subagentSessionId: this.id,
-          }
-        : { source: 'parent' as const };
-    const base = {
-      runId: pending.runId,
-      itemId: pending.itemId ?? '',
-      requestedAt: pending.requestedAt,
-      expiresAt: this._pendingInteractionExpiresAt(pending),
-      toolCallId: pending.toolCallId,
-      ...sourceFields,
-    };
-    const p = pending.payload ?? {};
-    switch (pending.kind) {
-      case 'tool-approval':
-        this._emitTurnEvent({
-          type: 'tool_approval_required',
-          ...base,
-          toolName: pending.toolName ?? '',
-          ...(p.toolCategory !== undefined ? { toolCategory: p.toolCategory } : {}),
-          approvalReasons: p.approvalReasons ?? [],
-          // §10.2 (events.ts:202 "Public payloads are JSON-safe projections"):
-          // `p.input` is the raw runtime `payload.args` from the suspended
-          // output (Date/Map/class/bigint). Project it at emit so the first
-          // live subscriber and the durable/replayed row carry the identical
-          // value — the same live===replay guarantee as tool_start/tool_end.
-          input: projectToolEventPayloadForJson(
-            p.input,
-            'tool_approval_required.input',
-            this._harness._internalMaxEventPayloadBytes,
-          ),
-        } as EmitInput);
-        return;
-      case 'tool-suspension':
-        this._emitTurnEvent({
-          type: 'tool_suspension_required',
-          ...base,
-          toolName: pending.toolName ?? '',
-          // §10.2: `suspendData` is the tool's raw `suspendPayload` and can hold
-          // runtime objects, so project it at emit for live===replay parity.
-          suspendData: projectToolEventPayloadForJson(
-            p.suspendData,
-            'tool_suspension_required.suspendData',
-            this._harness._internalMaxEventPayloadBytes,
-          ),
-        } as EmitInput);
-        return;
-      case 'question':
-        this._emitTurnEvent({
-          type: 'question_pending',
-          ...base,
-          question: p.question ?? '',
-          ...(p.options !== undefined ? { options: p.options } : {}),
-          ...(p.selectionMode !== undefined ? { selectionMode: p.selectionMode } : {}),
-        } as EmitInput);
-        return;
-      case 'plan-approval':
-        this._emitTurnEvent({
-          type: 'plan_approval_required',
-          ...base,
-          title: p.title ?? '',
-          plan: p.plan ?? '',
-        } as EmitInput);
-        return;
-      case 'sandbox-access':
-        // §10.2: sandbox/path-access prompts project to question_pending.
-        this._emitTurnEvent({
-          type: 'question_pending',
-          ...base,
-          question: p.sandboxAccess?.reason ?? `Allow ${p.sandboxAccess?.semanticType ?? 'sandbox'} access?`,
-        } as EmitInput);
-        return;
-    }
+    return expirePendingInteraction(this._pendingInteractionsPort(), expected, opts);
   }
 
   private _raceActiveTurnWaiter<T>(promise: Promise<T>, activeTurnWaiter?: Promise<never>): Promise<T> {
@@ -5131,7 +4066,7 @@ export class Session {
       this._noteAbortedTerminalRun(runId);
       return false;
     }
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     return cached !== undefined && !cached.ok && cached.runFailed === true && cached.err === err;
   }
 
@@ -5142,11 +4077,7 @@ export class Session {
    * not marked, and a same-admission retry never commits it as failed.
    */
   private _noteAbortedTerminalRun(runId: string): void {
-    const cached = this._completedRuns.get(runId);
-    if (cached !== undefined) {
-      if (!cached.ok) delete cached.runFailed;
-      return;
-    }
+    if (this._runOutcomes.demoteRunFailure(runId)) return;
     this._abortedTerminalRunIds.add(runId);
     while (this._abortedTerminalRunIds.size > 64) {
       const oldest = this._abortedTerminalRunIds.values().next().value;
@@ -5205,76 +4136,39 @@ export class Session {
     }
   }
 
+  /**
+   * PF-8698: the only writer of the current run id. The first run adopted for
+   * a turn wins; later calls leave it as it is. Only `agent_start` passes
+   * `start`, so only it stamps the run's start time and signal id: also when
+   * the turn's first chunk already adopted the same run id, which happens when
+   * the runtime starts the stream before it acknowledges the signal.
+   */
+  private _adoptRunId(runId: string, start?: { signalId: string | undefined }): void {
+    if (this._currentRunId === undefined) {
+      this._currentRunId = runId;
+    } else if (this._currentRunId !== runId || this._currentRunStartedAt !== undefined) {
+      return;
+    }
+    if (start === undefined) return;
+    // §5.1b: stamp the run-start time for the SessionRunProjection. agent_start
+    // is the canonical run-start choke for all entry paths.
+    this._currentRunStartedAt = Date.now();
+    // §5.1b: a signal-backed run records its originating signalId so the live
+    // projection's `operation` can link to the durable signal row.
+    this._currentRunSignalId = start.signalId;
+  }
+
   /** Capture the first run id for the active turn display state. */
   private _captureTurnRunId(full: FullOutput<unknown>): void {
     if (this._currentTurnAbortController === undefined) return;
-    if (full.runId && this._currentRunId === undefined) {
-      this._currentRunId = full.runId;
-    }
+    if (full.runId) this._adoptRunId(full.runId);
   }
 
   private _tokenUsageDeltaFromFullOutput(
     full: FullOutput<unknown>,
     accountedCumulative?: TokenUsage,
   ): TokenUsage | undefined {
-    const usage = (full as { totalUsage?: unknown; usage?: unknown }).totalUsage ?? (full as { usage?: unknown }).usage;
-    if (usage && typeof usage === 'object') {
-      const u = usage as {
-        promptTokens?: number;
-        completionTokens?: number;
-        totalTokens?: number;
-        inputTokens?: number;
-        outputTokens?: number;
-      };
-      const prompt = u.promptTokens ?? u.inputTokens;
-      const completion = u.completionTokens ?? u.outputTokens;
-      const promptNumber = typeof prompt === 'number' && Number.isInteger(prompt) && prompt >= 0 ? prompt : undefined;
-      const completionNumber =
-        typeof completion === 'number' && Number.isInteger(completion) && completion >= 0 ? completion : undefined;
-      const delta: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-      const incremented =
-        promptNumber !== undefined ||
-        completionNumber !== undefined ||
-        (typeof u.totalTokens === 'number' && Number.isInteger(u.totalTokens) && u.totalTokens >= 0);
-      if (promptNumber !== undefined) delta.promptTokens += promptNumber;
-      if (completionNumber !== undefined) delta.completionTokens += completionNumber;
-      const derivedTotalTokens = (promptNumber ?? 0) + (completionNumber ?? 0);
-      if (typeof u.totalTokens === 'number' && Number.isInteger(u.totalTokens) && u.totalTokens >= 0) {
-        delta.totalTokens += u.totalTokens < derivedTotalTokens ? derivedTotalTokens : u.totalTokens;
-      } else if (promptNumber !== undefined || completionNumber !== undefined) {
-        // Providers that only emit `inputTokens`/`outputTokens` leave `totalTokens`
-        // off; derive it so the aggregate stays consistent with its parts.
-        delta.totalTokens += derivedTotalTokens;
-      }
-      if (!incremented) return undefined;
-      if (accountedCumulative === undefined) return delta;
-
-      // A resumed Mastra stream restores its prior usage counter, so FullOutput
-      // is cumulative across suspend boundaries. Subtract the durable baseline
-      // component-wise. If a provider resets a counter, treat the new value as
-      // this segment's usage rather than producing a negative delta.
-      const promptTokens =
-        delta.promptTokens >= accountedCumulative.promptTokens
-          ? delta.promptTokens - accountedCumulative.promptTokens
-          : delta.promptTokens;
-      const completionTokens =
-        delta.completionTokens >= accountedCumulative.completionTokens
-          ? delta.completionTokens - accountedCumulative.completionTokens
-          : delta.completionTokens;
-      const rawTotalTokens =
-        delta.totalTokens >= accountedCumulative.totalTokens
-          ? delta.totalTokens - accountedCumulative.totalTokens
-          : delta.totalTokens;
-      const resumedDelta = {
-        promptTokens,
-        completionTokens,
-        totalTokens: Math.max(rawTotalTokens, promptTokens + completionTokens),
-      };
-      return resumedDelta.promptTokens === 0 && resumedDelta.completionTokens === 0 && resumedDelta.totalTokens === 0
-        ? undefined
-        : resumedDelta;
-    }
-    return undefined;
+    return tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, accountedCumulative);
   }
 
   private _applyTokenUsageDelta(delta: TokenUsage | undefined): void {
@@ -5367,7 +4261,7 @@ export class Session {
     opts: { persist?: boolean; accountedCumulative?: TokenUsage } = {},
   ): TokenUsage | undefined {
     this._captureTurnRunId(full);
-    const delta = this._tokenUsageDeltaFromFullOutput(full, opts.accountedCumulative);
+    const delta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, opts.accountedCumulative);
     this._applyTokenUsageDelta(delta);
     if (delta !== undefined && opts.persist !== false) this._schedulePersistTokenUsage();
     return delta;
@@ -5380,14 +4274,14 @@ export class Session {
     this._captureTurnRunId(full);
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
+      (this._messageTokenLedger.isAccounted(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
     ) {
       return { tokenUsageAccounted: true };
     }
-    const tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+    const tokenUsageDelta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
-      if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
+      if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
       if (full.runId && this._terminalStagingLedger.isStaged(full.runId)) {
         this._terminalStagingLedger.markAccounted(full.runId);
       }
@@ -5398,80 +4292,17 @@ export class Session {
   }
 
   private _messageSuspendedTokenUsageDelta(full: FullOutput<unknown>): TokenUsage | undefined {
-    if (
-      full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._messageTokenAccountingRunIds.has(full.runId))
-    ) {
-      return undefined;
-    }
-    // The in-memory accounted sets are empty after a reopen even though the
-    // suspended run's cumulative usage is durably recorded on the parked
-    // pending. Subtract that durable baseline so a cached-duplicate replay
-    // cannot re-apply usage the session already persisted.
-    const parked = this._record.pendingResume;
-    const durableBaseline =
-      parked !== undefined && parked.runId === full.runId ? parked.accountedTokenUsage : undefined;
-    return this._tokenUsageDeltaFromFullOutput(full, durableBaseline);
+    return messageSuspendedTokenUsageDelta(this._pendingInteractionsPort(), full);
   }
 
-  private _reserveMessageSuspendedTokenUsage(full: FullOutput<unknown>): {
-    tokenUsageDelta?: TokenUsage;
-    reservedRunId?: string;
-    reservation?: Deferred<void>;
-  } {
-    const tokenUsageDelta = this._messageSuspendedTokenUsageDelta(full);
-    if (tokenUsageDelta !== undefined && full.runId) {
-      const reservation = createDeferred<void>();
-      this._messageTokenAccountingRunIds.add(full.runId);
-      this._messageTokenAccountingReservations.set(full.runId, reservation);
-      void reservation.promise.catch(() => {});
-      return { tokenUsageDelta, reservedRunId: full.runId, reservation };
-    }
-    return { tokenUsageDelta };
-  }
-
-  private _commitMessageSuspendedTokenUsage(
-    full: FullOutput<unknown>,
-    reservation: { tokenUsageDelta?: TokenUsage; reservedRunId?: string; reservation?: Deferred<void> },
-  ): void {
-    if (reservation.reservedRunId !== undefined) {
-      this._messageTokenAccountingRunIds.delete(reservation.reservedRunId);
-      if (this._messageTokenAccountingReservations.get(reservation.reservedRunId) === reservation.reservation) {
-        this._messageTokenAccountingReservations.delete(reservation.reservedRunId);
-      }
-      this._messageTokenAccountedRunIds.add(reservation.reservedRunId);
-      reservation.reservation?.resolve();
-    } else if (reservation.tokenUsageDelta !== undefined && full.runId) {
-      this._messageTokenAccountedRunIds.add(full.runId);
-    }
-  }
-
-  private _rollbackMessageSuspendedTokenUsage(reservation: {
-    reservedRunId?: string;
-    reservation?: Deferred<void>;
-  }): void {
-    if (reservation.reservedRunId !== undefined) {
-      this._messageTokenAccountingRunIds.delete(reservation.reservedRunId);
-      if (this._messageTokenAccountingReservations.get(reservation.reservedRunId) === reservation.reservation) {
-        this._messageTokenAccountingReservations.delete(reservation.reservedRunId);
-      }
-      reservation.reservation?.resolve();
-    }
-  }
-
-  private async _waitForMessageSuspendedTokenUsageOwner(
+  private _waitForMessageSuspendedTokenUsageOwner(
     full: FullOutput<unknown>,
     activeTurnWaiter?: Promise<never>,
   ): Promise<void> {
-    if (!full.runId) return;
-    while (!this._messageTokenAccountedRunIds.has(full.runId)) {
-      const reservation = this._messageTokenAccountingReservations.get(full.runId);
-      if (reservation === undefined) return;
-      await this._raceActiveTurnWaiter(reservation.promise, activeTurnWaiter);
-    }
+    return waitForMessageSuspendedTokenUsageOwner(this._pendingInteractionsPort(), full, activeTurnWaiter);
   }
 
-  private async _captureMessageSuspendWithTokenUsage(
+  private _captureMessageSuspendWithTokenUsage(
     full: FullOutput<unknown>,
     queuedItemId: string | undefined,
     modeId: string,
@@ -5479,21 +4310,15 @@ export class Session {
     activeTurnWaiter?: Promise<never>,
     opts: { restoreFence?: { expectedKey?: string } } = {},
   ): Promise<void> {
-    await this._waitForMessageSuspendedTokenUsageOwner(full, activeTurnWaiter);
-    const reservation = this._reserveMessageSuspendedTokenUsage(full);
-    try {
-      await this._raceActiveTurnWaiter(
-        this._maybeCaptureSuspend(full, queuedItemId, modeId, modelId, {
-          tokenUsageDelta: reservation.tokenUsageDelta,
-          restoreFence: opts.restoreFence,
-        }),
-        activeTurnWaiter,
-      );
-      this._commitMessageSuspendedTokenUsage(full, reservation);
-    } catch (err) {
-      this._rollbackMessageSuspendedTokenUsage(reservation);
-      throw err;
-    }
+    return captureMessageSuspendWithTokenUsage(
+      this._pendingInteractionsPort(),
+      full,
+      queuedItemId,
+      modeId,
+      modelId,
+      activeTurnWaiter,
+      opts,
+    );
   }
 
   /**
@@ -6011,38 +4836,73 @@ export class Session {
     this._abortActiveTurn('agent_aborted');
   }
 
+  /** Build the port the admission-reservation functions reach the session through. */
+  private _admissionReservationPort(): AdmissionReservationSessionPort {
+    const session = this;
+    return {
+      harness: this._harness,
+      id: this.id,
+      messageAdmissionStarts: this._messageAdmissionStarts,
+      operationEvidenceSignalIds: this._operationEvidenceSignalIds,
+      resourceId: this.resourceId,
+      resultEvidenceWrites: this._resultEvidenceWrites,
+      runCompletionWaiters: this._runCompletionWaiters,
+      runOutcomes: this._runOutcomes,
+      terminalFinalizer: this._terminalFinalizer,
+      threadId: this.threadId,
+      get activeWorkAdmissionEpoch() {
+        return session._activeWorkAdmissionEpoch;
+      },
+      set activeWorkAdmissionEpoch(value) {
+        session._activeWorkAdmissionEpoch = value;
+      },
+      get activeWorkInvalidationsInFlight() {
+        return session._activeWorkInvalidationsInFlight;
+      },
+      set activeWorkInvalidationsInFlight(value) {
+        session._activeWorkInvalidationsInFlight = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get storage() {
+        return session._storage;
+      },
+      awaitDurableMessageResult: (...args) => session._awaitDurableMessageResult(...args),
+      awaitRunCompletion: (...args) => session._awaitRunCompletion(...args),
+      captureMessageSuspendWithTokenUsage: (...args) => session._captureMessageSuspendWithTokenUsage(...args),
+      cleanupOperationEvidenceIfDeleted: (...args) => session._cleanupOperationEvidenceIfDeleted(...args),
+      commitCachedDuplicateTerminal: (...args) => session._commitCachedDuplicateTerminal(...args),
+      commitTerminalHandoff: (...args) => session._commitTerminalHandoff(...args),
+      discardedErrorForReceipt: (...args) => session._discardedErrorForReceipt(...args),
+      ensureThreadSubscription: (...args) => session._ensureThreadSubscription(...args),
+      persistTokenUsageOrLatch: (...args) => session._persistTokenUsageOrLatch(...args),
+      prepareTerminalIdentity: (...args) => session._prepareTerminalIdentity(...args),
+      raceActiveTurnWaiter: (...args) => session._raceActiveTurnWaiter(...args),
+      recordMessageTurnCompletion: (...args) => session._recordMessageTurnCompletion(...args),
+      retainTerminalObservers: (...args) => session._retainTerminalObservers(...args),
+      sessionDeletedError: (...args) => session._sessionDeletedError(...args),
+      stageCompletedTerminalOutput: (...args) => session._stageCompletedTerminalOutput(...args),
+      terminalFailure: (...args) => session._terminalFailure(...args),
+      withActiveDeletedWaiter: (...args) => session._withActiveDeletedWaiter(...args),
+    };
+  }
+
   private _captureActiveWorkAdmission(operation: string): number {
-    if (this._activeWorkInvalidationsInFlight > 0) {
-      void operation;
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-    return this._activeWorkAdmissionEpoch;
+    return captureActiveWorkAdmission(this._admissionReservationPort(), operation);
   }
 
   private _activeWorkAdmissionIsCurrent(epoch: number): boolean {
-    return this._activeWorkInvalidationsInFlight === 0 && this._activeWorkAdmissionEpoch === epoch;
+    return activeWorkAdmissionIsCurrent(this._admissionReservationPort(), epoch);
   }
 
   private _assertActiveWorkAdmission(epoch: number, operation: string, signal?: AbortSignal): void {
-    if (signal?.aborted) {
-      throw signal.reason instanceof Error ? signal.reason : new HarnessAbortedError(this.id, 'agent_aborted');
-    }
-    if (!this._activeWorkAdmissionIsCurrent(epoch)) {
-      void operation;
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
+    return assertActiveWorkAdmission(this._admissionReservationPort(), epoch, operation, signal);
   }
 
   /** Begin a synchronous admission barrier; the returned closure is idempotent. */
   private _beginActiveWorkInvalidation(): () => void {
-    this._activeWorkAdmissionEpoch += 1;
-    this._activeWorkInvalidationsInFlight += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this._activeWorkInvalidationsInFlight = Math.max(0, this._activeWorkInvalidationsInFlight - 1);
-    };
+    return beginActiveWorkInvalidation(this._admissionReservationPort());
   }
 
   /**
@@ -6095,7 +4955,7 @@ export class Session {
         );
       }
       if (opts?.discardPendingInteraction !== false) {
-        await this._discardPendingInteractionForAbort(opts?.reason ?? 'parent_work_aborted');
+        await discardPendingInteractionForAbort(this._pendingInteractionsPort(), opts?.reason ?? 'parent_work_aborted');
       }
       // Catch a resume controller that was admitted immediately before the
       // invalidation epoch changed but became visible after the first abort.
@@ -6202,25 +5062,8 @@ export class Session {
    * `cancelRequest` is also honored by reconcile-on-rehydrate). Same-process
    * only: a child owned by another live instance is not reachable here.
    */
-  async cancelSubagent(opts: { subagentSessionId: string; reason?: string }): Promise<void> {
-    this._assertNotDeleted();
-    // Ownership guard: only cancel a subagent THIS session is actively running.
-    const isOwnChild = Array.from(this._activeSubagents.values()).some(
-      s => s.subagentSessionId === opts.subagentSessionId,
-    );
-    if (!isOwnChild) return;
-    const child = this._harness._internalGetLiveSession(opts.subagentSessionId);
-    if (!child) return; // not live in this process — best-effort no-op
-    try {
-      await child._cancelInternal(
-        { reason: opts.reason ?? 'subagent_cancelled', requestedBy: this.id },
-        this.id,
-        undefined,
-        true,
-      );
-    } catch {
-      // Best-effort: a late race (child already settling/closed) must not throw.
-    }
+  cancelSubagent(opts: { subagentSessionId: string; reason?: string }): Promise<void> {
+    return cancelSubagent(this._delegationDriverPort(), opts);
   }
 
   /** @internal — the delegated children this process is settling now (see `_settlingDelegations`). */
@@ -6237,10 +5080,7 @@ export class Session {
    * that throws is ignored. Returns the unsubscribe function.
    */
   _internalOnDelegatedSettlement(listener: (subagentSessionId: string) => void): () => void {
-    this._delegatedSettlementListeners.add(listener);
-    return () => {
-      this._delegatedSettlementListeners.delete(listener);
-    };
+    return internalOnDelegatedSettlement(this._delegationDriverPort(), listener);
   }
 
   /**
@@ -6253,57 +5093,20 @@ export class Session {
    */
   /** @internal PF-7473 — the `subagent` tool's send/cancel admission check. */
   _internalAssertSubagentControlAdmitted(callerSignal?: AbortSignal): void {
-    this._assertLive('subagent control');
-    this._assertActiveWorkAdmission(
-      this._captureActiveWorkAdmission('subagent control'),
-      'subagent control',
-      callerSignal,
-    );
+    return internalAssertSubagentControlAdmitted(this._delegationDriverPort(), callerSignal);
   }
 
-  async _internalCancelOwnedSubagent(
+  _internalCancelOwnedSubagent(
     subagentSessionId: string,
     reason: string,
     callerSignal?: AbortSignal,
   ): Promise<'delivered' | 'delivered_incomplete' | 'unavailable'> {
-    this._assertNotDeleted();
-    // Only a live parent whose turn is still admitted may cancel: a call that
-    // resumes after eviction, Stop or reset must not act on the child.
-    const epoch = this._captureActiveWorkAdmission('subagent cancel');
-    const assertAdmitted = () => {
-      this._assertLive('subagent cancel');
-      this._assertActiveWorkAdmission(epoch, 'subagent cancel', callerSignal);
-    };
-    assertAdmitted();
-    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted, true);
-    if (unavailable.includes(subagentSessionId)) return 'unavailable';
-    // A cold delegated child has no live driver in this process; reconciliation
-    // maps its committed cancelRequest to a cancelled plan task. A live driver's
-    // delegation is skipped by the reconcile pass, so this is safe either way.
-    this._scheduleDelegationReconcileRetry(0);
-    // The child committed its cancel, but a descendant below it could not be
-    // reached; a repeated cancel resumes that cascade.
-    return unavailable.length > 0 ? 'delivered_incomplete' : 'delivered';
+    return internalCancelOwnedSubagent(this._delegationDriverPort(), subagentSessionId, reason, callerSignal);
   }
 
   /** Read every durable delegation link in this session's plan forest. */
-  private async _listDelegatedSubagentSessionIds(): Promise<string[]> {
-    const ids = new Set<string>();
-    let cursor: string | undefined;
-    for (;;) {
-      const page = await this._storage.listPlanTasks({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        limit: 500,
-        cursor,
-      });
-      for (const task of page.tasks) {
-        if (task.delegatedSubagentSessionId !== undefined) ids.add(task.delegatedSubagentSessionId);
-      }
-      if (!page.cursor || page.tasks.length === 0) break;
-      cursor = page.cursor;
-    }
-    return Array.from(ids);
+  private _listDelegatedSubagentSessionIds(): Promise<string[]> {
+    return listDelegatedSubagentSessionIds(this._delegationDriverPort());
   }
 
   /**
@@ -6314,7 +5117,7 @@ export class Session {
    * cascade can resume. Descendant cancellation flows through the child's
    * normal durable `cancel()` path.
    */
-  private async _cancelOwnedSubagentSessions(
+  private _cancelOwnedSubagentSessions(
     subagentSessionIds: Iterable<string>,
     reason: string,
     /** PF-7473: re-proves the caller is still admitted right before each child write. */
@@ -6322,59 +5125,17 @@ export class Session {
     /** PF-7706: only the `subagent` tool's cancel of one child; never a cascade. */
     targeted = false,
   ): Promise<{ cancelled: string[]; unavailable: string[] }> {
-    const cancelled: string[] = [];
-    const unavailable: string[] = [];
-    for (const childId of new Set(subagentSessionIds)) {
-      if (childId === this.id) {
-        unavailable.push(childId);
-        continue;
-      }
-      let child = this._harness._internalGetLiveSession(childId);
-      if (child === undefined) {
-        let stored: SessionRecord | null;
-        try {
-          stored = await this._storage.loadSession({
-            harnessName: this._record.harnessName,
-            sessionId: childId,
-          });
-        } catch {
-          unavailable.push(childId);
-          continue;
-        }
-        if (stored === null || stored.closedAt !== undefined || stored.closingAt !== undefined) {
-          continue;
-        }
-        if (stored.parentSessionId !== this.id || stored.resourceId !== this.resourceId) {
-          unavailable.push(childId);
-          continue;
-        }
-        try {
-          child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
-        } catch {
-          unavailable.push(childId);
-          continue;
-        }
-      }
-      if (child.parentSessionId !== this.id || child.resourceId !== this.resourceId) {
-        unavailable.push(childId);
-        continue;
-      }
-      assertAdmitted?.();
-      try {
-        const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
-        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id, assertAdmitted, targeted);
-        if (!alreadyCancelled) cancelled.push(childId);
-        unavailable.push(...nested.unavailable);
-      } catch (error) {
-        // The caller lost admission mid-cancel: nothing was written; surface it.
-        if (assertAdmitted !== undefined && admissionLost(assertAdmitted)) throw error;
-        unavailable.push(childId);
-      }
-    }
-    return { cancelled: Array.from(new Set(cancelled)), unavailable: Array.from(new Set(unavailable)) };
+    return cancelOwnedSubagentSessions(
+      this._delegationDriverPort(),
+      subagentSessionIds,
+      reason,
+      assertAdmitted,
+      targeted,
+    );
   }
 
-  private async _cancelInternal(
+  /** @internal The owning parent session cancels this child through it, from the delegation driver. */
+  async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
     /** PF-7473: re-proved inside the serialized cancel write; a throw aborts it. */
@@ -6390,8 +5151,14 @@ export class Session {
     this._assertNotDeleted();
     const existingCancel = this._currentCancelRequest();
     if (existingCancel !== undefined) {
-      await this._settlePendingInteractionCancellation(existingCancel.reason ?? opts?.reason);
-      return this._cascadeCancellationToOwnedSubagents(existingCancel.reason ?? opts?.reason ?? 'parent_cancelled');
+      await settlePendingInteractionCancellation(
+        this._pendingInteractionsPort(),
+        existingCancel.reason ?? opts?.reason,
+      );
+      return cascadeCancellationToOwnedSubagents(
+        this._delegationDriverPort(),
+        existingCancel.reason ?? opts?.reason ?? 'parent_cancelled',
+      );
     }
 
     const reason = opts?.reason;
@@ -6457,7 +5224,10 @@ export class Session {
     const committedCancel = this._currentCancelRequest();
     if (committedCancel === undefined) return { unavailable: [] };
     if (!attemptedWrite || committedCancel.requestedAt !== requestedAt) {
-      return this._cascadeCancellationToOwnedSubagents(committedCancel.reason ?? reason ?? 'parent_cancelled');
+      return cascadeCancellationToOwnedSubagents(
+        this._delegationDriverPort(),
+        committedCancel.reason ?? reason ?? 'parent_cancelled',
+      );
     }
     const durableReason = committedCancel.reason;
     this._clearQueueWakeTimer();
@@ -6500,241 +5270,10 @@ export class Session {
       await this._settleCompletedQueuedItemAfterCancellation(completed.item, completed.result, completed.modeId);
     }
 
-    await this._settlePendingInteractionCancellation(durableReason);
+    await settlePendingInteractionCancellation(this._pendingInteractionsPort(), durableReason);
     this._notifyMaybeIdle();
 
-    return this._cascadeCancellationToOwnedSubagents(reason ?? 'parent_cancelled');
-  }
-
-  /**
-   * A suspended signal remains in `pendingResume` as immutable audit/recovery
-   * evidence after session cancellation, but its durable signal result must be
-   * failed immediately. Otherwise `signal()` callers (including detached task
-   * delegation drivers) wait until the interaction TTL and retain concurrency
-   * reservations for up to ten minutes.
-   */
-  private async _settlePendingInteractionCancellation(reason?: string): Promise<void> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) return;
-    const cancellationError = new HarnessSessionCancelledError(this.id, reason);
-    const projectedError = projectHarnessPublicError(cancellationError);
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    if (queuedItemId !== undefined) {
-      const receipt = this._record.queueAdmissionReceipts?.[queuedItemId];
-      if (receipt?.signalId !== undefined) {
-        await this._writeQueueSignalResultEvidence({
-          status: 'failed',
-          signalId: receipt.signalId,
-          runId: receipt.runId,
-          error: projectedError,
-        });
-      }
-    }
-    if (pending.originSignalId !== undefined) {
-      await this._settleSignalResult(pending.originSignalId, {
-        status: 'failed',
-        runId: pending.runId,
-        error: projectedError,
-      });
-    }
-    // A cancelled suspended turn may have deferred a terminal admission —
-    // settle the pending grant so its retained observers and durable row do
-    // not outlive the owning interaction.
-    await this._cancelTerminalizedPendingAdmission(pending, projectedError);
-  }
-
-  /**
-   * Abort/branch-revision counterpart to cancellation settlement. The pending
-   * interaction is terminalized and removed without setting a parent
-   * `cancelRequest`, so the conversation session remains reusable. Durable
-   * signal evidence is failed before the exact-generation clear; a crash in
-   * between leaves the pending row visible and safely retryable.
-   */
-  private async _discardPendingInteractionForAbort(reason: string): Promise<boolean> {
-    const pending = this._record.pendingResume;
-    if (pending === undefined) return false;
-    const abortError = new HarnessSessionCancelledError(this.id, reason);
-    const projectedError = projectHarnessPublicError(abortError);
-    const failedAt = Date.now();
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
-
-    // First win a durable waiting/resuming -> terminalizing transition. Resume
-    // admission rejects any generation carrying expiryStartedAt, so evidence is
-    // never failed for a response that can still proceed. If the process dies
-    // after this claim, the ordinary pending-deadline recovery finishes it.
-    let discardClaimed = false;
-    await this._flushUpdate(prev => {
-      discardClaimed = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== pending.kind ||
-        current.runId !== pending.runId ||
-        current.toolCallId !== pending.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
-        current.requestedAt !== pending.requestedAt ||
-        current.expiresAt !== pending.expiresAt ||
-        current.resumedAt !== pending.resumedAt ||
-        current.expiryStartedAt !== undefined
-      ) {
-        return prev;
-      }
-      discardClaimed = true;
-      return {
-        ...prev,
-        pendingResume: { ...current, expiryStartedAt: failedAt },
-      };
-    });
-    if (!discardClaimed) return false;
-
-    if (queueReceipt?.signalId !== undefined) {
-      await this._writeQueueSignalResultEvidence({
-        status: 'failed',
-        signalId: queueReceipt.signalId,
-        runId: queueReceipt.runId,
-        error: projectedError,
-      });
-    }
-    if (pending.originSignalId !== undefined) {
-      await this._settleSignalResult(pending.originSignalId, {
-        status: 'failed',
-        runId: pending.runId,
-        error: projectedError,
-      });
-    }
-    // A discarded suspension may have deferred a terminal admission — settle
-    // the pending grant alongside the other durable evidence BEFORE the
-    // pending row clears below. If cancellation fails here the claim marker
-    // (`expiryStartedAt`) stays on the row, the interaction remains
-    // discoverable, and the pending-deadline recovery finishes the cancel.
-    await this._cancelTerminalizedPendingAdmission(pending, projectedError);
-
-    let discarded = false;
-    await this._flushUpdate(prev => {
-      discarded = false;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        current.kind !== pending.kind ||
-        current.runId !== pending.runId ||
-        current.toolCallId !== pending.toolCallId ||
-        (current.itemId ?? current.toolCallId) !== (pending.itemId ?? pending.toolCallId) ||
-        current.requestedAt !== pending.requestedAt ||
-        current.expiresAt !== pending.expiresAt ||
-        current.resumedAt !== pending.resumedAt ||
-        current.expiryStartedAt !== failedAt
-      ) {
-        return prev;
-      }
-      discarded = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      // A response may have durably won admission (`resumedAt` + accepted
-      // inbox receipt) immediately before Stop invalidated the branch. Because
-      // no provider resume is allowed to start afterward, terminalize every
-      // accepted receipt for this exact pending generation instead of leaving a
-      // permanent "accepted" receipt that a reconnect could mistake for work
-      // still in flight.
-      const inboxResponseReceipts = { ...(prev.inboxResponseReceipts ?? {}) };
-      let inboxReceiptsChanged = false;
-      for (const [responseId, receipt] of Object.entries(inboxResponseReceipts)) {
-        if (
-          receipt.status === 'accepted' &&
-          receipt.kind === pending.kind &&
-          receipt.runId === pending.runId &&
-          receipt.toolCallId === pending.toolCallId &&
-          receipt.pendingRequestedAt === pending.requestedAt
-        ) {
-          inboxResponseReceipts[responseId] = {
-            ...receipt,
-            status: 'failed',
-            error: projectedError,
-            failedAt: receipt.failedAt ?? failedAt,
-            updatedAt: failedAt,
-            retryable: false,
-          };
-          inboxReceiptsChanged = true;
-        }
-      }
-      if (inboxReceiptsChanged) next.inboxResponseReceipts = inboxResponseReceipts;
-      if (queuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
-        const receipt = prev.queueAdmissionReceipts?.[queuedItemId];
-        if (receipt && receipt.status !== 'completed' && receipt.status !== 'failed' && receipt.status !== 'dead') {
-          next.queueAdmissionReceipts = {
-            ...(prev.queueAdmissionReceipts ?? {}),
-            [queuedItemId]: {
-              ...receipt,
-              status: 'failed',
-              error: projectedError,
-              failedAt: receipt.failedAt ?? failedAt,
-              updatedAt: failedAt,
-            },
-          };
-        }
-      }
-      return next;
-    });
-    if (!discarded) return false;
-
-    this._clearPendingInteractionExpiryTimer();
-    this._pendingReplacementToolSurfaces.delete(pending.runId);
-    if (queuedItemId !== undefined) {
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(abortError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(queueReceipt?.runId ? { runId: queueReceipt.runId } : {}),
-        ...(queueReceipt?.signalId ? { signalId: queueReceipt.signalId } : {}),
-        ...(queueReceipt?.admissionId ? { admissionId: queueReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: pending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    if (this._currentTurnAbortController === undefined) {
-      this._releaseParkedRun(pending);
-      this._emitAgentEnd({ runId: pending.runId, finishReason: 'error' });
-    }
-    this._notifyMaybeIdle();
-    return true;
-  }
-
-  /**
-   * Continue a durable cancellation through every owned delegation edge. This
-   * remains callable after `cancelRequest` committed so a restart between the
-   * parent CAS and descendant propagation can safely resume the cascade.
-   */
-  private async _cascadeCancellationToOwnedSubagents(reason: string): Promise<{ unavailable: string[] }> {
-    const activeChildIds = Array.from(this._activeSubagents.values(), state => state.subagentSessionId);
-    let delegatedChildIds: string[] = [];
-    let discoveryFailed = false;
-    try {
-      // A restarted parent may have no process-local `_activeSubagents` entry
-      // even though its plan still durably owns detached descendants. Discover
-      // those links before cascading so cancellation reaches the whole cold
-      // delegation tree rather than only whichever generation happened to be
-      // hydrated first.
-      delegatedChildIds = await this._listDelegatedSubagentSessionIds();
-    } catch {
-      // Mark this session as incomplete: its caller must preserve the ownership
-      // edge and retry because we cannot prove that every descendant was found.
-      discoveryFailed = true;
-    }
-    const cancellation = await this._cancelOwnedSubagentSessions([...activeChildIds, ...delegatedChildIds], reason);
-    return {
-      unavailable: Array.from(new Set([...(discoveryFailed ? [this.id] : []), ...cancellation.unavailable])),
-    };
+    return cascadeCancellationToOwnedSubagents(this._delegationDriverPort(), reason ?? 'parent_cancelled');
   }
 
   /**
@@ -6757,7 +5296,9 @@ export class Session {
       const queue = prev.pendingQueue ?? [];
       const idx = queue.findIndex(item => item.id === targetId);
       const activeResumeId =
-        prev.pendingResume !== undefined ? this._queuedItemIdForPendingResume(prev.pendingResume) : undefined;
+        prev.pendingResume !== undefined
+          ? queuedItemIdForPendingResume(this._pendingInteractionsPort(), prev.pendingResume)
+          : undefined;
       if (idx <= 0 || this._queueHead.currentId === targetId || activeResumeId === targetId) return prev;
 
       const item = queue[idx]!;
@@ -7132,7 +5673,7 @@ export class Session {
   // Signal-routing helpers (§4.2). One long-lived thread subscription per
   // Session multiplexes every run on the thread into a single chunk
   // stream. `message()` calls `agent.sendSignal()`, gets a `runId` back,
-  // and awaits the matching entry in `_runCompletionPromises`. Completion
+  // and awaits the matching entry in `_runCompletionWaiters`. Completion
   // settlement is handled by `_watchRunCompletion()`; the drain loop only
   // emits harness events from stream chunks.
   // -------------------------------------------------------------------------
@@ -7219,7 +5760,7 @@ export class Session {
     // Keep the cached result reusable so duplicate admission callers that
     // converge on the same runId can still observe the terminal output even
     // if another waiter arrived first.
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     if (cached) {
       return cached.ok
         ? this._stageCompletedTerminalOutput(runId, cached.full, { tolerateUnknownRun: true }).then(() => cached.full)
@@ -7228,15 +5769,8 @@ export class Session {
     // Multiple callers can await the same run (e.g. `message()` followed by
     // an active-delivery `signal()` that drains into the same run). Memoize
     // the promise so they all see the same resolution.
-    const existing = this._runCompletionPromises.get(runId);
-    if (existing) return existing.promise;
-    let resolve!: (full: FullOutput<unknown>) => void;
-    let reject!: (err: unknown) => void;
-    const promise = new Promise<FullOutput<unknown>>((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-    this._runCompletionPromises.set(runId, { promise, resolve, reject });
+    const { promise, created } = this._runCompletionWaiters.register(runId);
+    if (!created) return promise;
     // Single canonical settler: wait for the runtime to register the run's
     // `MastraModelOutput`, then await its `_waitUntilFinished()`. The drain
     // loop emits events from chunks; it does NOT settle completion. This
@@ -7251,7 +5785,7 @@ export class Session {
    * Canonical completion watcher. Acquires the run's `MastraModelOutput`
    * from the runtime via `waitForRunOutput()` (event-driven — no polling),
    * awaits `_waitUntilFinished()`, then settles the outstanding completion
-   * promise (or stashes the result in `_completedRuns` if the waiter has not
+   * promise (or stashes the result in the run outcome cache if the waiter has not
    * been registered yet, e.g. for very fast runs).
    *
    * The captured `out` reference is threaded through to `_handleRunTerminal`
@@ -7267,10 +5801,8 @@ export class Session {
         _waitUntilFinished?: () => Promise<void>;
       };
     } catch (err) {
-      const waiter = this._runCompletionPromises.get(runId);
-      this._runCompletionPromises.delete(runId);
-      this._rememberCompletedRun(runId, { ok: false, err });
-      waiter?.reject(err);
+      this._runCompletionWaiters.fail(runId, err);
+      this._runOutcomes.remember(runId, { ok: false, err });
       return;
     }
     // Stage the provider's completed output as soon as the run has it, before
@@ -7315,10 +5847,8 @@ export class Session {
               const lease = captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, runId);
               if (lease) clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, runId, lease);
             }
-            const waiter = this._runCompletionPromises.get(runId);
-            this._runCompletionPromises.delete(runId);
-            this._rememberCompletedRun(runId, { ok: false, err: terminalError });
-            waiter?.reject(terminalError);
+            this._runCompletionWaiters.fail(runId, terminalError);
+            this._runOutcomes.remember(runId, { ok: false, err: terminalError });
             return;
           }
           // Subscription teardown wakes the barrier. Since the model output is
@@ -7357,15 +5887,11 @@ export class Session {
       delete next.pendingResume;
       return next;
     });
-    if (cleared) this._pendingReplacementToolSurfaces.delete(runId);
+    if (cleared) this._replacementToolSurface.drop(runId);
   }
 
   private _rejectNonTerminalRunCompletions(reason: unknown): void {
-    for (const [runId, entry] of this._runCompletionPromises) {
-      if (this._modelTerminalRunsPendingEventDrain.has(runId)) continue;
-      this._runCompletionPromises.delete(runId);
-      entry.reject(reason);
-    }
+    this._runCompletionWaiters.rejectAllExcept(runId => this._modelTerminalRunsPendingEventDrain.has(runId), reason);
   }
 
   /**
@@ -7397,10 +5923,10 @@ export class Session {
     try {
       for await (const chunk of sub.stream) {
         const runId = (chunk as { runId?: string }).runId;
-        if (runId && this._currentRunId === undefined) {
-          // First chunk for a run marks our "current run" for getDisplayState().
-          this._currentRunId = runId;
-        }
+        // First chunk for a run marks our "current run" for getDisplayState(),
+        // but only inside a turn this session opened (PF-8698): a run woken on
+        // the thread from outside the session is not the session's run.
+        if (runId && this._currentTurnAbortController !== undefined) this._adoptRunId(runId);
         this._emitForChunk(chunk);
       }
     } catch (err) {
@@ -7421,18 +5947,17 @@ export class Session {
    * already dropped it from `getRunOutput()` by now).
    *
    * If no waiter is registered yet (very fast run), the result is stashed
-   * in `_completedRuns` so later `_awaitRunCompletion(runId)` calls can
+   * in the run outcome cache so later `_awaitRunCompletion(runId)` calls can
    * observe it.
    */
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
-    const waiter = this._runCompletionPromises.get(runId);
+    const waiter = this._runCompletionWaiters.promiseFor(runId);
     // Share this waiter through output collection and durable staging: the
     // runtime may already have cleared its output when another caller joins.
-    const cached = this._completedRuns.get(runId);
+    const cached = this._runOutcomes.get(runId);
     if (cached && !cached.ok) {
       this._runToolReceipts.delete(runId);
-      this._runCompletionPromises.delete(runId);
-      if (waiter) waiter.reject(cached.err);
+      this._runCompletionWaiters.fail(runId, cached.err);
       return;
     }
     let rawFull: FullOutput<unknown>;
@@ -7449,9 +5974,11 @@ export class Session {
       const aborted = this._abortedTerminalRunIds.delete(runId);
       const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
-      this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
-      this._runCompletionPromises.delete(runId);
-      if (waiter) waiter.reject(err);
+      this._runOutcomes.remember(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
+      // Remember before `fail`, as the base did here, while the other failure
+      // sites `fail` first. Either order is the same: remembering an outcome
+      // never reads the waiters, and a rejection runs no continuation synchronously.
+      this._runCompletionWaiters.fail(runId, err);
       return;
     }
     this._abortedTerminalRunIds.delete(runId);
@@ -7464,17 +5991,17 @@ export class Session {
       }
       full = this._materializeHarnessRunOutput(runId, rawFull);
       await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true });
-      this._rememberCompletedRun(runId, { ok: true, full });
-      if (waiter) waiter.resolve(full);
+      this._runOutcomes.remember(runId, { ok: true, full });
+      this._runCompletionWaiters.resolveIfCurrent(runId, waiter, full);
     } catch (err) {
       this._runToolReceipts.delete(runId);
       // A staging failure is pending settlement of concrete output. Keep that
       // output available to a same-admission retry, which must stage it before
       // delivering completion or accounting usage.
-      this._rememberCompletedRun(runId, full === undefined ? { ok: false, err } : { ok: true, full });
-      if (waiter) waiter.reject(err);
+      this._runOutcomes.remember(runId, full === undefined ? { ok: false, err } : { ok: true, full });
+      this._runCompletionWaiters.rejectIfCurrent(runId, waiter, err);
     } finally {
-      if (this._runCompletionPromises.get(runId) === waiter) this._runCompletionPromises.delete(runId);
+      this._runCompletionWaiters.dropIfCurrent(runId, waiter);
     }
   }
 
@@ -7653,33 +6180,6 @@ export class Session {
     }
   }
 
-  private _rememberCompletedRun(
-    runId: string,
-    entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown; runFailed?: true },
-  ): void {
-    const existing = this._completedRuns.get(runId);
-    if (existing !== undefined) {
-      // A resumed run produces a new output for the same runId each time it
-      // ends. A cached 'suspended' entry is an intermediate generation, not a
-      // terminal result — replace it so retries and settlement observe the
-      // newest suspension/terminal output instead of reverting to an obsolete
-      // earlier suspension point.
-      const existingSuspended = existing.ok && existing.full.finishReason === 'suspended';
-      if (!existingSuspended) return;
-      this._completedRuns.delete(runId);
-    }
-    this._completedRuns.set(runId, entry);
-    while (this._completedRuns.size > 64) {
-      const oldest = this._completedRuns.keys().next().value;
-      if (oldest === undefined) return;
-      this._completedRuns.delete(oldest);
-      this._messageTokenAccountedRunIds.delete(oldest);
-      this._messageTokenAccountingRunIds.delete(oldest);
-      this._messageTokenAccountingReservations.delete(oldest);
-      this._runToolReceipts.delete(oldest);
-    }
-  }
-
   /**
    * Capture only tool receipt identity/status from the authoritative stream.
    * Failed local tools are absent from Mastra FullOutput.toolResults, so this
@@ -7786,12 +6286,7 @@ export class Session {
   private _pendingRunToolReceiptProjection(
     runId: string,
   ): Pick<PendingResume, 'toolReceipts' | 'toolReceiptsOverflow'> {
-    const state = this._runToolReceipts.get(runId);
-    if (state === undefined) return {};
-    return {
-      ...(state.receipts.length > 0 ? { toolReceipts: state.receipts.map(receipt => ({ ...receipt })) } : {}),
-      ...(state.overflow ? { toolReceiptsOverflow: true } : {}),
-    };
+    return pendingRunToolReceiptProjection(this._pendingInteractionsPort(), runId);
   }
 
   private _restorePendingRunToolReceipts(pending: PendingResume): void {
@@ -7993,21 +6488,15 @@ export class Session {
         if (!answer) return;
         const deliveryKey = `${runId}:${chunk.id}`;
         if (this._deliveredTerminalSubagentAnswers.has(deliveryKey)) return;
-        const pending = this._pendingTerminalSubagentAnswers.get(runId);
-        if (pending && pending.partId !== chunk.id) {
-          // More than one candidate for a run is ambiguous. The framework
-          // protocol will fail the run; Harness must not guess which to render.
-          this._pendingTerminalSubagentAnswers.delete(runId);
-          return;
-        }
-        this._pendingTerminalSubagentAnswers.set(runId, { partId: chunk.id, answer });
+        // More than one candidate for a run is ambiguous. The framework
+        // protocol will fail the run; Harness must not guess which to render.
+        this._terminalSubagentAnswers.offer(runId, chunk.id, answer);
         return;
       }
       case 'step-finish': {
         if (runId === undefined) return;
-        const pending = this._pendingTerminalSubagentAnswers.get(runId);
+        const pending = this._terminalSubagentAnswers.take(runId);
         if (!pending) return;
-        this._pendingTerminalSubagentAnswers.delete(runId);
         const payload = chunk.payload as { messageId?: unknown; terminalToolResult?: unknown } | undefined;
         const authoritative = parseHarnessSubagentTerminalResult(payload?.terminalToolResult);
         if (
@@ -8036,7 +6525,7 @@ export class Session {
         return;
       }
       case 'finish': {
-        if (runId !== undefined) this._pendingTerminalSubagentAnswers.delete(runId);
+        if (runId !== undefined) this._terminalSubagentAnswers.drop(runId);
         return;
       }
       case 'tool-call-input-streaming-start': {
@@ -8572,7 +7061,7 @@ export class Session {
     // Signal-routed path: every non-structured message goes through
     // `agent.sendSignal()`. The long-lived thread subscription is the
     // single chunk consumer for this Session; the drain loop emits
-    // per-chunk harness events and resolves `_runCompletionPromises[runId]`
+    // per-chunk harness events and resolves the `runId` entry of `_runCompletionWaiters`
     // when the run terminates.
     //
     // On an idle thread the agent starts a fresh run with
@@ -8847,7 +7336,7 @@ export class Session {
               // The reservation stays unstamped; whoever holds the lease next
               // settles it. Keep recovery due in case that is this process.
               if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionClosedError) {
-                this._scheduleOrphanRecheck(Date.now());
+                scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
               }
               throw err;
             }
@@ -8902,7 +7391,7 @@ export class Session {
         if (this._state === 'deleted') {
           throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
         }
-        this._scheduleOrphanRecheck(Date.now());
+        scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
         latest = await this._storage.loadMessageResultEvidence({
           harnessName: this._record.harnessName,
           sessionId: this.id,
@@ -9111,10 +7600,8 @@ export class Session {
       finishOwnedMessageTurn();
       rejectMessageAdmissionStart(failure);
       void completion.catch(() => {});
-      const waiter = this._runCompletionPromises.get(signal.runId);
-      this._runCompletionPromises.delete(signal.runId);
-      this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-      waiter?.reject(failure);
+      this._runCompletionWaiters.fail(signal.runId, failure);
+      this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
       if (
         admissionIdentity !== undefined &&
         terminalIdentity === undefined &&
@@ -9176,10 +7663,8 @@ export class Session {
             : err;
           finishOwnedMessageTurn();
           void completion.catch(() => {});
-          const waiter = this._runCompletionPromises.get(signal.runId);
-          this._runCompletionPromises.delete(signal.runId);
-          this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-          waiter?.reject(failure);
+          this._runCompletionWaiters.fail(signal.runId, failure);
+          this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
           if (
             admissionIdentity !== undefined &&
             terminalIdentity === undefined &&
@@ -9455,10 +7940,8 @@ export class Session {
       }
       if (!streamStarted) {
         void completion.catch(() => {});
-        const waiter = this._runCompletionPromises.get(signal.runId);
-        this._runCompletionPromises.delete(signal.runId);
-        this._rememberCompletedRun(signal.runId, { ok: false, err: failure });
-        waiter?.reject(failure);
+        this._runCompletionWaiters.fail(signal.runId, failure);
+        this._runOutcomes.remember(signal.runId, { ok: false, err: failure });
       }
       if (
         admissionIdentity !== undefined &&
@@ -9672,7 +8155,7 @@ export class Session {
     timer.unref?.();
   }
 
-  private async _resolveMessageAdmissionDuplicate({
+  private _resolveMessageAdmissionDuplicate({
     admissionId,
     admissionHash,
     compatibleAdmissionHashes,
@@ -9681,371 +8164,18 @@ export class Session {
     admissionHash: string;
     compatibleAdmissionHashes?: readonly string[];
   }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | undefined> {
-    const resolved = await this._storage.resolveOperationAdmissionEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      kind: 'signal',
+    return resolveMessageAdmissionDuplicate(this._admissionReservationPort(), {
       admissionId,
-      attemptedAdmissionHash: admissionHash,
+      admissionHash,
+      compatibleAdmissionHashes,
     });
-    if (resolved.status === 'none') return undefined;
-    if (resolved.status === 'conflict') {
-      if (
-        resolved.storedAdmissionHash !== undefined &&
-        compatibleAdmissionHashes?.includes(resolved.storedAdmissionHash)
-      ) {
-        return resolved.evidence as AgentSignalResultEvidence | OperationAdmissionTombstone | undefined;
-      }
-      throw new HarnessAdmissionConflictError(this.id, admissionId, resolved.storedAdmissionHash ?? '', admissionHash);
-    }
-    return resolved.evidence as AgentSignalResultEvidence | OperationAdmissionTombstone | undefined;
   }
 
-  private async _returnDuplicateMessageResult(
+  private _returnDuplicateMessageResult(
     evidence: AgentSignalResultEvidence | OperationAdmissionTombstone,
     opts: MessageOptions,
   ): Promise<AgentResult | AgentStream | unknown> {
-    return this._withActiveDeletedWaiter(async activeDeleted => {
-      if ('status' in evidence) {
-        // A cancelled terminal admission settles its turn with this code; a
-        // same-admission retry keeps reporting the cancellation.
-        if (
-          evidence.status === 'failed' &&
-          evidence.error.code === 'harness.terminal_cancelled' &&
-          opts.executionAuthorityGrant !== undefined
-        ) {
-          const terminalError = new HarnessTerminalHandoffCancelledError(opts.executionAuthorityGrant.key);
-          try {
-            opts.onTerminalCommitError?.(terminalError);
-          } catch {
-            // The terminal outcome below is authoritative.
-          }
-          throw terminalError;
-        }
-        if (opts.stream === true) {
-          if (evidence.status === 'pending') {
-            const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
-            const duplicateModelId = this._messageDuplicateModelId(evidence, opts);
-            const agent = this._harness.getAgentForMode(duplicateModeId);
-            await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
-            const runId = await this._pendingMessageRunId(evidence);
-            if (runId && this._completedRuns.has(runId)) {
-              const cached = this._completedRuns.get(runId);
-              // A run whose own output rejected in this process: commit its
-              // durable failed terminal instead of leaving it pending.
-              if (cached !== undefined && !cached.ok && cached.runFailed === true) {
-                await this._commitCachedDuplicateTerminal(
-                  new RejectedTerminalRun(cached.err),
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-              }
-              if (cached?.ok && evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-                await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
-                const terminalCommitted = await this._commitCachedDuplicateTerminal(
-                  cached.full,
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-                if (!terminalCommitted) {
-                  await this._writeMessageResultEvidenceBestEffort({
-                    status: 'completed',
-                    signalId: evidence.signalId,
-                    runId,
-                    modeId: duplicateModeId,
-                    modelId: duplicateModelId,
-                    operationKind: 'message',
-                    result: cached.full,
-                    admissionId: evidence.admissionId,
-                    admissionHash: evidence.admissionHash,
-                  });
-                }
-              }
-              throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
-            }
-            let output = runId ? (agent.getRunOutput(runId) as AgentStream | undefined) : undefined;
-            let retainedCompletedOutput = false;
-            if (
-              output &&
-              (output as { status?: string }).status !== undefined &&
-              (output as { status?: string }).status !== 'running'
-            ) {
-              retainedCompletedOutput = true;
-              output = undefined;
-            }
-            if (runId && !output && !retainedCompletedOutput) {
-              const waitAbortController = new AbortController();
-              const completion = this._runCompletionPromises.get(runId)?.promise.then(
-                () => undefined,
-                () => undefined,
-              );
-              try {
-                output = (await Promise.race([
-                  this._raceActiveTurnWaiter(
-                    (
-                      agent.waitForRunOutput(runId, { abortSignal: waitAbortController.signal }) as Promise<AgentStream>
-                    ).catch(() => undefined),
-                    activeDeleted,
-                  ),
-                  ...(completion ? [completion] : []),
-                  delay(MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS, waitAbortController.signal).then(
-                    () => undefined,
-                    () => undefined,
-                  ),
-                ])) as AgentStream | undefined;
-              } finally {
-                waitAbortController.abort(
-                  new HarnessValidationError('message().admissionId', 'duplicate stream wait ended'),
-                );
-              }
-            }
-            if (output) {
-              // The returned stream may have been adopted after the original
-              // caller died between dispatch and bookkeeping — retain this
-              // retry's terminal observers AND take settlement ownership: a
-              // detached task runs the durable completion bookkeeping the
-              // original caller would have run (a suspended outcome must still
-              // park its pendingResume or the approval can never be answered)
-              // and then drives the terminal commit when the run ends. The
-              // per-runId in-flight dedup makes the commit a no-op when the
-              // original caller is still alive and commits first.
-              const adoptedTerminal =
-                this._terminalFinalizer !== undefined &&
-                opts.executionAuthorityGrant !== undefined &&
-                runId !== undefined &&
-                evidence.admissionId !== undefined &&
-                evidence.admissionHash !== undefined;
-              if (adoptedTerminal) {
-                this._retainTerminalObservers(runId!, {
-                  onReceipt: opts.onTerminalCommit,
-                  onFailure: opts.onTerminalCommitError,
-                });
-              }
-              // `_prepareTerminalIdentity` can throw synchronously — drain the
-              // observers retained above before propagating or they strand.
-              let identity: HarnessTerminalIdentity | undefined;
-              try {
-                identity = adoptedTerminal
-                  ? this._prepareTerminalIdentity(
-                      this._messageAdmissionIdentity(evidence.admissionId!),
-                      evidence.admissionId!,
-                      evidence.admissionHash!,
-                      opts.executionAuthorityGrant!,
-                    )
-                  : undefined;
-              } catch (err) {
-                throw this._terminalFailure(err, undefined, runId);
-              }
-              const duplicateMode = this._messageDuplicateModeId(evidence, opts);
-              const duplicateModel = this._messageDuplicateModelId(evidence, opts);
-              // Settle through the canonical run-completion barrier, not the raw
-              // stream output — `getFullOutput()` alone misses the output-drain
-              // barrier, tool receipts, and terminal-text materialization, so a
-              // terminal-tool response would commit empty evidence instead of
-              // the authoritative answer.
-              void this._awaitRunCompletion(runId!)
-                .then(async full => {
-                  const fullOutput = full as FullOutput<unknown>;
-                  try {
-                    await this._prepareCachedDuplicateMessageCompletion(fullOutput, evidence, opts, activeDeleted);
-                    if (identity !== undefined) {
-                      await this._commitTerminalHandoff(identity, fullOutput, {
-                        modeId: duplicateMode,
-                        modelId: duplicateModel,
-                      });
-                    }
-                  } catch (err) {
-                    // `_commitTerminalHandoff` drains retained observers on its
-                    // own failures, but pre-commit failures (suspension park,
-                    // usage persist, run-materialization) never reach that
-                    // drain — surface an indeterminate outcome here instead of
-                    // stranding the observers retained above. The drain is
-                    // idempotent against the helper's own.
-                    this._terminalFailure(err, undefined, runId);
-                  }
-                })
-                .catch(async err => {
-                  // A run whose own output rejected commits its durable failed
-                  // terminal (the commit drains the retained observers).
-                  const cached = this._completedRuns.get(runId!);
-                  if (
-                    identity !== undefined &&
-                    cached !== undefined &&
-                    !cached.ok &&
-                    cached.runFailed === true &&
-                    cached.err === err
-                  ) {
-                    await this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), {
-                      modeId: duplicateMode,
-                      modelId: duplicateModel,
-                    }).catch(() => {});
-                    return;
-                  }
-                  // Otherwise `_awaitRunCompletion` itself failed (collector or
-                  // output-drain) — the `.then` never ran, so no settlement
-                  // helper saw the failure. Drain the retained observers with
-                  // the indeterminate outcome; the admission stays pending for
-                  // recovery either way.
-                  this._terminalFailure(err, undefined, runId);
-                });
-              return output;
-            }
-          }
-          // A committed terminal admission must replay its durable receipt to
-          // this retry's observers before reporting the stream as unavailable —
-          // the throw below is not a substitute for the terminal outcome.
-          if (evidence.status === 'completed' && evidence.erased === true) {
-            await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
-          }
-          if (
-            evidence.status === 'completed' &&
-            this._terminalFinalizer !== undefined &&
-            opts.executionAuthorityGrant !== undefined
-          ) {
-            await this._commitCachedDuplicateTerminal(
-              this._completedEvidenceResult(evidence) as FullOutput<unknown>,
-              evidence,
-              opts,
-              activeDeleted,
-            );
-          }
-          if (evidence.status === 'failed') await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
-          throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
-        }
-        if (evidence.status === 'completed') {
-          // A terminal caller still needs its durable receipt replayed — the
-          // committed fast-path converges on the stored winner without
-          // recomputing it.
-          if (evidence.erased === true) await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
-          const completedResult = this._completedEvidenceResult(evidence);
-          // A completed (terminal, immutable) suspended result whose
-          // suspension was discarded replays the discard, not `suspended`.
-          const discardedSuspension = this._discardReceiptForSuspendedOutput(completedResult);
-          if (discardedSuspension !== undefined) throw this._discardedErrorForReceipt(discardedSuspension);
-          if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
-            await this._commitCachedDuplicateTerminal(
-              completedResult as FullOutput<unknown>,
-              evidence,
-              opts,
-              activeDeleted,
-            );
-          }
-          return completedResult;
-        }
-        if (evidence.status === 'failed') {
-          await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
-          throw publicErrorProjectionToError(evidence.error);
-        }
-        const runId = await this._pendingMessageRunId(evidence);
-        if (runId) {
-          const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
-          const duplicateModelId = this._messageDuplicateModelId(evidence, opts);
-          const agent = this._harness.getAgentForMode(duplicateModeId);
-          await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
-          const cached = this._completedRuns.get(runId);
-          if (cached) {
-            if (!cached.ok) {
-              // A run whose own output rejected in this process: commit its
-              // durable failed terminal (a no-op replay once committed), then
-              // report the run's failure as before.
-              if (cached.runFailed === true) {
-                await this._commitCachedDuplicateTerminal(
-                  new RejectedTerminalRun(cached.err),
-                  evidence,
-                  opts,
-                  activeDeleted,
-                );
-              }
-              throw cached.err;
-            }
-            if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-              await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
-              const terminalCommitted = await this._commitCachedDuplicateTerminal(
-                cached.full,
-                evidence,
-                opts,
-                activeDeleted,
-              );
-              if (!terminalCommitted) {
-                await this._writeMessageResultEvidenceBestEffort({
-                  status: 'completed',
-                  signalId: evidence.signalId,
-                  runId,
-                  modeId: duplicateModeId,
-                  modelId: duplicateModelId,
-                  operationKind: 'message',
-                  result: cached.full,
-                  admissionId: evidence.admissionId,
-                  admissionHash: evidence.admissionHash,
-                });
-              }
-            }
-            return cached.full;
-          }
-          if (!this._hasLiveMessageRun(agent, runId)) {
-            let durable: AgentResult;
-            try {
-              durable = await this._raceActiveTurnWaiter(
-                this._awaitDurableMessageResult(evidence, opts),
-                activeDeleted,
-              );
-            } catch (err) {
-              // The admission may have committed a failed or interrupted
-              // terminal meanwhile: replay its durable receipt to this retry.
-              // A completed turn whose result a session delete erased mid-wait
-              // replays its completed receipt too (PF-5309).
-              await this._replayCommittedTerminalFailure(
-                evidence,
-                opts,
-                activeDeleted,
-                err instanceof HarnessMessageResultErasedError ? { includeCompleted: true } : {},
-              );
-              throw err;
-            }
-            // The durable wait resolved because the admission committed — the
-            // committed fast-path replays the stored receipt so this retry's
-            // terminal observers see the same outcome as the winner's caller.
-            await this._commitCachedDuplicateTerminal(durable as FullOutput<unknown>, evidence, opts, activeDeleted);
-            return durable;
-          }
-          let live: FullOutput<unknown>;
-          try {
-            live = await this._raceActiveTurnWaiter(this._awaitRunCompletion(runId), activeDeleted);
-          } catch (err) {
-            // A live run whose own output rejected: commit (or replay) its
-            // durable failed terminal for this retry, then report the failure.
-            const rejected = this._completedRuns.get(runId);
-            if (rejected !== undefined && !rejected.ok && rejected.runFailed === true && rejected.err === err) {
-              await this._commitCachedDuplicateTerminal(new RejectedTerminalRun(err), evidence, opts, activeDeleted);
-            }
-            throw err;
-          }
-          if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
-            await this._prepareCachedDuplicateMessageCompletion(live, evidence, opts, activeDeleted);
-            const terminalCommitted = await this._commitCachedDuplicateTerminal(live, evidence, opts, activeDeleted);
-            if (!terminalCommitted) {
-              await this._writeMessageResultEvidenceBestEffort({
-                status: 'completed',
-                signalId: evidence.signalId,
-                runId,
-                modeId: duplicateModeId,
-                modelId: duplicateModelId,
-                operationKind: 'message',
-                result: live,
-                admissionId: evidence.admissionId,
-                admissionHash: evidence.admissionHash,
-              });
-            }
-          }
-          return live;
-        }
-      }
-      throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-    });
+    return returnDuplicateMessageResult(this._admissionReservationPort(), evidence, opts);
   }
 
   /**
@@ -10102,244 +8232,6 @@ export class Session {
   }
 
   /**
-   * A same-admission retry whose turn already committed a non-completed
-   * terminal — a rejected run's `failed` result, or an interrupted dispatch's
-   * `aborted` one — gets that durable receipt replayed to its
-   * `onTerminalCommit`, as a retry of a completed turn does, before it reports
-   * the failure. An admission that is not committed is left alone, and a
-   * failed lookup only skips the replay: the durable intent is authoritative.
-   */
-  private async _replayCommittedTerminalFailure(
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-    replay: { includeCompleted?: true } = {},
-  ): Promise<void> {
-    const grant = opts.executionAuthorityGrant;
-    if (
-      opts.onTerminalCommit === undefined ||
-      grant === undefined ||
-      evidence.admissionId === undefined ||
-      !this._storage.supportsTerminalHandoff
-    ) {
-      return;
-    }
-    let receipt: HarnessTerminalCommitReceipt;
-    try {
-      const admission = await this._raceActiveTurnWaiter(
-        this._storage.loadTerminalAdmission({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          admissionId: evidence.admissionId,
-          executionGrant: grant,
-        }),
-        activeDeleted,
-      );
-      if (
-        admission?.status !== 'committed' ||
-        (replay.includeCompleted !== true && admission.terminalResult?.status === 'completed')
-      ) {
-        return;
-      }
-      const intent = await this._raceActiveTurnWaiter(
-        this._storage.loadTerminalIntent({
-          harnessName: admission.harnessName,
-          intentId: harnessTerminalIntentId(admission.id),
-        }),
-        activeDeleted,
-      );
-      receipt = { status: 'duplicate', admission, ...(intent !== null ? { intent } : {}) };
-    } catch {
-      return;
-    }
-    try {
-      opts.onTerminalCommit(receipt);
-    } catch {
-      // Receipt observers are diagnostics only and cannot change the durable winner.
-    }
-  }
-
-  private async _prepareCachedDuplicateMessageCompletion(
-    full: FullOutput<unknown>,
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-  ): Promise<void> {
-    const runId = full.runId ?? evidence.runId;
-    if (runId !== undefined) {
-      try {
-        // The cached output exists only in this process, so a native run
-        // here is known and still fails closed on a lookup failure.
-        await this._raceActiveTurnWaiter(
-          this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true }),
-          activeDeleted,
-        );
-      } catch (error) {
-        throw this._terminalFailure(error, opts.onTerminalCommitError, runId);
-      }
-    }
-    if (full.finishReason === 'suspended') {
-      // A cached suspension is a replay of an earlier generation — a resumed
-      // run may already have parked a *newer* pendingResume (different tool
-      // call, or a different run entirely). The durable park is authoritative;
-      // restoring the stale cached suspension would revert it.
-      const parked = this._record.pendingResume;
-      const payload = full.suspendPayload as { toolCallId?: string } | undefined;
-      if (parked !== undefined && (parked.runId !== full.runId || parked.toolCallId !== payload?.toolCallId)) {
-        return;
-      }
-      // `discardPendingInteraction` resolved this suspended call. Re-parking
-      // the cached suspension (with a fresh `requestedAt`) would make the
-      // discarded run answerable again; settle the still-pending message
-      // admission as discarded instead and report that outcome.
-      const discardedCallRunId = full.runId ?? evidence.runId;
-      const discard = parked === undefined ? this._discardReceiptForSuspendedOutput(full, evidence.runId) : undefined;
-      if (discard !== undefined) {
-        const discardError = this._discardedErrorForReceipt(discard);
-        if (evidence.status === 'pending') {
-          // Same admitted failure write a failed message turn makes, so later
-          // retries replay a terminal outcome. Best effort: the discard
-          // receipt keeps refusing the re-park if this write fails.
-          await this._raceActiveTurnWaiter(
-            this._writeMessageResultEvidence({
-              status: 'failed',
-              signalId: evidence.signalId,
-              runId: discardedCallRunId,
-              ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
-              ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
-              operationKind: 'message',
-              error: projectHarnessPublicError(discardError),
-              ...(evidence.admissionId !== undefined && evidence.admissionHash !== undefined
-                ? { admissionId: evidence.admissionId, admissionHash: evidence.admissionHash }
-                : {}),
-            }).catch(() => undefined),
-            activeDeleted,
-          );
-        }
-        throw discardError;
-      }
-      // The deferred admission bound to this run may already be terminal
-      // (aborted/cancelled/fenced) or sealed. Re-parking the cached suspension
-      // then resurrects a pending interaction whose grant can never settle —
-      // a later respond would drive the provider against a revoked or finished
-      // grant. Only a still-pending admission may be re-parked here; the
-      // commit helper below reports the terminal outcome to this caller. The
-      // probe keys off durable state, not local finalizer registration — a
-      // reopened session without a finalizer must still see the dead grant.
-      const admissionRunId = full.runId ?? evidence.runId;
-      const sessionIncarnation = this._record.sessionIncarnation;
-      if (
-        this._storage.supportsTerminalHandoff &&
-        sessionIncarnation !== undefined &&
-        evidence.admissionId !== undefined &&
-        admissionRunId !== undefined
-      ) {
-        const admission = await this._raceActiveTurnWaiter(
-          this._storage.loadTerminalAdmissionByRun({
-            harnessName: this._record.harnessName,
-            sessionId: this.id,
-            runId: admissionRunId,
-            sessionIncarnation,
-          }),
-          activeDeleted,
-        );
-        if (admission !== null && admission.status !== 'pending') return;
-      }
-      await this._captureMessageSuspendWithTokenUsage(
-        full,
-        undefined,
-        this._messageDuplicateModeId(evidence, opts),
-        this._messageDuplicateModelId(evidence, opts),
-        activeDeleted,
-        {
-          restoreFence: {
-            expectedKey: parked === undefined ? undefined : pendingInteractionGenerationKey(parked),
-          },
-        },
-      );
-      return;
-    }
-
-    const { tokenUsageAccounted } = this._recordMessageTurnCompletion(full, { persist: false });
-    if (tokenUsageAccounted) {
-      await this._raceActiveTurnWaiter(this._persistTokenUsageOrLatch(), activeDeleted);
-    }
-  }
-
-  private async _pendingMessageRunId(evidence: AgentSignalResultEvidence): Promise<string | undefined> {
-    if (evidence.status !== 'pending') return evidence.runId;
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    if (!starting) return evidence.runId;
-    try {
-      const startingEvidence = await starting.promise;
-      return startingEvidence.runId ?? evidence.runId;
-    } catch {
-      return evidence.runId;
-    }
-  }
-
-  /**
-   * Deferred terminal settlement for a message that suspended. The admission's
-   * deterministic `runId` is the resumed run's id, so the durable row is
-   * recoverable without persisting extra correlation on `pendingResume`.
-   * The probe is by-run across statuses: a cancelled or fenced grant must still
-   * surface its terminal outcome (the commit helper throws it and drains
-   * retained observers) instead of letting the resume clear `pendingResume`
-   * and report success on a revoked grant; a committed row replays its durable
-   * receipt through the same barrier.
-   */
-  private async _settleResumedTerminalHandoff(
-    pending: PendingResume,
-    full: FullOutput<unknown>,
-    options: { modeId?: string; modelId?: string },
-    deletedTurnWaiter: Promise<never>,
-    turnAbortSignal: AbortSignal | undefined,
-  ): Promise<void> {
-    // Probe durable state even when no finalizer is registered on this session
-    // instance — a reopened session must still observe a bound admission and
-    // fail closed through the commit barrier rather than report success on an
-    // unsettled (or dead) grant.
-    const admission = await this._probeResumeAdmissionByRun(pending);
-    if (!admission) return;
-    // PF-7631: a resumed wake turn's terminal commit is a wake terminal commit:
-    // the same bounded re-drive with an `error` event per failed attempt. If it
-    // still fails, the resume rejects and the parked interaction stays, so a
-    // retry of the response or stale-resume recovery settles it later.
-    if (isHarnessWakeReservedKey(admission.admissionId)) {
-      await this._commitWakeTerminalWithRetry(admission, full, options, deletedTurnWaiter, turnAbortSignal);
-      return;
-    }
-    await this._commitTerminalHandoff(admission, full, options);
-  }
-
-  /**
-   * Stale-resume recovery terminalizes a resumed turn without delivering its
-   * reply, but the resumed run may already have staged completed output and
-   * consumed tokens. Count that usage before any evidence rewrite.
-   */
-  private async _accountStagedResumeUsage(pending: PendingResume, queuedItemId: string | undefined): Promise<void> {
-    const admission = await this._probeResumeAdmissionByRun(pending);
-    if (!admission) return;
-    const stored = await this._storage.loadMessageResultEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: admission.signalId,
-    });
-    if (
-      stored === null ||
-      !('status' in stored) ||
-      stored.status !== 'pending' ||
-      stored.stagedResult === undefined ||
-      stored.runId !== pending.runId
-    ) {
-      return;
-    }
-    await this._accountStagedTerminalUsage(pending.runId, stored.stagedResult as FullOutput<unknown>, queuedItemId);
-  }
-
-  /**
    * Count a staged turn's consumed usage exactly once before its pending
    * evidence is rewritten without delivery (cancellation or interruption).
    * A parked resumed run counts against its generation's durable baseline;
@@ -10372,49 +8264,23 @@ export class Session {
       });
       // A run this process already accounted keeps its armed baseline, and
       // a queued post-run finalization already persisted its delta.
-      const queuedId = queuedItemId ?? this._queuedItemIdForPendingResume(parked);
+      const queuedId = queuedItemId ?? queuedItemIdForPendingResume(this._pendingInteractionsPort(), parked);
       const queuedUsagePersisted =
         queuedId !== undefined && this._record.queueAdmissionReceipts?.[queuedId]?.postRunFinalizedAt !== undefined;
       // Resumed finalization and this path share one once-only marker.
-      const cached = this._completedRuns.get(runId);
-      const finalizationAccounted = cached?.ok === true && cached.resumeAccountingKey === generationKey;
-      if (cached?.ok === true) cached.resumeAccountingKey = generationKey;
-      if (
-        !queuedUsagePersisted &&
-        !finalizationAccounted &&
-        this._resumeUsageBaseline?.generationKey !== generationKey
-      ) {
+      const finalizationAccounted = this._runOutcomes.isResumeAccounted(runId, generationKey);
+      this._runOutcomes.noteResumeAccounted(runId, generationKey);
+      if (!queuedUsagePersisted && !finalizationAccounted && !this._resumeUsageFence.isArmedFor(generationKey)) {
         this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
-        const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
-        if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+        const runUsage = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), staged);
+        if (runUsage !== undefined) this._resumeUsageFence.arm(generationKey, runUsage);
       }
-      this._messageTokenAccountedRunIds.add(runId);
+      this._messageTokenLedger.markAccounted(runId);
     } else {
       this._recordMessageTurnCompletion(staged, { persist: false });
     }
     this._terminalStagingLedger.markStagedAndAccounted(runId);
     await this._persistTokenUsageOrLatch();
-  }
-
-  /**
-   * By-run admission probe shared by the settle and cancel paths. A probe
-   * failure never reaches `_commitTerminalHandoff`'s drain, so the
-   * indeterminate outcome is reported to the run's retained observers here
-   * while the admission stays pending/recoverable.
-   */
-  private async _probeResumeAdmissionByRun(pending: PendingResume) {
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return undefined;
-    try {
-      return await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        runId: pending.runId,
-        sessionIncarnation,
-      });
-    } catch (err) {
-      throw this._terminalFailure(err, undefined, pending.runId);
-    }
   }
 
   /**
@@ -10444,7 +8310,7 @@ export class Session {
     // Probe across statuses: an external cancellation may have already moved
     // the row out of 'pending', and the retained observers still need their
     // terminal outcome.
-    const admission = await this._probeResumeAdmissionByRun(pending);
+    const admission = await probeResumeAdmissionByRun(this._pendingInteractionsPort(), pending);
     if (!admission) return;
     if (admission.status === 'cancelled') {
       await this._settleCancelledTerminalMessage(admission, error.message, settleOptions);
@@ -10571,11 +8437,11 @@ export class Session {
         },
         updatedAt: Date.now(),
       });
-      if (!swapped.applied) this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      if (!swapped.applied) scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now() + ORPHANED_DISPATCH_RETRY_MS);
     } catch (err) {
       // The admission is already cancelled; its row is left to recovery.
       console.error('[harness/v1] cancelled terminal turn settlement failed; recovery will settle it:', err);
-      this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now() + ORPHANED_DISPATCH_RETRY_MS);
       if (this._state !== 'live' && this._state !== 'closing') return;
       this._emitter.emit({
         type: 'storage_error',
@@ -10615,137 +8481,6 @@ export class Session {
     });
   }
 
-  /**
-   * Resolve an approved plan-approval mode transition. A caller-supplied
-   * `transitionToMode` on the response overrides the submitting mode's
-   * declared `transitionsTo` (captured into `pending.transitionModeId` at
-   * suspend time); a same-mode or unapproved response flips nothing. Throws
-   * when the target mode no longer exists — recovery callers that must stay
-   * total catch and skip the flip.
-   */
-  private _resolvePlanApprovalModeFlipTarget(
-    pending: PendingResume,
-    data: { approved?: boolean; transitionToMode?: string } | undefined,
-  ): string | undefined {
-    if (data?.approved !== true) return undefined;
-    const candidate = data.transitionToMode ?? pending.transitionModeId;
-    if (!candidate || candidate === this._record.modeId) return undefined;
-    this._harness._getMode(candidate);
-    return candidate;
-  }
-
-  /**
-   * Settlement-only retry for a resume whose provider run already completed but
-   * whose post-output bookkeeping threw. `resumedAt` is durable so the caller
-   * cannot re-run `resumeStream`; instead the cached completed `FullOutput` is
-   * committed through `_finalizeResumedTurnOutcome`, which is idempotent for
-   * every step the failed attempt did not reach. Returns the completed result
-   * when it handled the retry, `undefined` when there is nothing recoverable
-   * (no cached output, no pending admission, or the run re-suspended) and the
-   * caller should fall through to the ordinary already-responded handling.
-   */
-  private async _maybeFinalizeRetriedResumedTerminal(
-    pending: PendingResume,
-    resumeData: unknown,
-    options: {
-      expectedKind: PendingResume['kind'];
-      responseMode: ResumeResponseMode;
-      responseId?: string;
-    },
-  ): Promise<AgentResult | InboxResponseResult | undefined> {
-    // Probe durable state even without a locally-registered finalizer — a
-    // reopened session must still reconcile a bound admission (the commit
-    // barrier replays a sealed winner or fails closed on a live one).
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return undefined;
-    // Probe by run regardless of status: a commit may have sealed the grant
-    // while the post-commit bookkeeping (the pendingResume-clearing flush)
-    // failed — the admission is then 'committed' rather than 'pending', and
-    // the retry must still finish the remaining bookkeeping. A cancelled or
-    // fenced row means the interaction was already terminalized elsewhere.
-    const admission = await this._storage.loadTerminalAdmissionByRun({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      runId: pending.runId,
-      sessionIncarnation,
-    });
-    if (!admission || (admission.status !== 'pending' && admission.status !== 'committed')) {
-      return undefined;
-    }
-    const cached = this._completedRuns.get(pending.runId);
-    let full: FullOutput<unknown>;
-    if (cached !== undefined && cached.ok && cached.full.finishReason !== 'suspended') {
-      full = cached.full;
-    } else {
-      // A restart emptied the local run cache — canonical evidence still
-      // carries the committed or staged completed output, so
-      // recover it instead of reporting the resume as abandoned. The cached
-      // entry is repopulated so the per-generation usage marker still dedupes
-      // a second retry.
-      const stored = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: admission.signalId,
-      });
-      if (
-        !stored ||
-        !('status' in stored) ||
-        !(
-          (stored.status === 'completed' && stored.result !== undefined) ||
-          (stored.status === 'pending' && stored.stagedResult !== undefined)
-        )
-      ) {
-        return undefined;
-      }
-      full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
-      this._rememberCompletedRun(pending.runId, { ok: true, full });
-    }
-
-    const { expectedKind, responseMode, responseId } = options;
-    const pendingQueuedItemId = this._queuedItemIdForPendingResume(pending);
-    const resumeModeId = this._modeIdForPendingResume(pending);
-    const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
-    const modeFlipTarget =
-      expectedKind === 'plan-approval'
-        ? this._resolvePlanApprovalModeFlipTarget(
-            pending,
-            resumeData as { approved: boolean; transitionToMode?: string },
-          )
-        : undefined;
-    const completingQueuedItemId = pendingQueuedItemId;
-    await this._withActiveDeletedWaiter(async activeTurnWaiter => {
-      try {
-        await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(pending.runId, full), activeTurnWaiter);
-        await this._finalizeResumedTurnOutcome(pending, full, {
-          responseId,
-          pendingQueuedItemId,
-          completingQueuedItemId,
-          modeFlipTarget,
-          previousModeId: this._record.modeId,
-          resumeModeId,
-          resumeModelId: resumeRuntimeDependencies.modelId,
-          deletedTurnWaiter: activeTurnWaiter,
-        });
-      } catch (err) {
-        if (err instanceof QueuePostRunFinalizationPendingError && completingQueuedItemId !== undefined) {
-          this._deferQueuedTurnRetry(err);
-        }
-        throw redactPublicBoundaryRejection(err);
-      }
-    });
-    if (completingQueuedItemId !== undefined) {
-      void this._maybeDrainQueue();
-    }
-    if (responseMode === 'inbox-receipt') {
-      const receipt =
-        responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
-      if (receipt) return this._inboxReceiptResult(receipt, false);
-    }
-    return full as AgentResult;
-  }
-
   private _retainTerminalObservers(
     runId: string,
     options: {
@@ -10781,105 +8516,23 @@ export class Session {
   }
 
   private _messageDuplicateModeId(evidence: AgentSignalResultEvidence, opts: MessageOptions): string {
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    return starting?.modeId ?? evidence.modeId ?? opts.mode ?? this._record.modeId;
+    return messageDuplicateModeId(this._admissionReservationPort(), evidence, opts);
   }
 
   private _messageDuplicateModelId(evidence: AgentSignalResultEvidence, opts: MessageOptions): string {
-    const starting = evidence.admissionId ? this._messageAdmissionStarts.get(evidence.admissionId) : undefined;
-    return starting?.modelId ?? evidence.modelId ?? opts.model ?? this._record.modelId;
+    return messageDuplicateModelId(this._admissionReservationPort(), evidence, opts);
   }
 
   private _hasLiveMessageRun(agent: Agent, runId: string): boolean {
-    return Boolean(
-      agent.getRunOutput(runId) || this._runCompletionPromises.has(runId) || this._completedRuns.has(runId),
-    );
+    return hasLiveMessageRun(this._admissionReservationPort(), agent, runId);
   }
 
-  private async _awaitDurableMessageResult(
-    evidence: AgentSignalResultEvidence,
-    opts: MessageOptions,
-  ): Promise<AgentResult> {
-    const deadline = Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
-    let extendedWaitMs = MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS;
-    while (true) {
-      throwIfAborted(opts.abortSignal, 'message().admissionId');
-      const latest = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
-      if (!latest) {
-        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-      }
-      if ('status' in latest) {
-        if (latest.status === 'completed') return this._completedEvidenceResult(latest);
-        if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
-        // While canonical evidence stays pending, consult the durable terminal
-        // admission each pass — a cancelled/fenced grant can never produce the
-        // completed evidence this loop waits on, and surfacing the durable
-        // outcome beats expiring into an unrelated liveness error (or waiting
-        // forever on a parked pendingResume).
-        const sessionIncarnation = this._record.sessionIncarnation;
-        if (this._storage.supportsTerminalHandoff && sessionIncarnation !== undefined && latest.runId !== undefined) {
-          const boundAdmission = await this._storage.loadTerminalAdmissionByRun({
-            harnessName: this._record.harnessName,
-            sessionId: this.id,
-            runId: latest.runId,
-            sessionIncarnation,
-          });
-          if (boundAdmission?.status === 'cancelled' || boundAdmission?.status === 'fenced') {
-            const terminalError =
-              boundAdmission.status === 'cancelled'
-                ? new HarnessTerminalHandoffCancelledError(boundAdmission.executionGrant.key)
-                : new HarnessTerminalHandoffFencedError(this.id);
-            try {
-              opts.onTerminalCommitError?.(terminalError);
-            } catch {
-              // The terminal outcome below is authoritative.
-            }
-            throw terminalError;
-          }
-        }
-      } else {
-        throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
-      }
-      let pastDeadline = false;
-      if (Date.now() >= deadline) {
-        // A terminal-mode message whose run is parked in `pendingResume`
-        // legitimately stays pending until the approval-gated resume settles
-        // the deferred admission — waiting past the probe deadline is correct.
-        // Key off the durable parked state, not local finalizer registration —
-        // a reopened session that has not re-registered a finalizer must still
-        // extend the wait for a run durably parked in pendingResume.
-        const suspendedOnThisRun = evidence.runId !== undefined && this._record.pendingResume?.runId === evidence.runId;
-        if (!suspendedOnThisRun) {
-          throw new HarnessValidationError('message().admissionId', 'pending message admission is not live');
-        }
-        pastDeadline = true;
-      }
-      await delay(pastDeadline ? extendedWaitMs : MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, opts.abortSignal);
-      if (pastDeadline) {
-        extendedWaitMs = Math.min(extendedWaitMs * 2, MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS);
-      }
-    }
+  private _awaitDurableMessageResult(evidence: AgentSignalResultEvidence, opts: MessageOptions): Promise<AgentResult> {
+    return awaitDurableMessageResult(this._admissionReservationPort(), evidence, opts);
   }
 
   private _messageAdmissionIdentity(admissionId: string): MessageAdmissionIdentity {
-    const digest = sha256CanonicalJson({
-      kind: 'message-admission',
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      admissionId,
-    });
-    return {
-      signalId: `harness-message-${digest.slice(0, 32)}`,
-      runId: `harness-message-${digest.slice(32, 64)}`,
-    };
+    return messageAdmissionIdentity(this._admissionReservationPort(), admissionId);
   }
 
   private _prepareTerminalIdentity(
@@ -10922,119 +8575,91 @@ export class Session {
     };
   }
 
-  /**
-   * PF-7631: admit a settlement wake turn under its Harness-minted grant
-   * (`harness-wake:<wakeNoticeId>`, generation 1) before it dispatches, through
-   * the same three durable steps an admitted message() terminal turn takes:
-   * the pending result reservation (lease-fenced), the terminal admission
-   * under the wake finalizer (grant lock, tombstones, winner check), and the
-   * dispatch claim stamp. Its staged output and settlement then follow the
-   * message() terminal path, and dispatch recovery settles it after a crash.
-   * Any refusal throws before dispatch, so no run starts under the grant.
-   */
-  private async _admitWakeTerminalTurn(input: {
-    wakeNoticeId: string;
-    signalId: string;
-    settlement: Pick<PendingDelegationSettlementNotice, 'taskId' | 'subagentSessionId' | 'outcome'>;
-    modeId: string;
-    modelId: string;
-  }): Promise<{ identity: HarnessTerminalIdentity; claimExpiresAt: number }> {
-    const finalizer = this._terminalWakeFinalizer!;
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (sessionIncarnation === undefined || sessionIncarnation.length === 0) {
-      throw new HarnessTerminalHandoffFencedError(this.id);
-    }
-    const executionGrant = harnessWakeExecutionGrant(input.wakeNoticeId);
-    const seed: HarnessWakeTerminalSeed = {
-      origin: 'wake',
-      wakeNoticeId: input.wakeNoticeId,
-      taskId: input.settlement.taskId,
-      subagentSessionId: input.settlement.subagentSessionId,
-      outcome: input.settlement.outcome,
-    };
-    const digest = sha256CanonicalJson({
-      kind: 'wake-admission',
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
+  /** Build the port the signals functions reach the session through. */
+  private _signalsPort(): SignalsSessionPort {
+    const session = this;
+    return {
+      harness: this._harness,
+      id: this.id,
+      operationEvidenceSignalIds: this._operationEvidenceSignalIds,
       resourceId: this.resourceId,
+      runCompletionWaiters: this._runCompletionWaiters,
+      runOutcomes: this._runOutcomes,
+      signalResultSettlements: this._signalResultSettlements,
+      terminalWakeFinalizer: this._terminalWakeFinalizer,
       threadId: this.threadId,
-      wakeNoticeId: input.wakeNoticeId,
-    });
-    const identity: HarnessTerminalIdentity = {
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      sessionIncarnation,
-      // The admission id is the grant key: both live in the reserved namespace.
-      admissionId: executionGrant.key,
-      admissionHash: sha256CanonicalJson({ kind: 'wake-admission-hash', seed }),
-      signalId: input.signalId,
-      runId: `harness-wake-${digest.slice(0, 32)}`,
-      executionGrant,
+      wakeAdmissions: this._wakeAdmissions,
+      get currentTurnAbortController() {
+        return session._currentTurnAbortController;
+      },
+      get currentTurnSourceWriteGuard() {
+        return session._currentTurnSourceWriteGuard;
+      },
+      get modeSwitchEpoch() {
+        return session._modeSwitchEpoch;
+      },
+      get pendingTokenUsageFlushError() {
+        return session._pendingTokenUsageFlushError;
+      },
+      set pendingTokenUsageFlushError(value) {
+        session._pendingTokenUsageFlushError = value;
+      },
+      get record() {
+        return session._record;
+      },
+      get state() {
+        return session._state;
+      },
+      get storage() {
+        return session._storage;
+      },
+      activeWorkAdmissionIsCurrent: (...args) => session._activeWorkAdmissionIsCurrent(...args),
+      admitTerminalHandoff: (...args) => session._admitTerminalHandoff(...args),
+      agentEndReasonForFullOutput: (...args) => session._agentEndReasonForFullOutput(...args),
+      assertLive: (...args) => session._assertLive(...args),
+      assertOpenForTurn: (...args) => session._assertOpenForTurn(...args),
+      assertSourceWriteGuardScope: (...args) => session._assertSourceWriteGuardScope(...args),
+      awaitRunCompletion: (...args) => session._awaitRunCompletion(...args),
+      beginTurn: (...args) => session._beginTurn(...args),
+      buildToolSurface: (...args) => session._buildToolSurface(...args),
+      buildTurnContextAndInstructions: (...args) => session._buildTurnContextAndInstructions(...args),
+      cancelWakeTerminalAdmission: (...args) => session._cancelWakeTerminalAdmission(...args),
+      cleanupOperationEvidenceIfDeleted: (...args) => session._cleanupOperationEvidenceIfDeleted(...args),
+      commitTerminalHandoff: (...args) => session._commitTerminalHandoff(...args),
+      completedEvidenceResult: (...args) => session._completedEvidenceResult(...args),
+      createActiveTurnWaiter: (...args) => session._createActiveTurnWaiter(...args),
+      createEmptySynthesisOptions: (...args) => session._createEmptySynthesisOptions(...args),
+      dispatchClaimStillHeld: (...args) => session._dispatchClaimStillHeld(...args),
+      emit: (...args) => session._emit(...args),
+      emitAgentEnd: (...args) => session._emitAgentEnd(...args),
+      emitAgentStart: (...args) => session._emitAgentStart(...args),
+      emitTurnEvent: (...args) => session._emitTurnEvent(...args),
+      endTurn: (...args) => session._endTurn(...args),
+      ensureThreadSubscription: (...args) => session._ensureThreadSubscription(...args),
+      injectSystemReminder: (...args) => session._injectSystemReminder(...args),
+      isExpectedFlushLifecycleError: (...args) => session._isExpectedFlushLifecycleError(...args),
+      isRejectedTerminalRun: (...args) => session._isRejectedTerminalRun(...args),
+      isRunning: (...args) => session.isRunning(...args),
+      latchDurableTurnFlushError: (...args) => session._latchDurableTurnFlushError(...args),
+      maybeCaptureSuspend: (...args) => session._maybeCaptureSuspend(...args),
+      maybeDrainQueue: (...args) => session._maybeDrainQueue(...args),
+      persistTokenUsageOrLatch: (...args) => session._persistTokenUsageOrLatch(...args),
+      recordMessageTurnCompletion: (...args) => session._recordMessageTurnCompletion(...args),
+      recordTurnCompletion: (...args) => session._recordTurnCompletion(...args),
+      releaseWakeTerminalAdmission: (...args) => session._releaseWakeTerminalAdmission(...args),
+      runGoalJudge: (...args) => session._runGoalJudge(...args),
+      runUsage: (...args) => session._runUsage(...args),
+      scheduleOrphanRecheck: (...args) => session._scheduleOrphanRecheck(...args),
+      sessionDeletedError: (...args) => session._sessionDeletedError(...args),
+      sessionLeaseHeld: (...args) => session._sessionLeaseHeld(...args),
+      setCurrentTurnReplacementToolSurface: (...args) => session._setCurrentTurnReplacementToolSurface(...args),
+      stageCompletedTerminalOutput: (...args) => session._stageCompletedTerminalOutput(...args),
+      subagentTracingOptions: (...args) => session._subagentTracingOptions(...args),
+      tokenUsageDeltaFromFullOutput: (...args) => session._tokenUsageDeltaFromFullOutput(...args),
+      trackBackgroundTurnCompletion: (...args) => session._trackBackgroundTurnCompletion(...args),
+      writeMessageResultEvidence: (...args) => session._writeMessageResultEvidence(...args),
+      writeMessageResultEvidenceBestEffort: (...args) => session._writeMessageResultEvidenceBestEffort(...args),
     };
-    validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
-    // Another attempt for this notice is admitting or running here.
-    if (!this._wakeAdmissions.enter(identity.admissionId)) {
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-    try {
-      const reservation = await this._writeMessageResultEvidence(
-        {
-          status: 'pending',
-          signalId: identity.signalId,
-          runId: identity.runId,
-          modeId: input.modeId,
-          modelId: input.modelId,
-          operationKind: 'message',
-          admissionId: identity.admissionId,
-          admissionHash: identity.admissionHash,
-        },
-        { leaseOwner: { ownerId: this._harness.ownerId } },
-      );
-      // An existing reservation means another attempt owns this notice's wake.
-      if (!reservation.created) throw new HarnessBusyError(this.id, 'in_flight');
-      await this._admitTerminalHandoff(identity, seed, undefined, finalizer);
-      const claimExpiresAt = Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS;
-      const stamped = await this._storage.compareAndSwapSignalDispatch({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: identity.signalId,
-        admissionId: identity.admissionId,
-        admissionHash: identity.admissionHash,
-        operationKind: 'message',
-        expected: { state: 'reserved' },
-        next: {
-          state: 'dispatching',
-          attemptId: `wake-dispatch-${randomUUID()}`,
-          claimExpiresAt,
-          delivery: 'idle',
-          runId: identity.runId,
-        },
-        leaseOwner: { ownerId: this._harness.ownerId },
-        updatedAt: Date.now(),
-      });
-      if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
-      return { identity, claimExpiresAt };
-    } catch (error) {
-      this._wakeAdmissions.leave(identity.admissionId);
-      // A reservation left behind is settled interrupted by dispatch recovery.
-      this._scheduleOrphanRecheck(Date.now());
-      // The notice was acknowledged before this wake, so a refusal other than
-      // a duplicate (busy) loses the wake: surface it rather than drop it. Its
-      // reminder row is persisted and still reaches the next parent turn.
-      if (!(error instanceof HarnessBusyError)) {
-        this._emitTurnEvent({
-          type: 'error',
-          runId: identity.runId,
-          signalId: identity.signalId,
-          error: projectHarnessPublicError(error),
-        });
-      }
-      throw error;
-    }
   }
 
   /**
@@ -11044,7 +8669,7 @@ export class Session {
    */
   private _releaseWakeTerminalAdmission(admissionId: string): void {
     this._wakeAdmissions.release(admissionId);
-    this._scheduleOrphanRecheck(Date.now());
+    scheduleOrphanRecheck(this._orphanRecoveryPort(), Date.now());
   }
 
   /**
@@ -11102,45 +8727,14 @@ export class Session {
    * any later failure). The caller then releases the admission to dispatch
    * recovery, and it stays durable.
    */
-  private async _commitWakeTerminalWithRetry(
+  private _commitWakeTerminalWithRetry(
     identity: HarnessTerminalIdentity,
     outcome: FullOutput<unknown> | RejectedTerminalRun,
     options: { modeId?: string; modelId?: string },
     activeDeleted: Promise<never>,
     turnAbortSignal: AbortSignal | undefined,
   ): Promise<void> {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        await Promise.race([this._commitTerminalHandoff(identity, outcome, options), activeDeleted]);
-        return;
-      } catch (error) {
-        if (this._state !== 'live' || turnAbortSignal?.aborted) throw error;
-        this._emitTurnEvent({
-          type: 'error',
-          runId: identity.runId,
-          signalId: identity.signalId,
-          error: projectHarnessPublicError(error),
-        });
-        if (
-          attempt >= WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS ||
-          error instanceof HarnessTerminalHandoffFencedError ||
-          error instanceof HarnessTerminalHandoffCancelledError ||
-          error instanceof HarnessTerminalHandoffIdentityConflictError
-        ) {
-          throw error;
-        }
-        const delayMs = Math.min(
-          WAKE_TERMINAL_COMMIT_RETRY_BASE_MS * 2 ** (attempt - 1),
-          WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
-        );
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const backoff = new Promise<void>(resolve => {
-          timer = setTimeout(resolve, delayMs);
-          (timer as { unref?: () => void }).unref?.();
-        });
-        await Promise.race([backoff, activeDeleted]).finally(() => clearTimeout(timer));
-      }
-    }
+    return commitWakeTerminalWithRetry(this._signalsPort(), identity, outcome, options, activeDeleted, turnAbortSignal);
   }
 
   /** The registration that settles a turn admitted under `id@version`, if any. */
@@ -11582,21 +9176,10 @@ export class Session {
    * so channel-ingress retries admitted by older processes resolve the same row.
    */
   private _signalAdmissionIdentity(admissionId: string): SignalAdmissionIdentity {
-    const digest = sha256CanonicalJson({
-      kind: 'channel-signal-admission',
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      admissionId,
-    });
-    return {
-      signalId: `harness-channel-signal-${digest.slice(0, 32)}`,
-      idleRunId: `harness-channel-wake-${digest.slice(32, 64)}`,
-    };
+    return signalAdmissionIdentity(this._signalsPort(), admissionId);
   }
 
-  private async _writeMessageResultEvidence(
+  private _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[]; leaseOwner?: { ownerId: string } },
   ): Promise<{
@@ -11604,51 +9187,7 @@ export class Session {
     applied: boolean;
     evidence?: AgentSignalResultEvidence | OperationAdmissionTombstone;
   }> {
-    if (status.admissionId !== undefined && status.admissionHash !== undefined && status.operationKind === undefined) {
-      throw new Error(
-        `Invalid Harness admission evidence for session "${this.id}" signal "${status.signalId}": operationKind is required`,
-      );
-    }
-    const now = Date.now();
-    this._operationEvidenceSignalIds.add(status.signalId);
-    try {
-      const evidence: AgentSignalResultEvidence = {
-        ...status,
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const write = this._storage.writeMessageResultEvidence(
-        evidence,
-        options?.leaseOwner !== undefined ? { leaseOwner: options.leaseOwner } : undefined,
-      );
-      // A turn's result write can outlive the turn (an aborted turn does not
-      // await it); close waits for these before judging what is pending.
-      this._resultEvidenceWrites.add(write);
-      void write
-        .finally(() => {
-          this._resultEvidenceWrites.delete(write);
-        })
-        .catch(() => {});
-      const result = await write;
-      await this._cleanupOperationEvidenceIfDeleted(status);
-      return result.created ? { created: true, applied: result.applied, evidence } : result;
-    } catch (err) {
-      if (err instanceof HarnessStorageSessionNotFoundError) throw this._sessionDeletedError(err);
-      if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
-        const duplicate = await this._resolveMessageAdmissionDuplicate({
-          admissionId: status.admissionId,
-          admissionHash: status.admissionHash,
-          compatibleAdmissionHashes: options?.compatibleAdmissionHashes,
-        });
-        if (duplicate) return { created: false, applied: false, evidence: duplicate };
-        throw new HarnessAdmissionConflictError(this.id, status.admissionId, '', status.admissionHash);
-      }
-      throw err;
-    }
+    return writeMessageResultEvidence(this._admissionReservationPort(), status, options);
   }
 
   /**
@@ -11675,7 +9214,7 @@ export class Session {
       .catch(() => {});
   }
 
-  private async _writeMessageResultEvidenceBestEffort(
+  private _writeMessageResultEvidenceBestEffort(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
   ): Promise<
@@ -11686,31 +9225,14 @@ export class Session {
       }
     | undefined
   > {
-    try {
-      return await this._writeMessageResultEvidence(status, options);
-    } catch (err) {
-      if (status.admissionId !== undefined) throw err;
-      // The initial pre-dispatch admission reservation is the durable barrier.
-      // Non-idempotent callers have no durable replay contract, so storage
-      // evidence is only best-effort for them.
-    }
+    return writeMessageResultEvidenceBestEffort(this._admissionReservationPort(), status, options);
   }
 
   private _writeMessageResultEvidenceBestEffortInBackground(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
     options?: { compatibleAdmissionHashes?: readonly string[] },
   ): void {
-    const write = this._writeMessageResultEvidenceBestEffort(status, options);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<void>(resolve => {
-      timer = setTimeout(resolve, MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS);
-      timer.unref?.();
-    });
-    void Promise.race([write, timeout])
-      .catch(() => {})
-      .finally(() => {
-        if (timer !== undefined) clearTimeout(timer);
-      });
+    return writeMessageResultEvidenceBestEffortInBackground(this._admissionReservationPort(), status, options);
   }
 
   /**
@@ -11740,215 +9262,17 @@ export class Session {
     admission?: SignalSettlementAdmission,
     options?: { strict?: boolean },
   ): Promise<AgentSignalResultEvidence | undefined> {
-    const inFlight = this._signalResultSettlements.get(signalId);
-    if (inFlight !== undefined) {
-      if (options?.strict !== true) return inFlight;
-      // A strict caller may join a best-effort settlement that swallowed its
-      // write failure: once it settles, verify the durable evidence is
-      // terminal and otherwise write it strictly (failure propagates).
-      return this._settleSignalResultStrictAfter(signalId, inFlight, outcome, admission);
-    }
-    const settlement = this._settleSignalResultOnce(signalId, outcome, admission, options).finally(() => {
-      if (this._signalResultSettlements.get(signalId) === settlement) {
-        this._signalResultSettlements.delete(signalId);
-      }
-    });
-    this._signalResultSettlements.set(signalId, settlement);
-    return settlement;
-  }
-
-  private async _settleSignalResultStrictAfter(
-    signalId: string,
-    inFlight: Promise<AgentSignalResultEvidence | undefined>,
-    outcome:
-      | { status: 'completed'; runId: string; result: AgentResult }
-      | { status: 'failed'; runId?: string; error: { code: string; message: string } },
-    admission?: SignalSettlementAdmission,
-  ): Promise<AgentSignalResultEvidence | undefined> {
-    await inFlight.catch(() => undefined);
-    const durable = await this._storage.loadMessageResultEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId,
-    });
-    if (durable && 'status' in durable && (durable.status === 'completed' || durable.status === 'failed')) {
-      return durable as AgentSignalResultEvidence;
-    }
-    return this._settleSignalResultOnce(signalId, outcome, admission, { strict: true });
-  }
-
-  private async _settleSignalResultOnce(
-    signalId: string,
-    outcome:
-      | { status: 'completed'; runId: string; result: AgentResult }
-      | { status: 'failed'; runId?: string; error: { code: string; message: string } },
-    admission?: SignalSettlementAdmission,
-    options?: { strict?: boolean },
-  ): Promise<AgentSignalResultEvidence | undefined> {
-    // A signal-owned run can suspend and later resume through a rehydrated
-    // Session. `PendingResume` intentionally carries only the public
-    // correlation signal id, so recover the private admission identity from
-    // its durable evidence before terminalizing. Without this, the storage
-    // identity fence rejects the terminal update and the admitted row remains
-    // pending forever. Non-admitted signal ids keep their historical
-    // best-effort behavior.
-    let retainedAdmission = admission;
-    if (retainedAdmission === undefined) {
-      const retained = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId,
-      });
-      if (retained && 'status' in retained) {
-        if (retained.status === 'completed' || retained.status === 'failed') {
-          return retained as AgentSignalResultEvidence;
-        }
-        const admitted = retained as AgentSignalResultEvidence;
-        if (admitted.admissionId !== undefined && admitted.admissionHash !== undefined) {
-          const identity = this._signalAdmissionIdentity(admitted.admissionId);
-          retainedAdmission = {
-            admissionId: admitted.admissionId,
-            admissionHash: admitted.admissionHash,
-            modeId: admitted.modeId ?? this._record.modeId,
-            modelId: admitted.modelId ?? this._record.modelId,
-            dispatch: this._signalDispatchState(admitted, identity),
-          };
-        }
-      }
-    }
-    if (retainedAdmission !== undefined) {
-      // Reserved admissions and synchronous pre-dispatch failures remain
-      // retryable. Only a concrete dispatch attempt can own terminal evidence.
-      if (retainedAdmission.dispatch.state === 'reserved') {
-        const retained = await this._storage.loadMessageResultEvidence({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-          signalId,
-        });
-        return retained && 'status' in retained ? (retained as AgentSignalResultEvidence) : undefined;
-      }
-      const terminal =
-        outcome.status === 'completed'
-          ? {
-              status: 'completed' as const,
-              signalId,
-              runId: outcome.runId,
-              result: outcome.result,
-              modeId: retainedAdmission.modeId,
-              modelId: retainedAdmission.modelId,
-            }
-          : {
-              status: 'failed' as const,
-              signalId,
-              ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-              error: outcome.error,
-              modeId: retainedAdmission.modeId,
-              modelId: retainedAdmission.modelId,
-            };
-      const write = await this._storage
-        .compareAndSwapSignalTerminal({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          resourceId: this.resourceId,
-          threadId: this.threadId,
-          signalId,
-          admissionId: retainedAdmission.admissionId,
-          admissionHash: retainedAdmission.admissionHash,
-          expected: retainedAdmission.dispatch,
-          terminal,
-          updatedAt: Date.now(),
-        })
-        .catch((err: unknown) => {
-          throw this._sessionDeletedError(err);
-        });
-      await this._cleanupOperationEvidenceIfDeleted({ signalId });
-      // The loser adopts the durable winner by returning without rewriting or
-      // projecting its stale run/result as the operation terminal.
-      if (!write.applied) return write.evidence;
-      if (outcome.status === 'completed') {
-        this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
-      } else {
-        this._emit({
-          type: 'signal_failed',
-          signalId,
-          ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-          error: outcome.error,
-        });
-      }
-      return write.evidence;
-    } else if (outcome.status === 'completed') {
-      await this._writeMessageResultEvidenceBestEffort({
-        status: 'completed',
-        signalId,
-        runId: outcome.runId,
-        result: outcome.result,
-      });
-    } else if (options?.strict === true) {
-      // Strict callers (discard completion) must not clear their recovery
-      // marker over a lost write, so a failure here propagates.
-      await this._writeMessageResultEvidence({
-        status: 'failed',
-        signalId,
-        ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-        error: outcome.error,
-      });
-    } else {
-      await this._writeMessageResultEvidenceBestEffort({
-        status: 'failed',
-        signalId,
-        ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-        error: outcome.error,
-      });
-    }
-    if (outcome.status === 'completed') {
-      this._emit({ type: 'signal_completed', runId: outcome.runId, signalId, result: outcome.result });
-      return;
-    }
-    this._emit({
-      type: 'signal_failed',
-      signalId,
-      ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
-      error: outcome.error,
-    });
-    return undefined;
+    return settleSignalResult(this._signalsPort(), signalId, outcome, admission, options);
   }
 
   /** Resolve every local handle from the terminal evidence that won durable CAS. */
-  private async _adoptSignalSettlement(
+  private _adoptSignalSettlement(
     signalId: string,
     evidence: AgentSignalResultEvidence | undefined,
     local: { status: 'completed'; result: AgentResult } | { status: 'failed'; error: unknown },
     abortSignal?: AbortSignal,
   ): Promise<AgentResult> {
-    if (evidence === undefined) {
-      if (local.status === 'completed') return local.result;
-      throw local.error;
-    }
-    if (evidence.status === 'completed') return this._completedEvidenceResult(evidence);
-    if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
-    return this._awaitDurableSignalResult({ signalId }, abortSignal, { waitIndefinitely: true });
-  }
-
-  /**
-   * A duplicate of a turn whose session was deleted (PF-5309): its result is
-   * erased, but its committed terminal receipt is still durable. Replay that
-   * receipt to the caller's terminal observers, then fail with the typed
-   * erased error, so no observer is left waiting and no caller sees an empty
-   * success.
-   */
-  private async _rejectErasedDuplicate(
-    evidence: AgentSignalResultEvidence & { status: 'completed' },
-    opts: MessageOptions,
-    activeDeleted?: Promise<never>,
-  ): Promise<never> {
-    await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted, { includeCompleted: true });
-    throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+    return adoptSignalSettlement(this._signalsPort(), signalId, evidence, local, abortSignal);
   }
 
   /**
@@ -11957,8 +9281,7 @@ export class Session {
    * it fails with a typed error instead of resolving as an empty success.
    */
   private _completedEvidenceResult(evidence: { signalId: string; result: unknown; erased?: true }): AgentResult {
-    if (evidence.erased === true) throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
-    return evidence.result as AgentResult;
+    return completedEvidenceResult(this._admissionReservationPort(), evidence);
   }
 
   private _computeMessageAdmissionHashes(
@@ -11966,86 +9289,7 @@ export class Session {
     stable: { modeId: string; modelId: string },
     persistedRequestContext?: PersistedRequestContextInput,
   ): MessageAdmissionHashes {
-    const primary = sha256CanonicalJson(
-      this._messageAdmissionHashInput(opts, undefined, { hashVersion: 2 }, persistedRequestContext),
-    );
-    // Pre-v2 evidence hashed the effective mode/model. Keep compatibility
-    // candidates for the current effective tuple only; old evidence does not
-    // persist enough metadata to safely infer previous defaults after drift.
-    const legacyCompatible = [
-      sha256CanonicalJson(this._messageAdmissionHashInput(opts, stable, undefined, persistedRequestContext)),
-      sha256CanonicalJson(
-        this._messageAdmissionHashInput(opts, stable, { includeAttachmentMetadata: false }, persistedRequestContext),
-      ),
-    ];
-    return {
-      primary,
-      legacyCompatible: [...new Set(legacyCompatible)].filter(hash => hash !== primary),
-    };
-  }
-
-  private _messageAdmissionHashInput(
-    opts: MessageOptions,
-    stable?: { modeId: string; modelId: string },
-    options?: { hashVersion?: number; includeAttachmentMetadata?: boolean },
-    persistedRequestContext?: PersistedRequestContextInput,
-  ) {
-    return {
-      // Operation-kind discriminator in the admission hash (signal vs queue);
-      // §5.1d token is `'signal'`. Distinct from the queue path's `kind: 'queue'`.
-      kind: 'signal',
-      ...(options?.hashVersion !== undefined ? { hashVersion: options.hashVersion } : {}),
-      content: opts.content,
-      ...(stable !== undefined
-        ? { mode: stable.modeId, model: stable.modelId }
-        : {
-            ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-            ...(opts.model !== undefined ? { model: opts.model } : {}),
-          }),
-      ...(opts.modelSettings !== undefined ? { modelSettings: opts.modelSettings } : {}),
-      ...(opts.logicalMessageIdentity !== undefined
-        ? { logicalMessageIdentity: { ...opts.logicalMessageIdentity } }
-        : {}),
-      ...(opts.executionAuthorityGrant !== undefined
-        ? { executionAuthorityGrant: { ...opts.executionAuthorityGrant } }
-        : {}),
-      ...(opts.terminalAdmissionSeed !== undefined
-        ? { terminalAdmissionSeed: structuredClone(opts.terminalAdmissionSeed) }
-        : {}),
-      attachments: (opts.attachments ?? []).map(attachment => ({
-        attachmentId: attachment.attachmentId,
-        resourceId: attachment.resourceId,
-        ...(attachment.ownerSessionId !== undefined ? { ownerSessionId: attachment.ownerSessionId } : {}),
-        ...(attachment.bytes !== undefined ? { bytes: attachment.bytes } : {}),
-        ...(attachment.sha256 !== undefined ? { sha256: attachment.sha256 } : {}),
-        ...(attachment.source !== undefined ? { source: attachment.source } : {}),
-        ...(options?.includeAttachmentMetadata !== false
-          ? {
-              ...(attachment.kind !== undefined ? { kind: attachment.kind } : {}),
-              ...(attachment.name !== undefined ? { name: attachment.name } : {}),
-              ...(attachment.mimeType !== undefined ? { mimeType: attachment.mimeType } : {}),
-              ...(attachment.primitiveType !== undefined ? { primitiveType: attachment.primitiveType } : {}),
-              ...(attachment.elementType !== undefined ? { elementType: attachment.elementType } : {}),
-              ...(attachment.renderer !== undefined ? { renderer: attachment.renderer } : {}),
-              ...(attachment.schemaId !== undefined ? { schemaId: attachment.schemaId } : {}),
-              ...(attachment.metadata !== undefined ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
-              ...(attachment.object !== undefined ? { object: attachment.object } : {}),
-            }
-          : {}),
-      })),
-      // §4.4c / §5.1: caller request context is part of admission identity when
-      // present. Absent => omitted => the hash is byte-identical to pre-feature
-      // evidence (backward-compatible). Mirrors the queue path's requestContext.
-      ...(persistedRequestContext ? { requestContext: clonePersistedRequestContext(persistedRequestContext) } : {}),
-      ...(opts.observationalMemorySourceWriteGuard
-        ? {
-            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
-              opts.observationalMemorySourceWriteGuard,
-              'message().observationalMemorySourceWriteGuard',
-            ),
-          }
-        : {}),
-    };
+    return computeMessageAdmissionHashes(this._admissionReservationPort(), opts, stable, persistedRequestContext);
   }
 
   private _computeSignalAdmissionHash(
@@ -12056,45 +9300,7 @@ export class Session {
     attachments: PersistedAttachment[],
     requestContext?: PersistedRequestContextInput,
   ): string {
-    return sha256CanonicalJson({
-      kind: 'signal',
-      content: opts.content,
-      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-      ...(opts.logicalMessageIdentity !== undefined
-        ? { logicalMessageIdentity: { ...opts.logicalMessageIdentity } }
-        : {}),
-      attachments: attachments.map(attachment => ({
-        kind: attachment.kind,
-        name: attachment.name,
-        mimeType: attachment.mimeType,
-        ...(attachment.kind === 'ref'
-          ? {
-              attachmentId: attachment.attachmentId,
-              resourceId: this.resourceId,
-              ownerSessionId: attachment.ownerSessionId,
-              bytes: attachment.bytes,
-              sha256: attachment.sha256,
-              source: attachment.source,
-              attachmentKind: attachment.attachmentKind ?? 'file',
-              ...(attachment.primitiveType ? { primitiveType: attachment.primitiveType } : {}),
-              ...(attachment.elementType ? { elementType: attachment.elementType } : {}),
-              ...(attachment.renderer ? { renderer: attachment.renderer } : {}),
-              ...(attachment.schemaId ? { schemaId: attachment.schemaId } : {}),
-              ...(attachment.metadata ? { metadata: cloneAttachmentMetadata(attachment.metadata) } : {}),
-              ...(attachment.object ? { object: attachment.object } : {}),
-            }
-          : { url: attachment.url }),
-      })),
-      ...(requestContext ? { requestContext: clonePersistedRequestContext(requestContext) } : {}),
-      ...(opts.observationalMemorySourceWriteGuard
-        ? {
-            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
-              opts.observationalMemorySourceWriteGuard,
-              'signal().observationalMemorySourceWriteGuard',
-            ),
-          }
-        : {}),
-    });
+    return computeSignalAdmissionHash(this._signalsPort(), opts, attachments, requestContext);
   }
 
   private _signalAdmissionCanRedispatch(
@@ -12111,64 +9317,22 @@ export class Session {
     evidence: AgentSignalResultEvidence,
     identity: SignalAdmissionIdentity,
   ): AgentSignalDispatchState {
-    if (evidence.dispatch !== undefined) return evidence.dispatch;
-    if (evidence.runId !== undefined) {
-      // Rows written before durable dispatch fencing already treated a persisted
-      // run id as accepted. Preserve that recovery meaning without allowing new
-      // unfenced writes to take this compatibility path.
-      return {
-        state: 'accepted',
-        attemptId: 'legacy',
-        delivery: evidence.runId === identity.idleRunId ? 'idle' : 'active',
-        runId: evidence.runId,
-        acceptedAt: evidence.updatedAt,
-      };
-    }
-    return { state: 'reserved' };
+    return signalDispatchState(this._signalsPort(), evidence, identity);
   }
 
-  private async _compareAndSwapSignalDispatch(
+  private _compareAndSwapSignalDispatch(
     admission: SignalAdmission,
     expected: AgentSignalDispatchState,
     next: AgentSignalDispatchState,
   ): Promise<{ applied: boolean; evidence: AgentSignalResultEvidence }> {
-    const result = await this._storage
-      .compareAndSwapSignalDispatch({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: admission.identity.signalId,
-        admissionId: admission.admissionId,
-        admissionHash: admission.admissionHash,
-        expected,
-        next,
-        updatedAt: Date.now(),
-      })
-      .catch((err: unknown) => {
-        throw this._sessionDeletedError(err);
-      });
-    admission.dispatch = this._signalDispatchState(result.evidence, admission.identity);
-    return result;
+    return compareAndSwapSignalDispatch(this._signalsPort(), admission, expected, next);
   }
 
-  private async _loadSignalAdmissionEvidence(admission: SignalAdmission): Promise<AgentSignalResultEvidence> {
-    const loaded = await this._storage.loadMessageResultEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: admission.identity.signalId,
-    });
-    if (!loaded || !('status' in loaded)) {
-      throw new HarnessValidationError('signal().admissionId', 'signal admission evidence has expired');
-    }
-    const evidence = loaded as AgentSignalResultEvidence;
-    admission.dispatch = this._signalDispatchState(evidence, admission.identity);
-    return evidence;
+  private _loadSignalAdmissionEvidence(admission: SignalAdmission): Promise<AgentSignalResultEvidence> {
+    return loadSignalAdmissionEvidence(this._signalsPort(), admission);
   }
 
-  private async _claimSignalDispatch(
+  private _claimSignalDispatch(
     admission: SignalAdmission,
     planned: { delivery: 'idle' | 'active'; runId: string },
     canAttachRun: (runId: string) => boolean,
@@ -12179,62 +9343,7 @@ export class Session {
     | { kind: 'duplicate'; evidence: AgentSignalResultEvidence }
     | { kind: 'active-lost'; dispatch: SignalDispatchingState }
   > {
-    let evidence = await this._loadSignalAdmissionEvidence(admission);
-    while (true) {
-      throwIfAborted(abortSignal, 'signal().admissionId');
-      if (evidence.status !== 'pending') return { kind: 'duplicate', evidence };
-      const dispatch = this._signalDispatchState(evidence, admission.identity);
-      if (dispatch.state === 'accepted') {
-        if (canAttachRun(dispatch.runId)) return { kind: 'duplicate', evidence };
-        const recoverAt = dispatch.acceptedAt + SIGNAL_ACCEPTED_RECOVERY_STALE_MS;
-        if (Date.now() < recoverAt) {
-          await delay(Math.min(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, recoverAt - Date.now()), abortSignal);
-          evidence = await this._loadSignalAdmissionEvidence(admission);
-          continue;
-        }
-        const reclaimed: SignalDispatchingState = {
-          state: 'dispatching',
-          attemptId: `signal-dispatch-${randomUUID()}`,
-          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
-          delivery: dispatch.delivery,
-          runId: dispatch.runId,
-        };
-        const swapped = await this._compareAndSwapSignalDispatch(admission, dispatch, reclaimed);
-        if (swapped.evidence.status !== 'pending') return { kind: 'duplicate', evidence: swapped.evidence };
-        if (!swapped.applied) {
-          evidence = swapped.evidence;
-          continue;
-        }
-        return dispatch.delivery === 'active'
-          ? { kind: 'active-lost', dispatch: reclaimed }
-          : { kind: 'owned', dispatch: reclaimed, recoveringAccepted: true };
-      }
-      if (dispatch.state === 'dispatching' && dispatch.claimExpiresAt > Date.now()) {
-        await delay(
-          Math.min(MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, dispatch.claimExpiresAt - Date.now()),
-          abortSignal,
-        );
-        evidence = await this._loadSignalAdmissionEvidence(admission);
-        continue;
-      }
-      const next: SignalDispatchingState = {
-        state: 'dispatching',
-        attemptId: `signal-dispatch-${randomUUID()}`,
-        claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
-        delivery: dispatch.state === 'dispatching' ? dispatch.delivery : planned.delivery,
-        runId: dispatch.state === 'dispatching' ? dispatch.runId : planned.runId,
-      };
-      const swapped = await this._compareAndSwapSignalDispatch(admission, dispatch, next);
-      if (swapped.evidence.status !== 'pending') return { kind: 'duplicate', evidence: swapped.evidence };
-      if (!swapped.applied) {
-        evidence = swapped.evidence;
-        continue;
-      }
-      if (dispatch.state === 'dispatching' && next.delivery === 'active' && !isRunActive(next.runId)) {
-        return { kind: 'active-lost', dispatch: next };
-      }
-      return { kind: 'owned', dispatch: next, recoveringAccepted: false };
-    }
+    return claimSignalDispatch(this._signalsPort(), admission, planned, canAttachRun, isRunActive, abortSignal);
   }
 
   private _startSignalDispatchClaimHeartbeat(
@@ -12243,63 +9352,14 @@ export class Session {
   ): {
     stop: () => Promise<SignalDispatchingState>;
   } {
-    let current = initial;
-    let failure: unknown;
-    let tail = Promise.resolve();
-    const interval = setInterval(() => {
-      tail = tail.then(async () => {
-        if (failure !== undefined) return;
-        const renewed: SignalDispatchingState = {
-          ...current,
-          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
-        };
-        try {
-          const swapped = await this._compareAndSwapSignalDispatch(admission, current, renewed);
-          if (!swapped.applied) {
-            failure = new HarnessConfigError('signal()', 'durable signal dispatch claim was lost');
-            return;
-          }
-          current = renewed;
-        } catch (error) {
-          failure = error;
-        }
-      });
-    }, SIGNAL_DISPATCH_CLAIM_RENEW_MS);
-    interval.unref?.();
-    return {
-      stop: async () => {
-        clearInterval(interval);
-        await tail;
-        if (failure !== undefined) throw failure;
-        return current;
-      },
-    };
+    return startSignalDispatchClaimHeartbeat(this._signalsPort(), admission, initial);
   }
 
-  private async _acceptSignalDispatch(
+  private _acceptSignalDispatch(
     admission: SignalAdmission,
     dispatching: SignalDispatchingState,
   ): Promise<AgentSignalResultEvidence> {
-    const accepted: SignalAcceptedDispatchState = {
-      state: 'accepted',
-      attemptId: dispatching.attemptId,
-      delivery: dispatching.delivery,
-      runId: dispatching.runId,
-      acceptedAt: Date.now(),
-    };
-    const swapped = await this._compareAndSwapSignalDispatch(admission, dispatching, accepted);
-    if (!swapped.applied) {
-      const current = this._signalDispatchState(swapped.evidence, admission.identity);
-      if (
-        current.state !== 'accepted' ||
-        current.attemptId !== accepted.attemptId ||
-        current.delivery !== accepted.delivery ||
-        current.runId !== accepted.runId
-      ) {
-        throw new HarnessConfigError('signal()', 'durable signal acceptance lost its dispatch claim');
-      }
-    }
-    return swapped.evidence;
+    return acceptSignalDispatch(this._signalsPort(), admission, dispatching);
   }
 
   private _awaitSignalNativeAcceptance<T>(
@@ -12308,281 +9368,23 @@ export class Session {
     interrupted?: Promise<never>,
     validationPath = 'signal().admissionId',
   ): Promise<T> {
-    throwIfAborted(abortSignal, validationPath);
-    return new Promise<T>((resolve, reject) => {
-      let settled = false;
-      const finish = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        abortSignal?.removeEventListener('abort', onAbort);
-        callback();
-      };
-      const onAbort = () =>
-        finish(() => reject(abortSignal?.reason ?? new HarnessValidationError('signal()', 'operation aborted')));
-      const timer = setTimeout(() => {
-        finish(() => reject(new NativeSignalAcceptanceTimeoutError(validationPath)));
-      }, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS);
-      timer.unref?.();
-      abortSignal?.addEventListener('abort', onAbort, { once: true });
-      accepted.then(
-        value => finish(() => resolve(value)),
-        error => finish(() => reject(error)),
-      );
-      interrupted?.then(
-        value => finish(() => resolve(value)),
-        error => finish(() => reject(error)),
-      );
-    });
+    return awaitSignalNativeAcceptance(this._signalsPort(), accepted, abortSignal, interrupted, validationPath);
   }
 
-  private _signalFromAdmissionEvidence(
-    evidence: AgentSignalResultEvidence,
-    opts: SessionSignalOptions,
-  ): CreatedAgentSignal {
-    const createdAt = Number.isFinite(evidence.createdAt) ? new Date(evidence.createdAt) : new Date();
-    return createSignal({
-      id: evidence.signalId,
-      type: 'user-message',
-      contents: opts.content,
-      ...(opts.logicalMessageIdentity ? { metadata: { logicalMessageId: opts.logicalMessageIdentity.input } } : {}),
-      createdAt,
-      acceptedAt: createdAt,
-    });
-  }
-
-  private async _awaitDurableSignalResult(
+  private _awaitDurableSignalResult(
     evidence: Pick<AgentSignalResultEvidence, 'signalId'>,
     abortSignal?: AbortSignal,
     options: { waitIndefinitely?: boolean } = {},
   ): Promise<AgentResult> {
-    const deadline = options.waitIndefinitely ? undefined : Date.now() + MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS;
-    let extendedWaitMs = MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS;
-    while (true) {
-      throwIfAborted(abortSignal, 'signal().admissionId');
-      const latest = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
-      if (!latest || !('status' in latest)) {
-        throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
-      }
-      if (latest.status === 'completed') return this._completedEvidenceResult(latest);
-      if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
-      if (deadline !== undefined && Date.now() >= deadline) {
-        throw new HarnessValidationError('signal().admissionId', 'pending signal admission is not live');
-      }
-      await delay(options.waitIndefinitely ? extendedWaitMs : MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS, abortSignal);
-      if (options.waitIndefinitely) {
-        extendedWaitMs = Math.min(extendedWaitMs * 2, MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS);
-      }
-    }
+    return awaitDurableSignalResult(this._signalsPort(), evidence, abortSignal, options);
   }
 
-  private async _returnDuplicateSignalResult(
+  private _returnDuplicateSignalResult(
     evidence: AgentSignalResultEvidence | OperationAdmissionTombstone,
     opts: SessionSignalOptions,
     identity: SignalAdmissionIdentity,
   ): Promise<SessionSignalResult> {
-    if (!('status' in evidence)) {
-      throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
-    }
-    if (evidence.status === 'pending' && this._signalDispatchState(evidence, identity).state !== 'accepted') {
-      throw new HarnessValidationError(
-        'signal().admissionId',
-        'pending signal admission has not crossed durable native acceptance',
-      );
-    }
-    if (evidence.runId === undefined) {
-      if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
-      throw new HarnessValidationError('signal().admissionId', 'pending signal admission was not dispatched');
-    }
-
-    let result: Promise<AgentResult>;
-    if (evidence.status === 'completed') {
-      result = Promise.resolve().then(() => this._completedEvidenceResult(evidence));
-    } else if (evidence.status === 'failed') {
-      result = Promise.reject(publicErrorProjectionToError(evidence.error));
-    } else {
-      const duplicateModeId = evidence.modeId ?? opts.mode ?? this._record.modeId;
-      const agent = this._harness.getAgentForMode(duplicateModeId);
-      const subscription = await this._ensureThreadSubscription(agent);
-      const cached = this._completedRuns.get(evidence.runId);
-      if (cached) {
-        const admission =
-          evidence.admissionId !== undefined && evidence.admissionHash !== undefined
-            ? {
-                admissionId: evidence.admissionId,
-                admissionHash: evidence.admissionHash,
-                modeId: duplicateModeId,
-                modelId: evidence.modelId ?? this._record.modelId,
-                dispatch: this._signalDispatchState(evidence, identity),
-              }
-            : undefined;
-        if (cached.ok) {
-          result =
-            cached.full.finishReason === 'suspended'
-              ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
-              : (async () => {
-                  await this._stageCompletedTerminalOutput(evidence.runId!, cached.full, {
-                    tolerateUnknownRun: true,
-                  });
-                  const settled = await this._settleSignalResult(
-                    evidence.signalId,
-                    {
-                      status: 'completed',
-                      runId: evidence.runId!,
-                      result: cached.full as AgentResult,
-                    },
-                    admission,
-                  );
-                  return this._adoptSignalSettlement(
-                    evidence.signalId,
-                    settled,
-                    { status: 'completed', result: cached.full as AgentResult },
-                    opts.abortSignal,
-                  );
-                })();
-        } else {
-          result = (async () => {
-            if (cached.err instanceof HarnessTerminalFinalizationPendingError) throw cached.err;
-            const settled = await this._settleSignalResult(
-              evidence.signalId,
-              {
-                status: 'failed',
-                runId: evidence.runId,
-                error: projectHarnessPublicError(cached.err),
-              },
-              admission,
-            );
-            return this._adoptSignalSettlement(
-              evidence.signalId,
-              settled,
-              { status: 'failed', error: cached.err },
-              opts.abortSignal,
-            );
-          })();
-        }
-      } else if (this._runCompletionPromises.has(evidence.runId)) {
-        const admission =
-          evidence.admissionId !== undefined && evidence.admissionHash !== undefined
-            ? {
-                admissionId: evidence.admissionId,
-                admissionHash: evidence.admissionHash,
-                modeId: duplicateModeId,
-                modelId: evidence.modelId ?? this._record.modelId,
-                dispatch: this._signalDispatchState(evidence, identity),
-              }
-            : undefined;
-        result = this._awaitRunCompletion(evidence.runId).then(
-          async full => {
-            if (full.finishReason === 'suspended') {
-              return this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true });
-            }
-            const settled = await this._settleSignalResult(
-              evidence.signalId,
-              { status: 'completed', runId: evidence.runId!, result: full as AgentResult },
-              admission,
-            );
-            return this._adoptSignalSettlement(
-              evidence.signalId,
-              settled,
-              { status: 'completed', result: full as AgentResult },
-              opts.abortSignal,
-            );
-          },
-          async err => {
-            if (err instanceof HarnessTerminalFinalizationPendingError) throw err;
-            const settled = await this._settleSignalResult(
-              evidence.signalId,
-              { status: 'failed', runId: evidence.runId, error: projectHarnessPublicError(err) },
-              admission,
-            );
-            return this._adoptSignalSettlement(
-              evidence.signalId,
-              settled,
-              { status: 'failed', error: err },
-              opts.abortSignal,
-            );
-          },
-        );
-      } else if (agent.getRunOutput(evidence.runId) || subscription.activeRunId() === evidence.runId) {
-        // Rehydrated accepted run: this Session has no original continuation to
-        // terminalize the signal evidence. Attach one to the recovered run so a
-        // restart does not leave a durable admitted row pending forever.
-        const admission =
-          evidence.admissionId !== undefined && evidence.admissionHash !== undefined
-            ? {
-                admissionId: evidence.admissionId,
-                admissionHash: evidence.admissionHash,
-                modeId: duplicateModeId,
-                modelId: evidence.modelId ?? this._record.modelId,
-                dispatch: this._signalDispatchState(evidence, identity),
-              }
-            : undefined;
-        result = this._awaitRunCompletion(evidence.runId).then(
-          async full => {
-            if (full.finishReason !== 'suspended') {
-              const settled = await this._settleSignalResult(
-                evidence.signalId,
-                {
-                  status: 'completed',
-                  runId: evidence.runId!,
-                  result: full as AgentResult,
-                },
-                admission,
-              );
-              return this._adoptSignalSettlement(
-                evidence.signalId,
-                settled,
-                { status: 'completed', result: full as AgentResult },
-                opts.abortSignal,
-              );
-            }
-            return this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true });
-          },
-          async err => {
-            if (err instanceof HarnessTerminalFinalizationPendingError) throw err;
-            const settled = await this._settleSignalResult(
-              evidence.signalId,
-              {
-                status: 'failed',
-                runId: evidence.runId,
-                error: projectHarnessPublicError(err),
-              },
-              admission,
-            );
-            return this._adoptSignalSettlement(
-              evidence.signalId,
-              settled,
-              { status: 'failed', error: err },
-              opts.abortSignal,
-            );
-          },
-        );
-      } else {
-        result = this._awaitDurableSignalResult(evidence, opts.abortSignal, {
-          waitIndefinitely: this._record.pendingResume?.originSignalId === evidence.signalId,
-        });
-      }
-    }
-    result = result.catch(err => {
-      throw redactPublicBoundaryRejection(err);
-    });
-    void result.catch(() => {});
-
-    const signal = this._signalFromAdmissionEvidence(evidence, opts);
-    return {
-      id: evidence.signalId,
-      runId: evidence.runId,
-      willInterleave: evidence.runId !== identity.idleRunId,
-      accepted: true,
-      signal,
-      result,
-    };
+    return returnDuplicateSignalResult(this._signalsPort(), evidence, opts, identity);
   }
 
   // -------------------------------------------------------------------------
@@ -12951,7 +9753,7 @@ export class Session {
     const isSignalRunActive = (runId: string) => {
       const pendingResume = this._record.pendingResume;
       return (
-        this._runCompletionPromises.has(runId) ||
+        this._runCompletionWaiters.has(runId) ||
         sub.activeRunId() === runId ||
         (pendingResume !== undefined &&
           pendingResume.originSignalId === signalAdmission?.identity.signalId &&
@@ -12959,7 +9761,7 @@ export class Session {
       );
     };
     const canAttachSignalRun = (runId: string) =>
-      isSignalRunActive(runId) || this._completedRuns.has(runId) || agent.getRunOutput(runId) !== undefined;
+      isSignalRunActive(runId) || this._runOutcomes.has(runId) || agent.getRunOutput(runId) !== undefined;
 
     const returnClaimOutcome = async (
       claim:
@@ -13559,7 +10361,7 @@ export class Session {
           .then(async full => {
             const tokenUsageDelta =
               full.finishReason === 'suspended'
-                ? this._tokenUsageDeltaFromFullOutput(full)
+                ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full)
                 : this._recordTurnCompletion(full, { persist: false });
             await Promise.race([
               this._maybeCaptureSuspend(full, undefined, effectiveModeId, effectiveModelId, {
@@ -13852,7 +10654,7 @@ export class Session {
   // (`agent_start`/`agent_end` are emitted, the judge runs, etc.). When
   // it drains into an active run, the active run's lifecycle absorbs it.
   // -------------------------------------------------------------------------
-  async injectSystemReminder(
+  injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
     /**
@@ -13862,16 +10664,7 @@ export class Session {
      */
     internal?: { requireActiveRun?: boolean; assertAdmitted?: () => void },
   ): Promise<SessionInjectSystemReminderResult> {
-    return this._injectSystemReminder(
-      content,
-      opts,
-      internal === undefined
-        ? undefined
-        : {
-            ...(internal.requireActiveRun !== undefined ? { requireActiveRun: internal.requireActiveRun } : {}),
-            ...(internal.assertAdmitted !== undefined ? { assertAdmitted: internal.assertAdmitted } : {}),
-          },
-    );
+    return injectSystemReminder(this._signalsPort(), content, opts, internal);
   }
 
   /**
@@ -13899,7 +10692,7 @@ export class Session {
    * still being cancelled) never reads as a lost slot: the wake runs without a
    * grant, as a wake outside the allowlist does, and stages no intent.
    */
-  private async _injectSystemReminder(
+  private _injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
     internal?: {
@@ -13920,474 +10713,7 @@ export class Session {
       assertAdmitted?: () => void;
     },
   ): Promise<SessionInjectSystemReminderResult> {
-    const signalId = internal?.signalId;
-    this._assertLive('injectSystemReminder()');
-    this._assertOpenForTurn('injectSystemReminder()');
-    if (typeof content !== 'string' || content.length === 0) {
-      throw new HarnessValidationError('injectSystemReminder()', '`content` must be a non-empty string');
-    }
-    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
-      opts?.observationalMemorySourceWriteGuard,
-      'injectSystemReminder().observationalMemorySourceWriteGuard',
-    );
-    if (sourceWriteGuard) {
-      this._assertSourceWriteGuardScope(sourceWriteGuard, 'injectSystemReminder().observationalMemorySourceWriteGuard');
-    }
-
-    const effectiveModeId = this._record.modeId;
-    const mode = this._harness._getMode(effectiveModeId);
-    const agent = this._harness.getAgentForMode(effectiveModeId);
-
-    const subscriptionWaiter = this._createActiveTurnWaiter();
-    void subscriptionWaiter.promise.catch(() => {});
-    const subscription = this._ensureThreadSubscription(agent);
-    void subscription.catch(() => {});
-    const sub = await Promise.race([subscription, subscriptionWaiter.promise]).finally(() => {
-      subscriptionWaiter.cleanup();
-    });
-    this._assertLive('injectSystemReminder()');
-    this._assertOpenForTurn('injectSystemReminder()');
-    const activeRunId = sub.activeRunId();
-    const willInterleave = activeRunId !== null;
-    // PF-7473: the sender may have lost admission during subscription setup.
-    internal?.assertAdmitted?.();
-    if (!willInterleave && internal?.requireActiveRun === true) {
-      throw new HarnessValidationError('injectSystemReminder()', 'no active run to interleave into');
-    }
-    const idleOnlyEpoch = internal?.admissionEpoch;
-    if (
-      idleOnlyEpoch !== undefined &&
-      (willInterleave || this.isRunning() || !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch))
-    ) {
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-
-    if (!willInterleave) {
-      // Owned-turn path: full turn bookkeeping in a background
-      // continuation. Caller doesn't get a result handle.
-      const turnAbortController = this._beginTurn(undefined, undefined, sourceWriteGuard);
-      const turnAbortSignal = turnAbortController.signal;
-      const activeTurnWaiter = this._createActiveTurnWaiter();
-      void activeTurnWaiter.promise.catch(() => {});
-      // PF-7631: the terminal identity of a settlement wake turn, once admitted.
-      let wakeTerminal: HarnessTerminalIdentity | undefined;
-      // When the admitted wake's durable dispatch claim expires.
-      let wakeClaimExpiresAt = 0;
-      // The wake admission attempt, kept even when a Stop, delete or eviction
-      // wins the race against it, and whether its terminal commit landed.
-      let wakeAdmission: Promise<HarnessTerminalIdentity> | undefined;
-      let wakeSettled = false;
-      // Whether a run may have started under the grant: set once `sendSignal`
-      // returns (a synchronous throw comes before any run reservation), and
-      // cleared again by a `discard` acceptance, which proves nothing ran.
-      let wakeDispatchSent = false;
-      const finishOwnedReminderTurn = () => {
-        if (wakeAdmission !== undefined) {
-          const admission = wakeAdmission;
-          wakeAdmission = undefined;
-          if (wakeSettled) {
-            this._wakeAdmissions.leave(wakeTerminal!.admissionId);
-          } else if (!wakeDispatchSent) {
-            // A Stop, edit, delete or eviction refused the turn before its
-            // dispatch: cancel the admission whenever it lands, as a grant
-            // given up at the re-check is. Tracked, so a close waits for it.
-            void this._trackBackgroundTurnCompletion(
-              admission.then(
-                identity => this._cancelWakeTerminalAdmission(identity),
-                () => undefined,
-              ),
-            );
-          } else {
-            // Release the admission whenever it lands; one that failed has
-            // already cleared its own marker. Tracked, so a close waits for it.
-            void this._trackBackgroundTurnCompletion(
-              admission.then(
-                identity => this._releaseWakeTerminalAdmission(identity.admissionId),
-                () => undefined,
-              ),
-            );
-          }
-        }
-        activeTurnWaiter.cleanup();
-        this._endTurn(turnAbortController);
-      };
-      const assertOwnedReminderTurnNotDeleted = () => {
-        if (this._state === 'deleted') {
-          throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
-        }
-      };
-      let dispatched;
-      try {
-        const toolSurface = this._buildToolSurface(mode, undefined);
-        this._setCurrentTurnReplacementToolSurface(toolSurface);
-        const [requestContext, turnInstructions] = await Promise.race([
-          this._buildTurnContextAndInstructions(
-            {
-              modeId: effectiveModeId,
-              modelId: this._record.modelId,
-              abortSignal: turnAbortSignal,
-            },
-            mode,
-          ),
-          activeTurnWaiter.promise,
-        ]);
-        const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
-          memory: { thread: this.threadId, resource: this.resourceId },
-          abortSignal: turnAbortSignal,
-          requestContext,
-          maxSteps: HARNESS_SESSION_MAX_STEPS,
-          ...this._createEmptySynthesisOptions(),
-          ...this._subagentTracingOptions(),
-          ...toolSurface,
-          ...(turnInstructions ? { instructions: turnInstructions } : {}),
-          ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
-        };
-        assertOwnedReminderTurnNotDeleted();
-        this._assertOpenForTurn('injectSystemReminder()');
-        if (
-          internal?.wakeNoticeId !== undefined &&
-          internal.wakeSettlement !== undefined &&
-          signalId !== undefined &&
-          this._terminalWakeFinalizer !== undefined &&
-          this._currentTurnAbortController === turnAbortController &&
-          sub.activeRunId() === null &&
-          this._wakeGrantAllowed(internal.wakeReminderRow, agent, effectiveModeId)
-        ) {
-          const claimed = this._admitWakeTerminalTurn({
-            wakeNoticeId: internal.wakeNoticeId,
-            signalId,
-            settlement: internal.wakeSettlement,
-            modeId: effectiveModeId,
-            modelId: this._record.modelId,
-          });
-          const admission = claimed.then(({ identity }) => identity);
-          void admission.catch(() => {});
-          wakeAdmission = admission;
-          const admitted = await Promise.race([
-            claimed.then(
-              ({ identity, claimExpiresAt }) => ({ identity, claimExpiresAt }),
-              (error: unknown) => ({ error }),
-            ),
-            activeTurnWaiter.promise,
-          ]);
-          if ('error' in admitted) {
-            wakeAdmission = undefined;
-            // PF-7679: the grant key is per notice, so a reservation left by an
-            // earlier attempt (given up, cancelling, or orphaned by a crash)
-            // refuses this one as busy. That is not a lost slot: the claim, not
-            // the grant, keeps the delivery exactly once, so the wake runs
-            // without a grant. Any other refusal fails the attempt as before.
-            if (internal.claimNotice === undefined || !(admitted.error instanceof HarnessBusyError)) {
-              throw admitted.error;
-            }
-          } else {
-            wakeTerminal = admitted.identity;
-            wakeClaimExpiresAt = admitted.claimExpiresAt;
-          }
-          assertOwnedReminderTurnNotDeleted();
-        }
-        // PF-7679: claim last. Raced, so an abort still releases the turn while
-        // the claim write stalls; the delivery itself awaits that write before
-        // it decides whether to clear its claim.
-        if (internal?.claimNotice !== undefined) {
-          const won = await Promise.race([internal.claimNotice(), activeTurnWaiter.promise]);
-          if (!won) throw new DelegationNoticeWakeNotSentError('claim_lost');
-          assertOwnedReminderTurnNotDeleted();
-          this._assertOpenForTurn('injectSystemReminder()');
-        }
-        // An idle-only wake re-checks in the same tick as its dispatch. A stale
-        // admission epoch refuses it: a Stop (`abortActiveWork`) or an
-        // edit/regenerate (`resetPlanTasks`, which cancels the owned child
-        // sessions) during its awaits (the Stop contract: not stopped or
-        // cancelled since the settlement). PF-7679: if a caller turn began or
-        // started a run during the awaits, the wake never folds into it: it
-        // throws `slot_lost`, and its delivery clears its claim and waits for
-        // that turn to end. PF-7631: the wake grant is kept only while its row
-        // is still proven to be in the dispatching agent's own memory with no
-        // mode change since (`_wakeGrantAllowed`), re-checked here in the same
-        // tick as the dispatch. If that no longer holds, the grant is cancelled
-        // (no run starts under it, no terminal result or intent is committed)
-        // and the wake is sent without it. A kept grant binds the dispatch to
-        // the reserved run.
-        if (idleOnlyEpoch !== undefined) {
-          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
-            if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('stale');
-            throw new HarnessBusyError(this.id, 'in_flight');
-          }
-          if (this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null) {
-            throw new DelegationNoticeWakeNotSentError('slot_lost');
-          }
-        }
-        if (internal?.noticeRowDelivered?.() === true) throw new DelegationNoticeWakeNotSentError('delivered');
-        if (
-          wakeTerminal !== undefined &&
-          (this._currentTurnAbortController !== turnAbortController ||
-            sub.activeRunId() !== null ||
-            !this._wakeGrantAllowed(internal?.wakeReminderRow, agent, effectiveModeId))
-        ) {
-          const givenUp = wakeTerminal;
-          wakeAdmission = undefined;
-          wakeTerminal = undefined;
-          this._cancelWakeTerminalAdmission(givenUp);
-        }
-
-        // Last step before `sendSignal`, as in message(): never dispatch a granted
-        // wake on a dispatch claim or session lease that lapsed during the
-        // awaits above, when another owner may already have recovered it. The
-        // grant is then cancelled or released by the turn's cleanup. A claimed
-        // settlement notice keeps its claim until the delivery clears it (a
-        // lease-fenced write), or the next lease holder takes it over.
-        if (wakeTerminal !== undefined && !this._dispatchClaimStillHeld(wakeClaimExpiresAt)) {
-          this._scheduleOrphanRecheck(Date.now());
-          if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
-          throw new HarnessBusyError(this.id, 'in_flight');
-        }
-        // PF-7679: a claimed settlement wake dispatches only while this owner
-        // still holds the session lease, granted or not: once the lease lapses
-        // the next holder may take the claim over and deliver the notice.
-        if (internal?.claimNotice !== undefined && !this._sessionLeaseHeld()) {
-          throw new DelegationNoticeWakeNotSentError('lease_lost');
-        }
-        const idleOnlyDispatch = wakeTerminal !== undefined || internal?.claimNotice !== undefined;
-        dispatched = agent.sendSignal(
-          {
-            type: 'system-reminder',
-            ...(signalId !== undefined ? { id: signalId } : {}),
-            contents: content,
-            ...(opts?.attributes ? { attributes: opts.attributes } : {}),
-            ...(opts?.metadata ? { metadata: opts.metadata } : {}),
-          },
-          {
-            resourceId: this.resourceId,
-            threadId: this.threadId,
-            // An admitted wake binds its grant to the run this dispatch starts.
-            // Neither it nor a claimed settlement wake (PF-7679) may fold into a
-            // run that appeared meanwhile, here or in another process.
-            ...(wakeTerminal !== undefined ? { runId: wakeTerminal.runId } : {}),
-            ...(idleOnlyDispatch ? { ifActive: { behavior: 'discard' } } : {}),
-            ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
-          },
-        );
-        wakeDispatchSent = true;
-        if (idleOnlyDispatch) {
-          // PF-7679: the wake run, its label and agent_start exist only once the
-          // runtime accepted this dispatch as a wake on the run it returned.
-          const expectedRunId = wakeTerminal?.runId ?? dispatched.runId;
-          // Bounded as message() bounds it. On a timeout the turn is aborted,
-          // so a native stream that did start never runs without an owner; the
-          // admission is then released to dispatch recovery.
-          let accepted: Awaited<typeof dispatched.accepted>;
-          try {
-            accepted = await this._awaitSignalNativeAcceptance(
-              dispatched.accepted,
-              turnAbortSignal,
-              activeTurnWaiter.promise,
-              'injectSystemReminder().wake',
-            );
-          } catch (err) {
-            if (err instanceof NativeSignalAcceptanceTimeoutError) turnAbortController.abort(err);
-            // PF-7679: the dispatch was sent, so a run may have started: a
-            // claimed settlement wake must not read this as not sent.
-            else if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('unconfirmed');
-            throw err;
-          }
-          if (accepted.action !== 'wake' || accepted.runId !== expectedRunId) {
-            // A `discard` (the dispatch binds `ifActive: 'discard'`) proves no
-            // run started: the grant is cancelled like one given up before the
-            // dispatch. Any other outcome is left to dispatch recovery, which
-            // settles it interrupted.
-            if (accepted.action === 'discard') {
-              wakeDispatchSent = false;
-              // PF-7679: a run took the slot; the delivery clears its claim.
-              if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
-            } else {
-              if (wakeTerminal !== undefined) this._scheduleOrphanRecheck(Date.now());
-              // PF-7679: a run may have started; never read as a lost slot.
-              if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('unconfirmed');
-            }
-            throw new HarnessBusyError(this.id, 'in_flight');
-          }
-        }
-      } catch (err) {
-        finishOwnedReminderTurn();
-        throw err;
-      }
-
-      // §10.2 agent_start carries the runId — emit it now the run is dispatched.
-      // dispatched.signal.id is the originating signalId — stamped for the run projection.
-      // A wake reaches here only while it held the idle slot at dispatch, or
-      // as the reserved run its grant bound (verified above: action 'wake' on
-      // the reserved runId), so it keeps the label.
-      this._emitAgentStart(dispatched.runId, dispatched.signal.id, internal?.wakeNoticeId);
-
-      const completion = this._awaitRunCompletion(dispatched.runId);
-      const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
-      let agentEndEmitted = false;
-      const result = this._trackBackgroundTurnCompletion(
-        completionOrDelete
-          .then(async full => {
-            // A wake terminal turn accounts usage under the terminal fences, as
-            // an admitted message turn does, so a recovery commit of its
-            // staged output never counts it twice.
-            const tokenUsageDelta =
-              full.finishReason === 'suspended'
-                ? this._tokenUsageDeltaFromFullOutput(full)
-                : wakeTerminal !== undefined
-                  ? this._recordMessageTurnCompletion(full, { persist: false }).tokenUsageDelta
-                  : this._recordTurnCompletion(full, { persist: false });
-            await Promise.race([
-              this._maybeCaptureSuspend(full, undefined, effectiveModeId, this._record.modelId, {
-                tokenUsageDelta: full.finishReason === 'suspended' ? tokenUsageDelta : undefined,
-              }).catch(err => {
-                this._latchDurableTurnFlushError(err, full);
-                throw err;
-              }),
-              activeTurnWaiter.promise,
-            ]);
-            if (tokenUsageDelta !== undefined && full.finishReason !== 'suspended') {
-              await Promise.race([
-                this._persistTokenUsageOrLatch().catch(err => {
-                  if (!this._isExpectedFlushLifecycleError(err)) this._pendingTokenUsageFlushError ??= err;
-                  throw err;
-                }),
-                activeTurnWaiter.promise,
-              ]);
-            }
-            // PF-7631: commit the wake turn's terminal intent before agent_end,
-            // as a message() terminal turn does. A failed commit leaves the
-            // staged output pending for dispatch recovery.
-            if (wakeTerminal !== undefined) {
-              await this._commitWakeTerminalWithRetry(
-                wakeTerminal,
-                full,
-                { modeId: effectiveModeId, modelId: this._record.modelId },
-                activeTurnWaiter.promise,
-                turnAbortSignal,
-              );
-              wakeSettled = true;
-            }
-            this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
-            agentEndEmitted = true;
-            await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
-          })
-          .catch(async err => {
-            // PF-7631: a wake run whose own output rejected commits a durable
-            // failed terminal; anything else stays pending for recovery.
-            if (wakeTerminal !== undefined && !agentEndEmitted) {
-              if (this._isRejectedTerminalRun(dispatched.runId, err, turnAbortSignal)) {
-                // A wake run has no caller to reject: surface the run's own
-                // failure first. If the commit below never lands, recovery
-                // settles the admission as interrupted, so this event is the
-                // only record of what the run failed with.
-                this._emitTurnEvent({
-                  type: 'error',
-                  runId: dispatched.runId,
-                  signalId: wakeTerminal.signalId,
-                  error: projectHarnessPublicError(err),
-                });
-                // The same bounded re-drive as a completed wake. If it does
-                // not land, the admission is released to dispatch recovery
-                // below (finishOwnedReminderTurn), never left 'finished'.
-                const committed = await this._commitWakeTerminalWithRetry(
-                  wakeTerminal,
-                  new RejectedTerminalRun(err),
-                  { modeId: effectiveModeId, modelId: this._record.modelId },
-                  activeTurnWaiter.promise,
-                  turnAbortSignal,
-                ).then(
-                  () => true,
-                  () => false,
-                );
-                if (committed) wakeSettled = true;
-                else this._scheduleOrphanRecheck(Date.now());
-              } else {
-                this._scheduleOrphanRecheck(Date.now());
-              }
-            }
-            // A wake whose terminal commit did not land leaves agent_end to
-            // its final settlement, as message() does: its failure was already
-            // surfaced as an `error` event, and recovery publishes the outcome.
-            if (!agentEndEmitted && (wakeTerminal === undefined || wakeSettled)) {
-              this._emitTurnEvent({
-                type: 'agent_end',
-                finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
-                runId: dispatched.runId,
-                usage: this._runUsage(),
-              });
-            }
-            throw err;
-          })
-          .finally(() => {
-            finishOwnedReminderTurn();
-            void this._maybeDrainQueue();
-          }),
-      );
-      void result.catch(() => {});
-
-      return {
-        id: dispatched.signal.id,
-        runId: dispatched.runId,
-        willInterleave: false,
-        accepted: true,
-        signal: dispatched.signal,
-      };
-    }
-
-    // Active-delivery path: drain into the live run.
-    this._assertOpenForTurn('injectSystemReminder()');
-    if (
-      sourceWriteGuard !== undefined &&
-      !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, this._currentTurnSourceWriteGuard)
-    ) {
-      throw new HarnessOverrideConflictError(this.id, activeRunId!, ['observationalMemorySourceWriteGuard']);
-    }
-    const dispatched = agent.sendSignal(
-      {
-        type: 'system-reminder',
-        ...(signalId !== undefined ? { id: signalId } : {}),
-        contents: content,
-        ...(opts?.attributes ? { attributes: opts.attributes } : {}),
-        ...(opts?.metadata ? { metadata: opts.metadata } : {}),
-      },
-      {
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        // PF-7473: an interleave-only reminder must never start a run: it
-        // expires with the run it was delivered to, and is discarded when the
-        // run already ended between routing and dispatch.
-        ...(internal?.requireActiveRun === true ? { ifActive: { behavior: 'deliver', expireWithRun: true } } : {}),
-        ifIdle:
-          internal?.requireActiveRun === true
-            ? { behavior: 'discard' }
-            : {
-                behavior: 'wake',
-                // The active-delivery race can still land idle; a wake here starts a
-                // REAL streamed turn, so it must carry the step ceiling and the
-                // silent-turn nudge like every other wake site — empty options ran
-                // the turn at the provider's 5-step default with no memory identity.
-                streamOptions: {
-                  memory: { thread: this.threadId, resource: this.resourceId },
-                  maxSteps: HARNESS_SESSION_MAX_STEPS,
-                  ...this._createEmptySynthesisOptions(),
-                  ...(this._currentTurnSourceWriteGuard
-                    ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-                    : {}),
-                  ...this._subagentTracingOptions(),
-                } as never,
-              },
-      },
-    );
-    if (internal?.requireActiveRun === true && (await dispatched.accepted).action !== 'deliver') {
-      throw new HarnessValidationError('injectSystemReminder()', 'the active run ended before the reminder landed');
-    }
-
-    return {
-      id: dispatched.signal.id,
-      runId: dispatched.runId,
-      willInterleave: true,
-      accepted: true,
-      signal: dispatched.signal,
-    };
+    return sessionInjectSystemReminder(this._signalsPort(), content, opts, internal);
   }
 
   /**
@@ -14404,7 +10730,7 @@ export class Session {
    *
    * No-op when the run did not suspend.
    */
-  private async _maybeCaptureSuspend(
+  private _maybeCaptureSuspend(
     full: FullOutput<unknown>,
     queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
@@ -14415,261 +10741,7 @@ export class Session {
       restoreFence?: { expectedKey?: string };
     } = {},
   ): Promise<void> {
-    if (full.finishReason !== 'suspended') return;
-    this._captureTurnRunId(full);
-    const payload = full.suspendPayload as
-      | { toolCallId: string; toolName: string; args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] }
-      | undefined;
-    if (!payload || !full.runId) {
-      await this._persistTokenUsageDelta(opts.tokenUsageDelta);
-      this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-      return;
-    }
-
-    const pending = this._pendingResumeFromSuspendedOutput(
-      full,
-      payload,
-      queuedItemId,
-      modeId,
-      modelId,
-      opts.originSignalId,
-    );
-    if (pending === undefined) return;
-    const suspendedFenceLease = this._currentAgentRequestContext
-      ? captureSuspendedToolSurfaceFenceLease(this._currentAgentRequestContext, full.runId)
-      : undefined;
-    // For a fenced cached-restore the token delta is evaluated at flush time
-    // against the generation that actually survived the CAS: a skipped write
-    // applies no usage, and an applied write reconciles the cached output's
-    // cumulative counter against the durable per-run baseline still on the
-    // record (the in-memory accounted sets are empty after a reopen).
-    let writeApplied = false;
-    const flushTokenUsageDelta =
-      opts.restoreFence === undefined
-        ? opts.tokenUsageDelta
-        : () => {
-            if (!writeApplied) return undefined;
-            const baseline =
-              this._record.pendingResume !== undefined && this._record.pendingResume.runId === full.runId
-                ? this._record.pendingResume.accountedTokenUsage
-                : undefined;
-            return this._tokenUsageDeltaFromFullOutput(full, baseline);
-          };
-    const existing = this._record.pendingResume;
-    if (existing && existing.runId === full.runId && existing.toolCallId === payload.toolCallId) {
-      if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
-      await this._flushUpdate(
-        prev => {
-          // CAS retries re-run this updater against newer state — the apply
-          // flag must reflect the attempt that actually won, not a failed one.
-          writeApplied = false;
-          const current = prev.pendingResume;
-          if (opts.restoreFence !== undefined) {
-            const currentKey = current === undefined ? undefined : pendingInteractionGenerationKey(current);
-            if (currentKey !== opts.restoreFence.expectedKey) return prev;
-          }
-          // A tool-registered pending (ctx.registerQuestion / registerPlanApproval
-          // / registerSandboxAccess) is written mid-turn without the turn's
-          // origin. Settlement and queue routing read `queuedItemId` /
-          // `originSignalId` off the parked pending, so adopt the captured
-          // origin when the registered pending lacks it.
-          const originToAdopt = {
-            ...(current?.queuedItemId === undefined && pending.queuedItemId !== undefined
-              ? { queuedItemId: pending.queuedItemId }
-              : {}),
-            ...(current?.originSignalId === undefined && pending.originSignalId !== undefined
-              ? { originSignalId: pending.originSignalId }
-              : {}),
-          };
-          if (
-            current === undefined ||
-            current.runId !== full.runId ||
-            current.toolCallId !== payload.toolCallId ||
-            (pending.accountedTokenUsage === undefined &&
-              pending.toolReceipts === undefined &&
-              pending.toolReceiptsOverflow !== true &&
-              pending.subagentBudgetSpent === undefined &&
-              Object.keys(originToAdopt).length === 0)
-          ) {
-            return prev;
-          }
-          writeApplied = true;
-          return {
-            ...prev,
-            pendingResume: {
-              ...current,
-              ...originToAdopt,
-              ...(pending.accountedTokenUsage !== undefined
-                ? { accountedTokenUsage: pending.accountedTokenUsage }
-                : {}),
-              ...(pending.toolReceipts !== undefined ? { toolReceipts: pending.toolReceipts } : {}),
-              ...(pending.toolReceiptsOverflow === true ? { toolReceiptsOverflow: true } : {}),
-              ...(pending.subagentBudgetSpent !== undefined
-                ? { subagentBudgetSpent: pending.subagentBudgetSpent }
-                : {}),
-            },
-          };
-        },
-        { tokenUsageDelta: flushTokenUsageDelta },
-      );
-      if (this._currentAgentRequestContext && suspendedFenceLease) {
-        clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
-      }
-      this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-      return;
-    }
-    // A cached-suspension restore (restoreFence) reads `pendingResume` before
-    // awaiting a durable probe; a resume can clear and re-park a NEWER
-    // generation — or clear it entirely on commit — in that gap. Re-check the
-    // pre-probe generation key inside the CAS updater so the stale restore
-    // cannot resurrect a cleared interaction or overwrite the newer pending:
-    // the durable park is authoritative.
-    let restored = true;
-    await this._flushUpdate(
-      prev => {
-        restored = true;
-        writeApplied = false;
-        if (opts.restoreFence !== undefined) {
-          const current = prev.pendingResume;
-          const currentKey = current === undefined ? undefined : pendingInteractionGenerationKey(current);
-          if (currentKey !== opts.restoreFence.expectedKey) {
-            restored = false;
-            return prev;
-          }
-        }
-        writeApplied = true;
-        return { ...prev, pendingResume: pending };
-      },
-      { tokenUsageDelta: flushTokenUsageDelta },
-    );
-    if (this._currentAgentRequestContext && suspendedFenceLease) {
-      clearSuspendedToolSurfaceFence(this._currentAgentRequestContext, full.runId, suspendedFenceLease);
-    }
-    // Announce the suspension only when the durable write actually landed this
-    // pending — a fenced-out restore or a size-budget drop must not surface a
-    // pending event for an interaction storage never recorded.
-    if (!restored || this._record.pendingResume !== pending) return;
-    this._clearPendingDurableTurnFlushErrorIfRepaired(full);
-
-    // Emit the §10.2 pending event AFTER the durable-parking barrier (§5.4) so
-    // any subscriber observing it can reconstruct the pending state from storage.
-    this._emitPendingEvent(pending);
-  }
-
-  private _pendingResumeFromSuspendedOutput(
-    full: FullOutput<unknown>,
-    payload: {
-      toolCallId: string;
-      toolName: string;
-      args?: unknown;
-      suspendPayload?: unknown;
-      approvalReasons?: string[];
-    },
-    queuedItemId = this._queueHead.currentId,
-    modeId = this._record.modeId,
-    modelId = this._modelIdForQueuedItem(queuedItemId),
-    originSignalId?: string,
-  ): PendingResume | undefined {
-    if (!full.runId) return undefined;
-    const kind = this._classifyResumeKind(payload);
-    const accountedTokenUsage = this._tokenUsageDeltaFromFullOutput(full);
-    const toolReceiptProjection = this._pendingRunToolReceiptProjection(full.runId);
-    const pending: PendingResume = {
-      kind,
-      itemId: `${kind}:${payload.toolCallId}`,
-      runId: full.runId,
-      toolCallId: payload.toolCallId,
-      toolName: payload.toolName,
-      ...this._pendingResumeSourceFields(),
-      ...this._newPendingInteractionTiming(kind),
-      ...(queuedItemId !== undefined ? { queuedItemId } : {}),
-      ...(originSignalId !== undefined ? { originSignalId } : {}),
-      modeId,
-      // §4.2e — carry the active turn's yolo so the resumed run keeps auto-granting.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(modeId, modelId),
-      // §5.1 — persist the suspended turn's caller app bag so a resume rebuilds the
-      // SAME context (a re-suspend re-captures it because resume re-stashes it).
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(full.runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
-        : {}),
-      ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
-      ...toolReceiptProjection,
-      ...this._subagentBudgetSpentProjection(),
-      payload: this._buildResumePayload(kind, payload),
-    };
-
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(full.runId);
-
-    if (kind === 'plan-approval') {
-      const mode = this._harness._getMode(modeId);
-      if (mode.transitionsTo) pending.transitionModeId = mode.transitionsTo;
-    }
-    return pending;
-  }
-
-  /** Correlate child-side pending interactions with their parent invocation. */
-  private _pendingResumeSourceFields(): Pick<PendingResume, 'source' | 'subagentToolCallId'> {
-    if (this.subagentDepth <= 0) return { source: 'parent' };
-    return {
-      source: 'subagent',
-      ...(this._subagentParentToolCallId !== undefined ? { subagentToolCallId: this._subagentParentToolCallId } : {}),
-    };
-  }
-
-  private _classifyResumeKind(payload: { toolName: string; suspendPayload?: unknown }): PendingResume['kind'] {
-    if (payload.toolName === ASK_USER_TOOL_NAME) return 'question';
-    if (payload.toolName === SUBMIT_PLAN_TOOL_NAME) return 'plan-approval';
-    if ('suspendPayload' in payload && payload.suspendPayload !== undefined) return 'tool-suspension';
-    return 'tool-approval';
-  }
-
-  private _buildResumePayload(
-    kind: PendingResume['kind'],
-    payload: { args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] },
-  ): PendingResume['payload'] {
-    // The payload is persisted and published as JSON: an argument the model
-    // omitted (an optional `selectionMode`, `options`, `title`, a tool with no
-    // args, a suspension without data) is left out rather than stored as an
-    // explicit `undefined`, which strict JSON consumers read as a non-JSON
-    // payload. Absent stays absent; present values are unchanged.
-    switch (kind) {
-      case 'tool-approval':
-        return {
-          ...(payload.args !== undefined ? { input: payload.args } : {}),
-          ...(payload.approvalReasons !== undefined ? { approvalReasons: payload.approvalReasons } : {}),
-        };
-      case 'tool-suspension':
-        return {
-          ...(payload.args !== undefined ? { input: payload.args } : {}),
-          ...(payload.suspendPayload !== undefined ? { suspendData: payload.suspendPayload } : {}),
-        };
-      case 'question': {
-        const args = (payload.args ?? {}) as {
-          question?: string;
-          options?: { label: string; description?: string }[];
-          selectionMode?: 'single_select' | 'multi_select';
-        };
-        return {
-          ...(args.question !== undefined ? { question: args.question } : {}),
-          ...(args.options !== undefined ? { options: args.options } : {}),
-          ...(args.selectionMode !== undefined ? { selectionMode: args.selectionMode } : {}),
-        };
-      }
-      case 'plan-approval': {
-        const args = (payload.args ?? {}) as { title?: string; plan?: string };
-        return {
-          ...(args.title !== undefined ? { title: args.title } : {}),
-          ...(args.plan !== undefined ? { plan: args.plan } : {}),
-        };
-      }
-    }
+    return maybeCaptureSuspend(this._pendingInteractionsPort(), full, queuedItemId, modeId, modelId, opts);
   }
 
   // -------------------------------------------------------------------------
@@ -15460,28 +11532,8 @@ export class Session {
   async respondToToolApproval(
     opts: ToolApprovalDecision & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToToolApproval(
-    opts: ToolApprovalDecision & InboxResponseOptions,
-  ): Promise<AgentResult | InboxResponseResult> {
-    const approvalDecision =
-      opts.editedArgs !== undefined
-        ? parseToolApprovalDecision({ approved: opts.approved, editedArgs: opts.editedArgs })
-        : undefined;
-    if (opts.editedArgs !== undefined && !approvalDecision) {
-      throw new HarnessValidationError(
-        'respond[tool-approval].editedArgs',
-        'editedArgs requires an approved decision and a JSON object',
-      );
-    }
-    return this._resume(
-      'tool-approval',
-      compactJsonObject({
-        approved: opts.approved,
-        reason: opts.reason,
-        editedArgs: approvalDecision?.editedArgs,
-      }),
-      opts,
-    );
+  respondToToolApproval(opts: ToolApprovalDecision & InboxResponseOptions): Promise<AgentResult | InboxResponseResult> {
+    return respondToToolApproval(this._pendingInteractionsPort(), opts);
   }
 
   /** Resume a pending tool-suspension. `resumeData` is forwarded to the tool. */
@@ -15492,20 +11544,18 @@ export class Session {
   async respondToToolSuspension(
     opts: { resumeData: unknown } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToToolSuspension(
+  respondToToolSuspension(
     opts: { resumeData: unknown } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume('tool-suspension', opts.resumeData, opts);
+    return respondToToolSuspension(this._pendingInteractionsPort(), opts);
   }
 
   /** Resume a pending `ask_user` question. */
   async respondToQuestion(opts: { answer: unknown } & InboxReceiptResponseOptions): Promise<InboxResponseResult>;
   async respondToQuestion(opts: { answer: unknown } & LegacyInboxResponseOptions): Promise<AgentResult>;
   async respondToQuestion(opts: { answer: unknown } & InboxResponseOptions): Promise<AgentResult | InboxResponseResult>;
-  async respondToQuestion(
-    opts: { answer: unknown } & InboxResponseOptions,
-  ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume('question', { answer: opts.answer }, opts);
+  respondToQuestion(opts: { answer: unknown } & InboxResponseOptions): Promise<AgentResult | InboxResponseResult> {
+    return respondToQuestion(this._pendingInteractionsPort(), opts);
   }
 
   async respondToSandboxAccess(
@@ -15517,17 +11567,10 @@ export class Session {
   async respondToSandboxAccess(
     opts: { approved: boolean; reason?: string } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToSandboxAccess(
+  respondToSandboxAccess(
     opts: { approved: boolean; reason?: string } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    return this._resume(
-      'sandbox-access',
-      compactJsonObject({
-        approved: opts.approved,
-        reason: opts.reason,
-      }),
-      opts,
-    );
+    return respondToSandboxAccess(this._pendingInteractionsPort(), opts);
   }
 
   /**
@@ -15564,27 +11607,14 @@ export class Session {
       transitionToMode?: string;
     } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult>;
-  async respondToPlanApproval(
+  respondToPlanApproval(
     opts: {
       approved: boolean;
       revision?: string;
       transitionToMode?: string;
     } & InboxResponseOptions,
   ): Promise<AgentResult | InboxResponseResult> {
-    if (opts.transitionToMode !== undefined) {
-      // Validate eagerly so callers see a clean error rather than a CAS-time
-      // throw from inside the resume flow.
-      this._harness._getMode(opts.transitionToMode);
-    }
-    return this._resume(
-      'plan-approval',
-      compactJsonObject({
-        approved: opts.approved,
-        revision: opts.revision,
-        transitionToMode: opts.transitionToMode,
-      }),
-      opts,
-    );
+    return respondToPlanApproval(this._pendingInteractionsPort(), opts);
   }
 
   /**
@@ -15611,400 +11641,12 @@ export class Session {
    * `responseId` already used for a different response rejects with
    * `HarnessInboxResponseConflictError`.
    */
-  async discardPendingInteraction(opts: DiscardPendingInteractionOptions): Promise<DiscardPendingInteractionResult> {
-    this._assertLive('discardPendingInteraction()');
-    const input = parseDiscardPendingInteractionOptions(opts);
-    const responseHash = sha256CanonicalJson({
-      operation: 'discard',
-      kind: input.kind,
-      itemId: input.itemId,
-      runId: input.runId,
-      toolCallId: input.toolCallId,
-      pendingRequestedAt: input.pendingRequestedAt,
-      reason: input.reason,
-    });
-    try {
-      // One retry: a lost CAS re-classifies against the reloaded record.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const observed = this._classifyPendingInteractionDiscard(input, responseHash);
-        if (observed.status === 'finish') {
-          await this._completeDiscardedPendingInteraction(observed.pending, observed.receipt);
-          return discardReceiptResult('already_resolved', observed.receipt);
-        }
-        if (observed.status !== 'claimable') return observed.result;
-        const claimed = await this._claimPendingInteractionDiscard(input, responseHash, observed.pending);
-        if (claimed !== undefined) {
-          await this._completeDiscardedPendingInteraction(claimed.pending, claimed.receipt);
-          return discardReceiptResult('discarded', claimed.receipt);
-        }
-      }
-      throw new HarnessBusyError(this.id, 'in_flight');
-    } catch (err) {
-      throw this._discardPendingInteractionFailure(err, input.responseId);
-    }
-  }
-
-  private _classifyPendingInteractionDiscard(
-    input: DiscardPendingInteractionOptions,
-    responseHash: string,
-  ):
-    | { status: 'claimable'; pending: PendingResume }
-    | { status: 'finish'; pending: PendingResume; receipt: InboxResponseReceipt }
-    | { status: 'resolved'; result: DiscardPendingInteractionResult } {
-    const generation = discardGeneration(input);
-    const notCurrent = (): { status: 'resolved'; result: DiscardPendingInteractionResult } => ({
-      status: 'resolved',
-      result: { status: 'not_current', itemId: input.itemId, kind: input.kind },
-    });
-    const pending = this._record.pendingResume;
-    const pendingIsGeneration = pending !== undefined && pendingMatchesDiscardGeneration(pending, generation);
-    const ownReceipt = getOwnRecordValue(this._record.inboxResponseReceipts, input.responseId);
-    if (ownReceipt !== undefined) {
-      if (
-        ownReceipt.discardedAt === undefined ||
-        ownReceipt.responseHash !== responseHash ||
-        !receiptMatchesDiscardGeneration(ownReceipt, generation)
-      ) {
-        throw new HarnessInboxResponseConflictError(this.id, input.itemId, input.responseId);
-      }
-      if (pendingIsGeneration && pending!.expiryStartedAt === ownReceipt.discardedAt) {
-        return { status: 'finish', pending: pending!, receipt: ownReceipt };
-      }
-      return { status: 'resolved', result: discardReceiptResult('already_resolved', ownReceipt) };
-    }
-    if (!pendingIsGeneration) {
-      const prior = this._findDiscardReceipt(generation);
-      return prior !== undefined
-        ? { status: 'resolved', result: discardReceiptResult('already_resolved', prior) }
-        : notCurrent();
-    }
-    if (pending!.expiryStartedAt !== undefined) {
-      // Another terminalizer (expiry, Stop, or an earlier discard whose clear
-      // has not committed) already claimed this generation.
-      const claim = this._discardClaimForPending(pending!);
-      return claim !== undefined ? { status: 'finish', pending: pending!, receipt: claim } : notCurrent();
-    }
-    // A resume admitted for this generation, or a still-running tool that
-    // registered it, owns the interaction. Resolving it underneath would need a
-    // turn abort, which this operation never performs.
-    if (
-      pending!.resumedAt !== undefined ||
-      (this._currentTurnAbortController !== undefined &&
-        (pending!.kind === 'question' || pending!.kind === 'plan-approval' || pending!.kind === 'sandbox-access'))
-    ) {
-      throw new HarnessBusyError(this.id, 'in_flight');
-    }
-    return { status: 'claimable', pending: pending! };
-  }
-
-  /**
-   * Phase one: a single session CAS fenced to the exact unresumed, unclaimed
-   * generation stamps the terminalizing claim (`expiryStartedAt`, which resume
-   * admission rejects), writes the discard receipt, and finalizes every
-   * unsettled inbox receipt of that generation as discarded.
-   */
-  private async _claimPendingInteractionDiscard(
-    input: DiscardPendingInteractionOptions,
-    responseHash: string,
-    observed: PendingResume,
-  ): Promise<{ pending: PendingResume; receipt: InboxResponseReceipt } | undefined> {
-    const generation = discardGeneration(input);
-    const discardError = new HarnessPendingInteractionDiscardedError(this.id, input.itemId, input.reason);
-    const projectedError = projectHarnessPublicError(discardError);
-    let claimed: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
-    await this._flushUpdate(
-      prev => {
-        claimed = undefined;
-        const current = prev.pendingResume;
-        if (
-          current === undefined ||
-          !pendingMatchesDiscardGeneration(current, generation) ||
-          current.expiresAt !== observed.expiresAt ||
-          current.resumedAt !== undefined ||
-          current.expiryStartedAt !== undefined ||
-          getOwnRecordValue(prev.inboxResponseReceipts, input.responseId) !== undefined
-        ) {
-          return prev;
-        }
-        // Never below `requestedAt`: the parking host's clock may be ahead of
-        // ours (lease handoff, NTP step), and `expiresAt < requestedAt` is a
-        // corrupt pending row.
-        const discardedAt = Math.max(Date.now(), current.requestedAt);
-        const receipt: InboxResponseReceipt = {
-          responseId: input.responseId,
-          responseHash,
-          resumeAttemptId: input.responseId,
-          itemId: input.itemId,
-          ...(current.queuedItemId !== undefined ? { queuedItemId: current.queuedItemId } : {}),
-          kind: input.kind,
-          runId: input.runId,
-          toolCallId: input.toolCallId,
-          pendingRequestedAt: input.pendingRequestedAt,
-          response: { discarded: true, reason: input.reason },
-          status: 'failed',
-          error: projectedError,
-          retryable: false,
-          acceptedAt: discardedAt,
-          failedAt: discardedAt,
-          discardedAt,
-          ...(prev.cancelRequest !== undefined
-            ? { cancelledPendingResume: cancelledPendingAudit(current, prev.cancelRequest) }
-            : {}),
-          updatedAt: discardedAt,
-        };
-        // Built with data-property semantics only (entries / computed keys),
-        // never `map[id] = ...`, so a caller id such as "__proto__" stays an
-        // own, serializable receipt instead of hitting the prototype setter.
-        const inboxResponseReceipts: Record<string, InboxResponseReceipt> = Object.fromEntries([
-          ...Object.entries(prev.inboxResponseReceipts ?? {}).map(([responseId, candidate]) =>
-            receiptMatchesDiscardGeneration(candidate, generation) &&
-            (candidate.status === 'accepted' || (candidate.status === 'failed' && candidate.retryable === true))
-              ? ([
-                  responseId,
-                  {
-                    ...candidate,
-                    status: 'failed',
-                    error: projectedError,
-                    retryable: false,
-                    failedAt: discardedAt,
-                    updatedAt: discardedAt,
-                  } satisfies InboxResponseReceipt,
-                ] as const)
-              : ([responseId, candidate] as const),
-          ),
-          [input.responseId, receipt] as const,
-        ]);
-        // The claim also moves the row's deadline to now, so a completion that
-        // fails after this commit is due at once for the live timer, hydrate,
-        // and the cold sweep instead of waiting for the original TTL. Expiry
-        // never acts on a discard-owned row, so nothing else reads it.
-        claimed = { pending: { ...current, expiryStartedAt: discardedAt, expiresAt: discardedAt }, receipt };
-        return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
-      },
-      { skipIfUnchanged: true, keepPendingResume: true },
-    );
-    return claimed;
-  }
-
-  /**
-   * Settlement + phase two for a discard claim. Idempotent: replays, the
-   * pending-deadline reconciler (live timer, hydrate, cold sweep) and the
-   * original caller may all drive it; the clear is fenced to the claim.
-   */
-  private async _completeDiscardedPendingInteraction(
-    claimedPending: PendingResume,
-    receipt: InboxResponseReceipt,
-    opts: { drainQueue?: boolean } = {},
-  ): Promise<boolean> {
-    const discardedAt = receipt.discardedAt;
-    if (discardedAt === undefined || claimedPending.expiryStartedAt !== discardedAt) return false;
-    const discardError = this._discardedErrorForReceipt(receipt);
-    const projectedError = projectHarnessPublicError(discardError);
-    const generation = {
-      kind: claimedPending.kind,
-      itemId: claimedPending.itemId ?? claimedPending.toolCallId,
-      runId: claimedPending.runId,
-      toolCallId: claimedPending.toolCallId,
-      pendingRequestedAt: claimedPending.requestedAt,
-    };
-    const queuedItemId = this._queuedItemIdForPendingResume(claimedPending);
-    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
-    if (queueReceipt?.signalId !== undefined) {
-      await this._writeQueueSignalResultEvidence({
-        status: 'failed',
-        signalId: queueReceipt.signalId,
-        runId: queueReceipt.runId,
-        error: projectedError,
-      });
-    }
-    if (claimedPending.originSignalId !== undefined) {
-      // Required, not best effort: if the signal evidence cannot be written,
-      // the claim stays as the (immediately due) recovery marker.
-      await this._settleSignalResult(
-        claimedPending.originSignalId,
-        { status: 'failed', runId: claimedPending.runId, error: projectedError },
-        undefined,
-        { strict: true },
-      );
-    }
-    // Settle a deferred terminal admission before the claim marker clears, so
-    // a failure here leaves the claimed row discoverable for retry.
-    await this._cancelTerminalizedPendingAdmission(claimedPending, projectedError, { settleAsDiscard: true });
-
-    let cleared = false;
-    let settledQueueReceipt: QueueAdmissionReceipt | undefined;
-    await this._flushUpdate(
-      prev => {
-        cleared = false;
-        settledQueueReceipt = undefined;
-        const current = prev.pendingResume;
-        if (
-          current === undefined ||
-          !pendingMatchesDiscardGeneration(current, generation) ||
-          current.expiryStartedAt !== discardedAt
-        ) {
-          return prev;
-        }
-        cleared = true;
-        const next: SessionRecord = { ...prev };
-        delete next.pendingResume;
-        if (queuedItemId !== undefined) {
-          next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
-          const queued = prev.queueAdmissionReceipts?.[queuedItemId];
-          settledQueueReceipt = queued;
-          if (queued && queued.status !== 'completed' && queued.status !== 'failed' && queued.status !== 'dead') {
-            settledQueueReceipt = {
-              ...queued,
-              status: 'failed',
-              error: projectedError,
-              failedAt: queued.failedAt ?? discardedAt,
-              updatedAt: discardedAt,
-            };
-            next.queueAdmissionReceipts = {
-              ...(prev.queueAdmissionReceipts ?? {}),
-              [queuedItemId]: settledQueueReceipt,
-            };
-          }
-        }
-        return next;
-      },
-      { skipIfUnchanged: true },
-    );
-    if (!cleared) return false;
-
-    this._clearPendingInteractionExpiryTimer();
-    this._pendingReplacementToolSurfaces.delete(claimedPending.runId);
-    if (queuedItemId !== undefined) {
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.reject(discardError);
-      }
-      this._queueHead.releaseIf(queuedItemId);
-      this._emit({
-        type: 'queue_failed',
-        queuedItemId,
-        ...(settledQueueReceipt?.runId ? { runId: settledQueueReceipt.runId } : {}),
-        ...(settledQueueReceipt?.signalId ? { signalId: settledQueueReceipt.signalId } : {}),
-        ...(settledQueueReceipt?.admissionId ? { admissionId: settledQueueReceipt.admissionId } : {}),
-        error: projectedError,
-      });
-    }
-    // The parked run has no live owner (the claim refuses discards while a
-    // turn owns the interaction); close it here. Tool rows and agent_end
-    // belong to a live turn when one is running, so leave those alone.
-    const turnActive = this._currentTurnAbortController !== undefined;
-    if (!turnActive) this._releaseParkedRun(claimedPending);
-    if (!turnActive) this._emitAbortedToolEnds({ force: true });
-    this._emitTurnEvent({
-      type: 'resume_failed',
-      runId: claimedPending.runId,
-      retryable: false,
-      error: projectedError,
-    });
-    if (!turnActive) this._emitAgentEnd({ runId: claimedPending.runId, finishReason: 'error' });
-    this._notifyMaybeIdle();
-    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return true;
-  }
-
-  /**
-   * PF-8122: a suspension settled with no live turn (discarded, expired or stopped)
-   * leaves its agent run parked on the thread, and a parked run holds the
-   * thread until the suspended-run TTL sweeps it, so the next message cannot
-   * start a fresh run. Abort that parked run so the thread is free again.
-   */
-  private _releaseParkedRun(pending: PendingResume): void {
-    try {
-      const { agent } = this._harness._resolveAgentForRuntimeDependencies(
-        this._runtimeDependenciesForPendingResume(pending),
-        'settled pending interaction release',
-      );
-      agent.abortRunStream(pending.runId);
-    } catch (err) {
-      // The interaction is already settled; the TTL sweep still releases the run.
-      console.error('[harness/v1] parked run release after a settled pending interaction failed:', err);
-    }
-  }
-
-  /** The discard receipt whose claim is stamped on `pending`, if any. */
-  private _discardClaimForPending(pending: PendingResume): InboxResponseReceipt | undefined {
-    return discardClaimReceipt(this._record, pending);
-  }
-
-  private _findDiscardReceipt(generation: DiscardGeneration): InboxResponseReceipt | undefined {
-    return findDiscardReceiptIn(this._record, generation);
-  }
-
-  /** The discard receipt for the suspended call `output` parked on, if discarded. */
-  private _discardReceiptForSuspendedOutput(output: unknown, fallbackRunId?: string): InboxResponseReceipt | undefined {
-    const full = output as { finishReason?: unknown; runId?: unknown; suspendPayload?: unknown } | undefined;
-    if (full?.finishReason !== 'suspended') return undefined;
-    const runId = typeof full.runId === 'string' ? full.runId : fallbackRunId;
-    const toolCallId = (full.suspendPayload as { toolCallId?: unknown } | undefined)?.toolCallId;
-    if (runId === undefined || typeof toolCallId !== 'string') return undefined;
-    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
-      receipt => receipt.discardedAt !== undefined && receipt.runId === runId && receipt.toolCallId === toolCallId,
-    );
-  }
-
-  /** Throw the typed discard outcome when `pending`'s generation was discarded. */
-  private _throwIfPendingGenerationDiscarded(pending: PendingResume): void {
-    const discard = this._findDiscardReceipt({
-      kind: pending.kind,
-      itemId: pending.itemId ?? pending.toolCallId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      pendingRequestedAt: pending.requestedAt,
-    });
-    if (discard !== undefined) throw this._discardedErrorForReceipt(discard);
+  discardPendingInteraction(opts: DiscardPendingInteractionOptions): Promise<DiscardPendingInteractionResult> {
+    return discardPendingInteraction(this._pendingInteractionsPort(), opts);
   }
 
   private _discardedErrorForReceipt(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
-    const reason = (receipt.response as { reason?: unknown } | undefined)?.reason;
-    return new HarnessPendingInteractionDiscardedError(
-      this.id,
-      receipt.itemId,
-      typeof reason === 'string' ? reason : 'discarded',
-    );
-  }
-
-  private _discardPendingInteractionFailure(err: unknown, responseId: string): unknown {
-    // Storage errors raised inside the discard's own writes (e.g. the claim
-    // rejected by the record size budget) carry the discard's response subject.
-    if (err instanceof HarnessStorageError && err.operation !== 'inbox_response') {
-      return new HarnessStorageError({
-        operation: 'inbox_response',
-        cause: err.cause ?? err,
-        retryable: err.retryable,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        harnessName: this._record.harnessName,
-        subject: { kind: 'inbox_response', id: responseId },
-      });
-    }
-    if (
-      err instanceof HarnessError ||
-      err instanceof HarnessStorageError ||
-      err instanceof HarnessValidationError ||
-      err instanceof HarnessInboxResponseConflictError ||
-      err instanceof HarnessSessionClosedError ||
-      err instanceof HarnessSessionClosingError ||
-      err instanceof HarnessSessionDeletedError ||
-      err instanceof HarnessSessionLockedError
-    ) {
-      return err;
-    }
-    return new HarnessStorageError({
-      operation: 'inbox_response',
-      cause: err,
-      retryable: true,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      harnessName: this._record.harnessName,
-      subject: { kind: 'inbox_response', id: responseId },
-    });
+    return discardedErrorForReceipt(this._pendingInteractionsPort(), receipt);
   }
 
   // -------------------------------------------------------------------------
@@ -16288,7 +11930,12 @@ export class Session {
       return await this._resumeAnswer(expectedKind, resumeData, responseOptions, progress);
     } catch (err) {
       if (err instanceof HarnessPendingInteractionDiscardedError || !progress.validated) throw err;
-      const discard = this._discardReceiptForAnswer(expectedKind, responseOptions, progress.pending);
+      const discard = discardReceiptForAnswer(
+        this._pendingInteractionsPort(),
+        expectedKind,
+        responseOptions,
+        progress.pending,
+      );
       if (discard === undefined) throw err;
       const reason = (discard.response as { reason?: unknown } | undefined)?.reason;
       throw new HarnessPendingInteractionDiscardedError(
@@ -16298,39 +11945,6 @@ export class Session {
         { cause: err },
       );
     }
-  }
-
-  /**
-   * The discard receipt owning the generation this answer targeted: the
-   * answer's explicit generation fields when present, else the pending
-   * interaction it observed on entry.
-   */
-  private _discardReceiptForAnswer(
-    expectedKind: PendingResume['kind'],
-    responseOptions: InboxResponseOptions,
-    observed: PendingResume | undefined,
-  ): InboxResponseReceipt | undefined {
-    const options = responseOptions as Record<string, unknown>;
-    const itemId = getOwnRecordValue(options, 'itemId');
-    const runId = getOwnRecordValue(options, 'runId');
-    const toolCallId = getOwnRecordValue(options, 'toolCallId');
-    const pendingRequestedAt = getOwnRecordValue(options, 'pendingRequestedAt');
-    if (
-      typeof itemId === 'string' &&
-      typeof runId === 'string' &&
-      typeof toolCallId === 'string' &&
-      typeof pendingRequestedAt === 'number'
-    ) {
-      return this._findDiscardReceipt({ kind: expectedKind, itemId, runId, toolCallId, pendingRequestedAt });
-    }
-    if (observed === undefined || observed.kind !== expectedKind) return undefined;
-    return this._findDiscardReceipt({
-      kind: observed.kind,
-      itemId: observed.itemId ?? observed.toolCallId,
-      runId: observed.runId,
-      toolCallId: observed.toolCallId,
-      pendingRequestedAt: observed.requestedAt,
-    });
   }
 
   private async _resumeAnswer(
@@ -16407,14 +12021,22 @@ export class Session {
     const storedReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
     if (storedReceipt !== undefined) {
-      const duplicate = this._resolveStoredInboxResponse(expectedKind, resumeData, responseOptions);
+      const duplicate = resolveStoredInboxResponse(
+        this._pendingInteractionsPort(),
+        expectedKind,
+        resumeData,
+        responseOptions,
+      );
       const retryClaim = storedReceipt.status === 'failed' && storedReceipt.retryable === true;
       if (!retryClaim && storedReceipt.status === 'applied') {
         return duplicate!;
       }
       if (!retryClaim && this._record.pendingResume === undefined) {
-        const recoveredReceipt = await this._applyInboxReceiptFromCompletedQueue(storedReceipt);
-        if (recoveredReceipt) return this._inboxReceiptResult(recoveredReceipt, true);
+        const recoveredReceipt = await applyInboxReceiptFromCompletedQueue(
+          this._pendingInteractionsPort(),
+          storedReceipt,
+        );
+        if (recoveredReceipt) return inboxReceiptResult(this._pendingInteractionsPort(), recoveredReceipt, true);
         return duplicate!;
       }
       // The original caller owns the in-flight resume. A later delivery of the
@@ -16443,7 +12065,7 @@ export class Session {
       typeof requestedToolCallId === 'string' &&
       typeof requestedPendingRequestedAt === 'number'
     ) {
-      const discarded = this._findDiscardReceipt({
+      const discarded = findDiscardReceipt(this._pendingInteractionsPort(), {
         kind: expectedKind,
         itemId: requestedItemId,
         runId: requestedRunId,
@@ -16452,12 +12074,14 @@ export class Session {
       });
       if (discarded !== undefined) {
         const claimed = this._record.pendingResume;
-        if (claimed !== undefined && this._discardClaimForPending(claimed) === discarded) {
+        if (claimed !== undefined && discardClaimForPending(this._pendingInteractionsPort(), claimed) === discarded) {
           // Best effort: the claim is durable and the deadline reconciler
           // retries the clear, so the answer still gets the discard outcome.
-          await this._completeDiscardedPendingInteraction(claimed, discarded).catch(() => false);
+          await completeDiscardedPendingInteraction(this._pendingInteractionsPort(), claimed, discarded).catch(
+            () => false,
+          );
         }
-        throw this._discardedErrorForReceipt(discarded);
+        throw discardedErrorForReceipt(this._pendingInteractionsPort(), discarded);
       }
     }
 
@@ -16529,12 +12153,14 @@ export class Session {
         'the pending tool approval has no grantable tool name',
       );
     }
-    const pendingExpiresAt = this._pendingInteractionExpiresAt(pending);
+    const pendingExpiresAt = pendingInteractionExpiresAt(this._pendingInteractionsPort(), pending);
     // A discard-claimed generation is resolved by its discard, never expired.
-    const discardClaim = this._discardClaimForPending(pending);
+    const discardClaim = discardClaimForPending(this._pendingInteractionsPort(), pending);
     if (discardClaim !== undefined) {
-      await this._completeDiscardedPendingInteraction(pending, discardClaim).catch(() => false);
-      throw this._discardedErrorForReceipt(discardClaim);
+      await completeDiscardedPendingInteraction(this._pendingInteractionsPort(), pending, discardClaim).catch(
+        () => false,
+      );
+      throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardClaim);
     }
     if (pending.expiryStartedAt !== undefined || (pending.resumedAt === undefined && Date.now() >= pendingExpiresAt)) {
       const expiryOutcome = await this._expirePendingInteraction({
@@ -16546,7 +12172,7 @@ export class Session {
         expiresAt: pendingExpiresAt,
       });
       // A discard that won while this answer was in flight is the outcome.
-      this._throwIfPendingGenerationDiscarded(pending);
+      throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), pending);
       const didExpire = expiryOutcome === 'expired';
       const generationKey = pendingInteractionGenerationKey({
         kind: pending.kind,
@@ -16578,7 +12204,7 @@ export class Session {
     const existingReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
     if (existingReceipt !== undefined) {
-      this._assertMatchingInboxReceipt(existingReceipt, {
+      assertMatchingInboxReceipt(this._pendingInteractionsPort(), existingReceipt, {
         kind: expectedKind,
         itemId,
         responseId: responseId!,
@@ -16586,12 +12212,12 @@ export class Session {
       });
       const retryClaim = existingReceipt.status === 'failed' && existingReceipt.retryable === true;
       if (!retryClaim) {
-        this._throwStoredInboxResponseFailure(existingReceipt);
+        throwStoredInboxResponseFailure(this._pendingInteractionsPort(), existingReceipt);
         if (
           responseMode === 'inbox-receipt' &&
           (pending.resumedAt === undefined || existingReceipt.status === 'applied')
         ) {
-          return this._inboxReceiptResult(existingReceipt, true);
+          return inboxReceiptResult(this._pendingInteractionsPort(), existingReceipt, true);
         }
         if (existingReceipt.status === 'applied' && existingReceipt.result !== undefined) {
           return existingReceipt.result as AgentResult;
@@ -16611,31 +12237,42 @@ export class Session {
         // execution and then failed inside terminal settlement. Re-drive the
         // durable bookkeeping from the cached run output — this marks this
         // receipt applied — before falling back to stale-recovery handling.
-        const settled = await this._maybeFinalizeRetriedResumedTerminal(pending, resumeData, {
-          expectedKind,
-          responseMode,
-          responseId,
-        });
+        const settled = await maybeFinalizeRetriedResumedTerminal(
+          this._pendingInteractionsPort(),
+          pending,
+          resumeData,
+          {
+            expectedKind,
+            responseMode,
+            responseId,
+          },
+        );
         if (settled !== undefined) return settled;
         const recovery = await this._maybeRecoverStaleQueuedResume();
         if (recovery.status === 'completed') {
-          await this._markInboxResponseApplied(existingReceipt.responseId, recovery.result);
+          await markInboxResponseApplied(this._pendingInteractionsPort(), existingReceipt.responseId, recovery.result);
           const receipt =
             getOwnRecordValue(this._record.inboxResponseReceipts, existingReceipt.responseId) ?? existingReceipt;
-          return this._inboxReceiptResult(receipt, true);
+          return inboxReceiptResult(this._pendingInteractionsPort(), receipt, true);
         }
         if (recovery.status === 'stale') {
           throw new ResumeRecoveryStaleError();
         }
         if (
           this._currentTurnAbortController === undefined &&
-          this._queuedItemIdForPendingResume(pending) === undefined &&
-          Date.now() >= this._pendingInteractionDueAt(pending)
+          queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending) === undefined &&
+          Date.now() >= pendingInteractionDueAt(this._pendingInteractionsPort(), pending)
         ) {
           const stale = new ResumeRecoveryStaleError();
-          if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
+          if (
+            await recoverStaleResumeAdmission(
+              this._pendingInteractionsPort(),
+              this._pendingInteractionGeneration(pending),
+            )
+          )
+            throw stale;
         }
-        return this._inboxReceiptResult(existingReceipt, true);
+        return inboxReceiptResult(this._pendingInteractionsPort(), existingReceipt, true);
       }
       const recovery = await this._maybeRecoverStaleQueuedResume();
       if (recovery.status === 'completed') {
@@ -16657,7 +12294,7 @@ export class Session {
       // still cached and a pending admission exists, re-drive the settlement
       // and the remaining durable bookkeeping from it instead of re-running
       // the provider.
-      const settled = await this._maybeFinalizeRetriedResumedTerminal(pending, resumeData, {
+      const settled = await maybeFinalizeRetriedResumedTerminal(this._pendingInteractionsPort(), pending, resumeData, {
         expectedKind,
         responseMode,
         responseId,
@@ -16665,11 +12302,17 @@ export class Session {
       if (settled !== undefined) return settled;
       if (
         this._currentTurnAbortController === undefined &&
-        this._queuedItemIdForPendingResume(pending) === undefined &&
-        Date.now() >= this._pendingInteractionDueAt(pending)
+        queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending) === undefined &&
+        Date.now() >= pendingInteractionDueAt(this._pendingInteractionsPort(), pending)
       ) {
         const stale = new ResumeRecoveryStaleError();
-        if (await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending))) throw stale;
+        if (
+          await recoverStaleResumeAdmission(
+            this._pendingInteractionsPort(),
+            this._pendingInteractionGeneration(pending),
+          )
+        )
+          throw stale;
       }
       throw new HarnessValidationError(
         `respond[${expectedKind}]`,
@@ -16677,7 +12320,7 @@ export class Session {
       );
     }
 
-    const pendingQueuedItemId = this._queuedItemIdForPendingResume(pending);
+    const pendingQueuedItemId = queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending);
     if (pendingQueuedItemId !== undefined) {
       this._ensureQueuedItemContext(pendingQueuedItemId);
     }
@@ -16690,19 +12333,20 @@ export class Session {
     // check catches the pending-record path.
     const modeFlipTarget =
       expectedKind === 'plan-approval'
-        ? this._resolvePlanApprovalModeFlipTarget(
+        ? resolvePlanApprovalModeFlipTarget(
+            this._pendingInteractionsPort(),
             pending,
             resumeData as { approved: boolean; transitionToMode?: string },
           )
         : undefined;
 
     const previousModeId = this._record.modeId;
-    const resumeModeId = this._modeIdForPendingResume(pending);
-    const resumeRuntimeDependencies = this._runtimeDependenciesForPendingResume(pending);
+    const resumeModeId = modeIdForPendingResume(this._pendingInteractionsPort(), pending);
+    const resumeRuntimeDependencies = runtimeDependenciesForPendingResume(this._pendingInteractionsPort(), pending);
     const resumeMode = this._harness._getMode(resumeModeId);
     let resumeToolSurface = this._buildToolSurface(resumeMode);
     if (pending.toolSurfaceFence !== undefined) {
-      const retainedFence = this._pendingReplacementToolSurfaces.get(pending.runId);
+      const retainedFence = this._replacementToolSurface.fenceFor(pending.runId);
       if (retainedFence === undefined) {
         throw new HarnessValidationError(
           `respond[${expectedKind}]`,
@@ -16726,7 +12370,8 @@ export class Session {
       let thrown = err;
       if (responseId !== undefined) {
         try {
-          await this._recordInboxResponsePreDispatchFailure(
+          await recordInboxResponsePreDispatchFailure(
+            this._pendingInteractionsPort(),
             {
               responseId,
               responseHash: responseHash!,
@@ -16797,7 +12442,8 @@ export class Session {
         // registers that version.
         if (responseId !== undefined && !(resumeRefusal instanceof HarnessTerminalFinalizationPendingError)) {
           try {
-            await this._recordInboxResponsePreDispatchFailure(
+            await recordInboxResponsePreDispatchFailure(
+              this._pendingInteractionsPort(),
               {
                 responseId,
                 responseHash: responseHash!,
@@ -16866,7 +12512,7 @@ export class Session {
       const retryableReceipt =
         currentReceipt?.status === 'failed' && currentReceipt.retryable === true ? currentReceipt : undefined;
       if (currentReceipt !== undefined && retryableReceipt === undefined) {
-        this._assertMatchingInboxReceipt(currentReceipt, {
+        assertMatchingInboxReceipt(this._pendingInteractionsPort(), currentReceipt, {
           kind: expectedKind,
           itemId,
           responseId: currentReceipt.responseId,
@@ -16893,7 +12539,7 @@ export class Session {
       }
 
       const admissionAt = Date.now();
-      if (admissionAt >= this._pendingInteractionExpiresAt(currentPending)) {
+      if (admissionAt >= pendingInteractionExpiresAt(this._pendingInteractionsPort(), currentPending)) {
         expiredBeforeAdmission = currentPending;
         return prev;
       }
@@ -16966,7 +12612,7 @@ export class Session {
       this._emitter.emit({ type: 'permission_granted', toolName: grantedToolAfterAdmission });
     }
     if (discardedBeforeAdmission !== undefined) {
-      throw this._discardedErrorForReceipt(discardedBeforeAdmission);
+      throw discardedErrorForReceipt(this._pendingInteractionsPort(), discardedBeforeAdmission);
     }
     if (cancelledBeforeResume !== undefined) {
       throw new HarnessSessionCancelledError(this.id, cancelledBeforeResume.reason);
@@ -16976,7 +12622,7 @@ export class Session {
     }
     // The admission lost to a `discardPendingInteraction` claim that
     // committed after this answer's pre-admission checks: report the discard.
-    if (resumedAt === undefined) this._throwIfPendingGenerationDiscarded(pending);
+    if (resumedAt === undefined) throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), pending);
     if (expiredBeforeAdmission !== undefined) {
       const expired = expiredBeforeAdmission;
       await this._expirePendingInteraction({
@@ -16985,18 +12631,18 @@ export class Session {
         runId: expired.runId,
         toolCallId: expired.toolCallId,
         requestedAt: expired.requestedAt,
-        expiresAt: this._pendingInteractionExpiresAt(expired),
+        expiresAt: pendingInteractionExpiresAt(this._pendingInteractionsPort(), expired),
       });
-      this._throwIfPendingGenerationDiscarded(expired);
+      throwIfPendingGenerationDiscarded(this._pendingInteractionsPort(), expired);
       throw new HarnessPendingInteractionExpiredError(
         this.id,
         expired.itemId ?? expired.toolCallId,
-        this._pendingInteractionExpiresAt(expired),
+        pendingInteractionExpiresAt(this._pendingInteractionsPort(), expired),
       );
     }
     if (duplicateReceiptAfterAdmission !== undefined) {
-      this._throwStoredInboxResponseFailure(duplicateReceiptAfterAdmission);
-      return this._inboxReceiptResult(duplicateReceiptAfterAdmission, true);
+      throwStoredInboxResponseFailure(this._pendingInteractionsPort(), duplicateReceiptAfterAdmission);
+      return inboxReceiptResult(this._pendingInteractionsPort(), duplicateReceiptAfterAdmission, true);
     }
     if (pendingAlreadyResumedAfterAdmission) {
       const recovery = await this._maybeRecoverStaleQueuedResume();
@@ -17174,7 +12820,7 @@ export class Session {
         this._emitAbortedToolEnds({ force: true });
       }
       full = this._materializeHarnessRunOutput(pending.runId, full);
-      const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
+      const resumedQueuedItemId = queuedItemIdForPendingResume(this._pendingInteractionsPort(), pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
           this._markQueuedTurnCompleted(resumedQueuedItemId, full, { modeId: modeFlipTarget }),
@@ -17352,7 +12998,7 @@ export class Session {
     // durable `resumedAt` marker rightly blocks a second provider call. Caching
     // the materialized output gives the settlement-only retry below a concrete
     // result to commit without re-running the provider.
-    this._rememberCompletedRun(pending.runId, { ok: true, full });
+    this._runOutcomes.remember(pending.runId, { ok: true, full });
 
     // Clear pending + apply any remaining mode flip in a single CAS write. A
     // queued terminal resume has already persisted its completed receipt before
@@ -17400,7 +13046,7 @@ export class Session {
     if (responseMode === 'inbox-receipt') {
       const receipt =
         responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
-      if (receipt) return this._inboxReceiptResult(receipt, false);
+      if (receipt) return inboxReceiptResult(this._pendingInteractionsPort(), receipt, false);
     }
     return full as AgentResult;
   }
@@ -17455,7 +13101,8 @@ export class Session {
         : undefined;
     const suspendedPending =
       suspendedPayload !== undefined
-        ? this._pendingResumeFromSuspendedOutput(
+        ? pendingResumeFromSuspendedOutput(
+            this._pendingInteractionsPort(),
             full,
             suspendedPayload,
             pendingQueuedItemId,
@@ -17466,7 +13113,7 @@ export class Session {
         : undefined;
     const suspendedTokenUsageDelta =
       full.finishReason === 'suspended'
-        ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage)
+        ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, pending.accountedTokenUsage)
         : undefined;
     if (full.finishReason === 'suspended') this._captureTurnRunId(full);
     // `_recordTurnCompletion` mutates the live counter immediately (unlike the
@@ -17482,22 +13129,20 @@ export class Session {
       requestedAt: pending.requestedAt,
     });
     const resumeAccountingDone = (): boolean => {
-      const entry = this._completedRuns.get(pending.runId);
-      return entry !== undefined && entry.ok === true && entry.resumeAccountingKey === resumeAccountingKey;
+      return this._runOutcomes.isResumeAccounted(pending.runId, resumeAccountingKey);
     };
     const markResumeAccountingDone = (): void => {
-      const entry = this._completedRuns.get(pending.runId);
-      if (entry !== undefined && entry.ok === true) entry.resumeAccountingKey = resumeAccountingKey;
+      this._runOutcomes.noteResumeAccounted(pending.runId, resumeAccountingKey);
       // This run's usage is now part of the session total — mark the
       // message-side memo too, or a cached-duplicate replay of the resumed
       // output re-adds the run's cumulative usage.
-      this._messageTokenAccountedRunIds.add(pending.runId);
+      this._messageTokenLedger.markAccounted(pending.runId);
       // Arm the durable fence: the live counter already holds this delta, so
       // every flush until the pending clears must persist the advanced
       // baseline alongside it — a cold retry then computes a zero delta.
-      const runUsage = this._tokenUsageDeltaFromFullOutput(full);
+      const runUsage = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
       if (runUsage !== undefined) {
-        this._resumeUsageBaseline = { generationKey: resumeAccountingKey, runUsage };
+        this._resumeUsageFence.arm(resumeAccountingKey, runUsage);
       }
     };
     let alreadyAccounted = false;
@@ -17538,9 +13183,13 @@ export class Session {
         let tokenUsageDelta: TokenUsage | undefined;
         try {
           this._captureTurnRunId(full);
-          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
+          tokenUsageDelta = tokenUsageDeltaFromFullOutput(
+            this._pendingInteractionsPort(),
+            full,
+            pending.accountedTokenUsage,
+          );
           alreadyAccounted = true;
-          this._messageTokenAccountedRunIds.add(pending.runId);
+          this._messageTokenLedger.markAccounted(pending.runId);
           await Promise.race([
             this._markQueuedPostRunFinalized(completingQueuedItemId, { tokenUsageDelta }),
             deletedTurnWaiter,
@@ -17573,7 +13222,8 @@ export class Session {
     // pending and recoverable only while a retry of the same responseId can
     // still reach this settlement.
     if (full.finishReason !== 'suspended') {
-      await this._settleResumedTerminalHandoff(
+      await settleResumedTerminalHandoff(
+        this._pendingInteractionsPort(),
         pending,
         full,
         { modeId: resumeModeId, modelId: resumeModelId },
@@ -17701,9 +13351,9 @@ export class Session {
       // The flush durably applied the re-suspension's usage delta — mark the
       // message-side memo so a cached-duplicate replay of this run cannot
       // re-apply its cumulative usage after a reopen empties the sets.
-      this._messageTokenAccountedRunIds.add(pending.runId);
+      this._messageTokenLedger.markAccounted(pending.runId);
     } else {
-      this._pendingReplacementToolSurfaces.delete(pending.runId);
+      this._replacementToolSurface.drop(pending.runId);
     }
 
     // §10.2 defines no suspension_resolved event — resolution is observed via
@@ -17723,7 +13373,7 @@ export class Session {
     // fenced out of the pending write must not announce a suspension that
     // durable state never recorded.
     if (suspendedPending !== undefined && this._record.pendingResume === suspendedPending) {
-      this._emitPendingEvent(suspendedPending);
+      emitPendingEvent(this._pendingInteractionsPort(), suspendedPending);
     }
 
     // If the record size budget expired the re-suspension during the park
@@ -17745,17 +13395,17 @@ export class Session {
     // If the resumed run did NOT suspend again, the turn is complete from
     // the harness's perspective. Surface that to subscribers via agent_end.
     // A settlement retry (committed admission, failed post-commit bookkeeping)
-    // re-enters this helper — `_finalizedRunIds` is populated synchronously by
-    // the first emit, so the guard keeps the terminal event exactly-once while
+    // re-enters this helper — the run is finalized synchronously by the first
+    // emit, so the guard keeps the terminal event exactly-once while
     // the steps below still re-run their own idempotent bookkeeping.
     if (full.finishReason !== 'suspended') {
-      // `_finalizedRunIds` is populated synchronously by `_emitAgentEnd`, so
+      // The run is finalized synchronously by `_emitAgentEnd`, so
       // the flag captured here is true for exactly one caller per completed
       // run. Goal judging joins the same once-scope: a settlement retry that
       // re-enters this helper must not invoke `_runGoalJudge` again — a second
       // 'continue' verdict would consume additional goal budget and enqueue a
       // duplicate continuation.
-      const firstFinalize = full.runId === undefined || !this._finalizedRunIds.has(full.runId);
+      const firstFinalize = full.runId === undefined || !this._runSpans.isFinalized(full.runId);
       if (firstFinalize) {
         this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
       }
@@ -17819,7 +13469,9 @@ export class Session {
     const { pending, resumedAt, responseId, queuedItemId, modeFlipTarget, previousModeId, full, error } = input;
     const failedAt = Date.now();
     const projectedError = projectHarnessPublicError(error);
-    const usageDelta = full ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage) : undefined;
+    const usageDelta = full
+      ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full, pending.accountedTokenUsage)
+      : undefined;
     let terminalized = false;
     let usageDeltaToPersist: TokenUsage | undefined;
     let failedQueueReceipt: QueueAdmissionReceipt | undefined;
@@ -17912,7 +13564,7 @@ export class Session {
     );
 
     if (!terminalized) return false;
-    this._pendingReplacementToolSurfaces.delete(pending.runId);
+    this._replacementToolSurface.drop(pending.runId);
 
     if (queuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
@@ -17964,187 +13616,6 @@ export class Session {
     return true;
   }
 
-  private _resolveStoredInboxResponse(
-    expectedKind: PendingResume['kind'],
-    resumeData: unknown,
-    responseOptions: InboxResponseOptions,
-  ): InboxResponseResult | undefined {
-    const responseId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'responseId');
-    if (typeof responseId !== 'string') return undefined;
-    const receipt = getOwnRecordValue(this._record.inboxResponseReceipts, responseId);
-    if (receipt === undefined) return undefined;
-    if (receipt.kind !== expectedKind) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    const requestedItemId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'itemId');
-    if (requestedItemId !== undefined && typeof requestedItemId !== 'string') {
-      throw new HarnessValidationError(`respond[${expectedKind}].itemId`, 'itemId must be a string');
-    }
-    if (requestedItemId !== undefined && receipt.itemId !== requestedItemId) {
-      throw new HarnessInboxItemNotFoundError(
-        this.id,
-        requestedItemId,
-        expectedKind === 'sandbox-access' ? undefined : expectedKind,
-      );
-    }
-    const requestedRunId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'runId');
-    const requestedToolCallId = getOwnRecordValue(responseOptions as Record<string, unknown>, 'toolCallId');
-    const requestedPendingRequestedAt = getOwnRecordValue(
-      responseOptions as Record<string, unknown>,
-      'pendingRequestedAt',
-    );
-    if (
-      receipt.runId !== requestedRunId ||
-      receipt.toolCallId !== requestedToolCallId ||
-      receipt.pendingRequestedAt !== requestedPendingRequestedAt
-    ) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    // A retried answer reusing the responseId of a `discardPendingInteraction`
-    // replays the discard outcome rather than a payload conflict.
-    if (receipt.discardedAt !== undefined) {
-      throw this._discardedErrorForReceipt(receipt);
-    }
-    const attemptedHash = this._computeInboxResponseHash({
-      kind: expectedKind,
-      itemId: receipt.itemId,
-      runId: receipt.runId,
-      pendingRequestedAt: receipt.pendingRequestedAt,
-      response: resumeData,
-      ...(expectedKind === 'tool-approval' ? { approvalScope: responseOptions.approvalScope ?? 'once' } : {}),
-    });
-    if (attemptedHash !== receipt.responseHash) {
-      throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
-    }
-    this._throwStoredInboxResponseFailure(receipt);
-    return this._inboxReceiptResult(receipt, true);
-  }
-
-  private _assertMatchingInboxReceipt(
-    receipt: InboxResponseReceipt,
-    input: { kind: PendingResume['kind']; itemId: string; responseId: string; responseHash: string },
-  ): void {
-    if (receipt.kind !== input.kind || receipt.itemId !== input.itemId || receipt.responseHash !== input.responseHash) {
-      throw new HarnessInboxResponseConflictError(this.id, input.itemId, input.responseId);
-    }
-  }
-
-  private _inboxReceiptResult(receipt: InboxResponseReceipt, duplicate: boolean): InboxResponseResult {
-    return {
-      itemId: receipt.itemId,
-      kind: receipt.kind,
-      status: receipt.status === 'applied' ? 'applied' : 'accepted',
-      responseId: receipt.responseId,
-      duplicate,
-    };
-  }
-
-  private _throwStoredInboxResponseFailure(receipt: InboxResponseReceipt): void {
-    if (receipt.status !== 'failed' && receipt.status !== 'dead') return;
-    if (receipt.status === 'failed' && receipt.retryable === true) return;
-    throw publicErrorProjectionToError(
-      receipt.error ?? { code: 'harness.inbox_response_failed', message: 'inbox response failed' },
-    );
-  }
-
-  private async _applyInboxReceiptFromCompletedQueue(
-    receipt: InboxResponseReceipt,
-  ): Promise<InboxResponseReceipt | undefined> {
-    if (receipt.queuedItemId === undefined) return undefined;
-    const completed = this._record.queueAdmissionReceipts?.[receipt.queuedItemId];
-    if (completed?.status !== 'completed' || completed.runId !== receipt.runId || completed.result === undefined) {
-      return undefined;
-    }
-    await this._markInboxResponseApplied(receipt.responseId, completed.result as AgentResult);
-    return getOwnRecordValue(this._record.inboxResponseReceipts, receipt.responseId) ?? receipt;
-  }
-
-  private async _markInboxResponseApplied(responseId: string, result: AgentResult): Promise<void> {
-    const appliedAt = Date.now();
-    await this._flushUpdate(prev => {
-      const receipt = getOwnRecordValue(prev.inboxResponseReceipts, responseId);
-      if (!receipt || receipt.status === 'applied' || receiptGenerationDiscarded(prev, receipt)) return prev;
-      return {
-        ...prev,
-        inboxResponseReceipts: {
-          ...(prev.inboxResponseReceipts ?? {}),
-          [responseId]: {
-            ...receipt,
-            status: 'applied',
-            result,
-            appliedAt: receipt.appliedAt ?? appliedAt,
-            updatedAt: appliedAt,
-          },
-        },
-      };
-    });
-  }
-
-  private async _recordInboxResponsePreDispatchFailure(
-    input: {
-      responseId: string;
-      responseHash: string;
-      itemId: string;
-      queuedItemId?: string;
-      kind: PendingResume['kind'];
-      pending: PendingResume;
-      response: unknown;
-      approvalScope?: 'once' | 'always';
-    },
-    err: unknown,
-  ): Promise<void> {
-    const failedAt = Date.now();
-    await this._flushUpdate(prev => {
-      // Never persist a contrary refusal for a generation a discard owns.
-      if (
-        findDiscardReceiptIn(prev, {
-          kind: input.kind,
-          itemId: input.itemId,
-          runId: input.pending.runId,
-          toolCallId: input.pending.toolCallId,
-          pendingRequestedAt: input.pending.requestedAt,
-        }) !== undefined
-      ) {
-        return prev;
-      }
-      const currentReceipt = getOwnRecordValue(prev.inboxResponseReceipts, input.responseId);
-      if (currentReceipt !== undefined) {
-        this._assertMatchingInboxReceipt(currentReceipt, {
-          kind: input.kind,
-          itemId: input.itemId,
-          responseId: input.responseId,
-          responseHash: input.responseHash,
-        });
-        return prev;
-      }
-      return {
-        ...prev,
-        inboxResponseReceipts: {
-          ...(prev.inboxResponseReceipts ?? {}),
-          [input.responseId]: {
-            responseId: input.responseId,
-            responseHash: input.responseHash,
-            resumeAttemptId: input.responseId,
-            itemId: input.itemId,
-            ...(input.queuedItemId !== undefined ? { queuedItemId: input.queuedItemId } : {}),
-            kind: input.kind,
-            runId: input.pending.runId,
-            toolCallId: input.pending.toolCallId,
-            pendingRequestedAt: input.pending.requestedAt,
-            response: input.response,
-            ...(input.approvalScope !== undefined ? { approvalScope: input.approvalScope } : {}),
-            status: 'failed',
-            error: projectHarnessPublicError(err),
-            retryable: false,
-            acceptedAt: failedAt,
-            failedAt,
-            updatedAt: failedAt,
-          } satisfies InboxResponseReceipt,
-        },
-      };
-    });
-  }
-
   private async _markInboxResponseFailed(responseId: string, err: unknown): Promise<void> {
     const failedAt = Date.now();
     await this._flushUpdate(prev => {
@@ -18183,38 +13654,13 @@ export class Session {
     response: unknown;
     approvalScope?: 'once' | 'always';
   }): string {
-    return sha256CanonicalJson(input);
-  }
-
-  private _queuedItemIdForPendingResume(pending: PendingResume): string | undefined {
-    if (pending.queuedItemId !== undefined) return pending.queuedItemId;
-    if (this._queueHead.currentId !== undefined) return this._queueHead.currentId;
-    return (this._record.pendingQueue ?? []).find(item => {
-      const receipt = this._record.queueAdmissionReceipts?.[item.id];
-      return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === pending.runId;
-    })?.id;
-  }
-
-  private _modeIdForPendingResume(pending: PendingResume): string {
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
-    const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    return pending.modeId ?? receipt?.modeId ?? queuedItem?.mode ?? this._record.modeId;
+    return computeInboxResponseHash(this._pendingInteractionsPort(), input);
   }
 
   private _modelIdForQueuedItem(queuedItemId: string | undefined): string {
     const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
     const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
     return queuedItem?.model ?? receipt?.runtimeDependencies?.modelId ?? this._record.modelId;
-  }
-
-  private _runtimeDependenciesForPendingResume(pending: PendingResume): HarnessRuntimeDependencyRefs {
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    const queuedItem = queuedItemId ? this._record.pendingQueue.find(item => item.id === queuedItemId) : undefined;
-    const receipt = queuedItemId ? this._record.queueAdmissionReceipts?.[queuedItemId] : undefined;
-    const modeId = this._modeIdForPendingResume(pending);
-    const modelId = queuedItem?.model ?? this._record.modelId;
-    return pending.runtimeDependencies ?? receipt?.runtimeDependencies ?? { modeId, ...(modelId ? { modelId } : {}) };
   }
 
   /**
@@ -18296,97 +13742,10 @@ export class Session {
     return reverted;
   }
 
-  private async _maybeRecoverStaleQueuedResume({
+  private _maybeRecoverStaleQueuedResume({
     kickDrainOnStale = true,
   }: { kickDrainOnStale?: boolean } = {}): Promise<QueueResumeRecoveryResult> {
-    if (this._currentTurnAbortController !== undefined) return { status: 'none' };
-    const pending = this._record.pendingResume;
-    if (pending?.resumedAt === undefined) return { status: 'none' };
-    const queuedItemId = this._queuedItemIdForPendingResume(pending);
-    if (queuedItemId === undefined) return { status: 'none' };
-    // §10.2: no queue_item_replayed event on crash-recovery — the recovered
-    // turn flows through normal drain/agent_start; settlement evidence stays durable.
-    this._ensureQueuedItemContext(queuedItemId);
-
-    const currentReceipt = this._record.queueAdmissionReceipts?.[queuedItemId];
-    if (currentReceipt?.status === 'completed') {
-      const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
-      const shouldRunPostRunSideEffects = queuedItem !== undefined && currentReceipt.postRunFinalizedAt === undefined;
-      let alreadyAccounted = false;
-      if (shouldRunPostRunSideEffects) {
-        let tokenUsageDelta: TokenUsage | undefined;
-        try {
-          const full = currentReceipt.result as FullOutput<unknown>;
-          this._captureTurnRunId(full);
-          tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
-          alreadyAccounted = true;
-          this._messageTokenAccountedRunIds.add(pending.runId);
-          await this._markQueuedPostRunFinalized(queuedItemId, { tokenUsageDelta });
-        } catch (err) {
-          this._deferQueuedTurnRetry(
-            new QueuePostRunFinalizationPendingError(Date.now() + QUEUE_POST_RUN_FINALIZATION_RETRY_MS, err),
-          );
-          return { status: 'none' };
-        }
-      }
-      await this._flushUpdate(prev => {
-        const current = prev.pendingResume;
-        if (
-          !current ||
-          current.runId !== pending.runId ||
-          current.toolCallId !== pending.toolCallId ||
-          current.resumedAt !== pending.resumedAt
-        ) {
-          return prev;
-        }
-        const next: SessionRecord = {
-          ...prev,
-          pendingQueue: (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId),
-        };
-        delete next.pendingResume;
-        return next;
-      });
-      if (shouldRunPostRunSideEffects && queuedItem) {
-        await this._finalizeQueuedRunCompletion(
-          queuedItem,
-          currentReceipt.result as FullOutput<unknown>,
-          pending.modeId ?? currentReceipt.modeId ?? queuedItem.mode ?? this._record.modeId,
-          undefined,
-          { skipTokenAccounting: alreadyAccounted },
-        );
-      }
-      this._queueHead.release();
-      const resolver = this._queueHead.takeResolver(queuedItemId);
-      if (resolver) {
-        resolver.resolve(currentReceipt.result as AgentResult);
-      }
-      this._notifyMaybeIdle();
-      void this._maybeDrainQueue();
-      return { status: 'completed', result: currentReceipt.result as AgentResult };
-    }
-
-    const retryAt = pending.resumedAt + QUEUE_ACCEPTED_RECOVERY_STALE_MS;
-    if (Date.now() < retryAt) {
-      if (this._queuedResumeRecoveryTimer === undefined) {
-        const delayMs = Math.max(0, retryAt - Date.now());
-        this._queuedResumeRecoveryTimer = setTimeout(() => {
-          this._queuedResumeRecoveryTimer = undefined;
-          void this._maybeDrainQueue();
-        }, delayMs);
-        this._queuedResumeRecoveryTimer.unref?.();
-      }
-      return { status: 'none' };
-    }
-
-    if (this._queuedResumeRecoveryTimer !== undefined) {
-      clearTimeout(this._queuedResumeRecoveryTimer);
-      this._queuedResumeRecoveryTimer = undefined;
-    }
-
-    const recovered = await this._recoverStaleResumeAdmission(this._pendingInteractionGeneration(pending), {
-      drainQueue: kickDrainOnStale,
-    });
-    return recovered ? { status: 'stale' } : { status: 'none' };
+    return maybeRecoverStaleQueuedResume(this._pendingInteractionsPort(), { kickDrainOnStale });
   }
 
   // -------------------------------------------------------------------------
@@ -18646,7 +14005,7 @@ export class Session {
     attachments: PersistedAttachment[],
     requestContext: PersistedRequestContextInput,
   ): string {
-    return this._computeSignalAdmissionHash(opts, attachments, requestContext);
+    return channelSignalAdmissionHash(this._signalsPort(), opts, attachments, requestContext);
   }
 
   private async _admitQueue(
@@ -19866,9 +15225,9 @@ export class Session {
       let tokenUsageDelta: TokenUsage | undefined;
       try {
         this._captureTurnRunId(full);
-        tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
+        tokenUsageDelta = tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full);
         alreadyAccounted = true;
-        if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
+        if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
         await this._raceActiveTurnWaiter(
           this._markQueuedPostRunFinalized(item.id, { tokenUsageDelta }),
           activeTurnWaiter,
@@ -20000,7 +15359,7 @@ export class Session {
     const tokenUsageDelta = opts.skipTokenAccounting
       ? undefined
       : full.finishReason === 'suspended'
-        ? this._tokenUsageDeltaFromFullOutput(full)
+        ? tokenUsageDeltaFromFullOutput(this._pendingInteractionsPort(), full)
         : this._recordTurnCompletion(full, { persist: false });
     await this._raceActiveTurnWaiter(
       this._maybeCaptureSuspend(full, item.id, modeId ?? item.mode ?? this._record.modeId, undefined, {
@@ -20136,60 +15495,11 @@ export class Session {
    * mirroring the non-v1 harness file-part pattern, so the agent turn actually
    * receives the attachment, not just the dedup identity.
    */
-  private async _buildSignalContentsWithAttachments(
+  private _buildSignalContentsWithAttachments(
     content: string,
     attachments: PersistedAttachment[] | undefined,
   ): Promise<AgentSignalContents> {
-    if (attachments === undefined || attachments.length === 0) {
-      return content;
-    }
-    const parts: Array<
-      { type: 'text'; text: string } | { type: 'file'; data: string; mediaType: string; filename?: string }
-    > = [{ type: 'text', text: content }];
-    for (const attachment of attachments) {
-      if (attachment.kind === 'url') {
-        // A URL-only attachment carries no bytes to inline; surface it as a file
-        // reference so the model still sees the link + filename.
-        parts.push({ type: 'file', data: attachment.url, mediaType: attachment.mimeType, filename: attachment.name });
-        continue;
-      }
-      const loaded = await this._storage.loadAttachment({
-        harnessName: this._record.harnessName,
-        sessionId: attachment.ownerSessionId,
-        attachmentId: attachment.attachmentId,
-      });
-      if (!loaded) {
-        throw new HarnessAttachmentUnavailableError(attachment.ownerSessionId, 'not_found', attachment.attachmentId);
-      }
-      const base64 = Buffer.from(loaded.data).toString('base64');
-      // Inline both image and non-image attachment bytes through the AI SDK v5
-      // file-part shape (a `data:<mime>;base64,<bytes>` URL). The v5 image-part
-      // shape keys on `image`/`mediaType`, not `data`/`mimeType`, so a hand-built
-      // `{ type: 'image', data, mimeType }` part silently drops its bytes when
-      // MessageList runs `convertImageFilePart` (it reads `part.image`, which is
-      // undefined). The file shape preserves bytes for image/* mime types too —
-      // `convertToDataContent` decodes the data URL regardless of media type — so
-      // one code path covers every inline attachment.
-      parts.push({
-        type: 'file',
-        data: `data:${attachment.mimeType};base64,${base64}`,
-        mediaType: attachment.mimeType,
-        filename: attachment.name,
-      });
-    }
-    // Upstream signals API (#merge): AgentSignalContents is a bare parts array.
-    return parts as AgentSignalContents;
-  }
-
-  /**
-   * [PF-7749] Whether a tool's interaction pre-registration belongs to this
-   * session's active run. A nested agent-as-tool run inherits this session's
-   * Harness slot but is not this session's run; its interaction stays with
-   * the suspend capture of the run that owns it. A registration without a run
-   * id targets the active run.
-   */
-  private _ownsPreRegistrationRun(runId: string | undefined): boolean {
-    return runId === undefined || runId === this._currentRunId;
+    return buildSignalContentsWithAttachments(this._signalsPort(), content, attachments);
   }
 
   /**
@@ -20202,241 +15512,22 @@ export class Session {
     }
   }
 
-  /**
-   * [PF-8058] The origin a tool pre-registration stamps on its pending: the
-   * owned `signal()` turn's signal, when `runId` is the run that turn
-   * dispatched. This is the `originSignalId` the suspend capture would add.
-   */
-  private _preRegistrationOrigin(runId: string): { originSignalId?: string } {
-    const origin = this._ownedSignalTurnOrigin;
-    return origin !== undefined && origin.runId === runId ? { originSignalId: origin.signalId } : {};
-  }
-
-  private async _registerQuestion(
+  private _registerQuestion(
     params: RegisterQuestionParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerQuestion');
-    if (typeof params.questionId !== 'string' || params.questionId.length === 0) {
-      throw new HarnessValidationError('ctx.registerQuestion.questionId', 'must be a non-empty string');
-    }
-    if (typeof params.question !== 'string' || params.question.length === 0) {
-      throw new HarnessValidationError('ctx.registerQuestion.question', 'must be a non-empty string');
-    }
-    if (
-      params.selectionMode !== undefined &&
-      params.selectionMode !== 'single_select' &&
-      params.selectionMode !== 'multi_select'
-    ) {
-      throw new HarnessValidationError('ctx.registerQuestion.selectionMode', 'must be single_select or multi_select');
-    }
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.questionId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerQuestion.runId', 'active run id is required');
-    }
-    if (!this._ownsPreRegistrationRun(params.runId)) return;
-    const pending: PendingResume = {
-      kind: 'question',
-      itemId: params.questionId,
-      runId,
-      toolCallId,
-      toolName: ASK_USER_TOOL_NAME,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('question'),
-      modeId: params.modeId ?? this._record.modeId,
-      // §4.2e — carry the active turn's yolo so a later tool approval on the
-      // resumed run is still auto-granted (pre-registered pendings win over the
-      // suspend-capture merge, so yolo must be stamped here too).
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        params.modeId ?? this._record.modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        question: params.question,
-        ...(params.options ? { options: params.options } : {}),
-        ...(params.selectionMode ? { selectionMode: params.selectionMode } : {}),
-      },
-    };
-    let registered = false;
-    let occupied = false;
-    await this._flushUpdate(prev => {
-      const slot = preRegistrationSlot(prev.pendingResume, 'question', runId, toolCallId);
-      registered = slot === 'free';
-      occupied = slot === 'occupied';
-      return registered ? { ...prev, pendingResume: pending } : prev;
-    });
-    if (occupied) return;
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerQuestion(this._pendingInteractionsPort(), params);
   }
 
-  private async _registerSandboxAccess(
+  private _registerSandboxAccess(
     params: RegisterSandboxAccessParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerSandboxAccess');
-    if (typeof params.requestId !== 'string' || params.requestId.length === 0) {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.requestId', 'must be a non-empty string');
-    }
-    const validSemanticTypes = new Set(['file', 'command', 'network', 'mcp', 'custom']);
-    if (!validSemanticTypes.has(params.semanticType)) {
-      throw new HarnessValidationError(
-        'ctx.registerSandboxAccess.semanticType',
-        "must be one of 'file' | 'command' | 'network' | 'mcp' | 'custom'",
-      );
-    }
-    if (params.reason !== undefined && typeof params.reason !== 'string') {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.reason', 'must be a string when provided');
-    }
-    const sanitizedPayload =
-      params.payload !== undefined ? assertJsonValue(params.payload, 'ctx.registerSandboxAccess.payload') : undefined;
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.requestId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerSandboxAccess.runId', 'active run id is required');
-    }
-    const modeId = params.modeId ?? this._record.modeId;
-    const pending: PendingResume = {
-      kind: 'sandbox-access',
-      itemId: params.requestId,
-      runId,
-      toolCallId,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('sandbox-access'),
-      modeId,
-      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        sandboxAccess: {
-          semanticType: params.semanticType,
-          ...(params.reason !== undefined ? { reason: params.reason } : {}),
-          ...(sanitizedPayload !== undefined ? { payload: sanitizedPayload } : {}),
-        },
-      },
-    };
-    let registered = false;
-    await this._flushUpdate(prev => {
-      const current = prev.pendingResume;
-      if (current) {
-        const currentSandboxAccess = current.payload?.sandboxAccess;
-        if (
-          current.kind === 'sandbox-access' &&
-          current.runId === runId &&
-          current.toolCallId === toolCallId &&
-          current.itemId === params.requestId &&
-          currentSandboxAccess?.semanticType === params.semanticType &&
-          currentSandboxAccess?.reason === params.reason &&
-          jsonValuesEqual(currentSandboxAccess?.payload, sanitizedPayload)
-        ) {
-          return prev;
-        }
-        throw new HarnessValidationError('ctx.registerSandboxAccess', `pending resume is already "${current.kind}"`);
-      }
-      registered = true;
-      return { ...prev, pendingResume: pending };
-    });
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    // §10.2: sandbox/path-access has no dedicated event — it projects to
-    // question_pending via the captured pending resume.
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerSandboxAccess(this._pendingInteractionsPort(), params);
   }
 
-  private async _registerPlanApproval(
+  private _registerPlanApproval(
     params: RegisterPlanApprovalParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
-    this._assertOpenForTurn('ctx.registerPlanApproval');
-    if (typeof params.planId !== 'string' || params.planId.length === 0) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.planId', 'must be a non-empty string');
-    }
-    if (params.title !== undefined && typeof params.title !== 'string') {
-      throw new HarnessValidationError('ctx.registerPlanApproval.title', 'must be a string when provided');
-    }
-    if (typeof params.plan !== 'string' || params.plan.length === 0) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.plan', 'must be a non-empty string');
-    }
-    const runId = params.runId ?? this._currentRunId;
-    const toolCallId = params.toolCallId ?? params.planId;
-    if (!runId) {
-      throw new HarnessValidationError('ctx.registerPlanApproval.runId', 'active run id is required');
-    }
-    if (!this._ownsPreRegistrationRun(params.runId)) return;
-    const submittingModeId = params.modeId ?? this._record.modeId;
-    const submittingMode = this._harness._getMode(submittingModeId);
-    const pending: PendingResume = {
-      kind: 'plan-approval',
-      itemId: params.planId,
-      runId,
-      toolCallId,
-      toolName: SUBMIT_PLAN_TOOL_NAME,
-      ...this._pendingResumeSourceFields(),
-      ...this._preRegistrationOrigin(runId),
-      ...this._newPendingInteractionTiming('plan-approval'),
-      modeId: submittingModeId,
-      // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
-      ...(this._currentTurnYolo ? { yolo: true } : {}),
-      runtimeDependencies: this._harness._runtimeDependenciesForMode(
-        submittingModeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
-      ),
-      // §5.1 — carry the active turn's caller app bag onto the pending resume.
-      ...(this._currentTurnRequestContext
-        ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
-        : {}),
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-      ...(this._currentToolSurfaceFenceSnapshot(runId)
-        ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
-        : {}),
-      ...this._subagentBudgetSpentProjection(),
-      payload: {
-        ...(params.title !== undefined ? { title: params.title } : {}),
-        plan: params.plan,
-      },
-      ...(submittingMode.transitionsTo ? { transitionModeId: submittingMode.transitionsTo } : {}),
-    };
-    let registered = false;
-    let occupied = false;
-    await this._flushUpdate(prev => {
-      const slot = preRegistrationSlot(prev.pendingResume, 'plan-approval', runId, toolCallId);
-      registered = slot === 'free';
-      occupied = slot === 'occupied';
-      return registered ? { ...prev, pendingResume: pending } : prev;
-    });
-    if (occupied) return;
-    if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
-    if (!registered) return;
-    if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
+    return registerPlanApproval(this._pendingInteractionsPort(), params);
   }
 
   /**
@@ -20724,15 +15815,6 @@ export class Session {
     this._queueWakeAt = undefined;
   }
 
-  /** TM-6 — cancel any pending reconcile-on-rehydrate retry timers on teardown. */
-  private _clearDelegationReconcileTimers(): void {
-    for (const timer of this._delegationReconcileRetryTimers) clearTimeout(timer);
-    this._delegationReconcileRetryTimers.clear();
-    this._delegationReconcileRerunRequested = false;
-    for (const watch of this._delegationNoticeWatches.values()) watch.dispose();
-    this._delegationNoticeWatches.clear();
-  }
-
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
     if (this._queueHead.resolverCount === 0) {
       timer.unref?.();
@@ -20946,19 +16028,19 @@ export class Session {
         // cumulative usage must also advance the parked pending's durable
         // baseline — otherwise a crash between the two leaves a stale
         // `accountedTokenUsage` and a cold settlement retry double-counts.
-        const resumeUsageBaseline = this._resumeUsageBaseline;
-        if (resumeUsageBaseline !== undefined && next.pendingResume !== undefined) {
+        if (next.pendingResume !== undefined) {
           const parked = next.pendingResume;
-          if (
+          const resumeUsageBaseline = this._resumeUsageFence.baselineFor(() =>
             pendingInteractionGenerationKey({
               kind: parked.kind,
               itemId: parked.itemId,
               runId: parked.runId,
               toolCallId: parked.toolCallId,
               requestedAt: parked.requestedAt,
-            }) === resumeUsageBaseline.generationKey
-          ) {
-            next.pendingResume = { ...parked, accountedTokenUsage: resumeUsageBaseline.runUsage };
+            }),
+          );
+          if (resumeUsageBaseline !== undefined) {
+            next.pendingResume = { ...parked, accountedTokenUsage: resumeUsageBaseline };
           }
         }
         // PF-2251 D2/D4 — receipts stay bounded on EVERY persisted record, at
@@ -21060,23 +16142,20 @@ export class Session {
           };
           // Disarm the resume-usage fence once the parked generation is gone
           // (pending-clearing flush) or was superseded by a different one.
-          const armedBaseline = this._resumeUsageBaseline;
-          if (armedBaseline !== undefined) {
-            const parkedNow = this._record.pendingResume;
-            if (
-              parkedNow === undefined ||
-              pendingInteractionGenerationKey({
-                kind: parkedNow.kind,
-                itemId: parkedNow.itemId,
-                runId: parkedNow.runId,
-                toolCallId: parkedNow.toolCallId,
-                requestedAt: parkedNow.requestedAt,
-              }) !== armedBaseline.generationKey
-            ) {
-              this._resumeUsageBaseline = undefined;
-            }
-          }
-          this._syncPendingInteractionExpiryTimer();
+          const parkedNow = this._record.pendingResume;
+          this._resumeUsageFence.disarmUnlessParked(
+            parkedNow === undefined
+              ? undefined
+              : () =>
+                  pendingInteractionGenerationKey({
+                    kind: parkedNow.kind,
+                    itemId: parkedNow.itemId,
+                    runId: parkedNow.runId,
+                    toolCallId: parkedNow.toolCallId,
+                    requestedAt: parkedNow.requestedAt,
+                  }),
+          );
+          syncPendingInteractionExpiryTimer(this._pendingInteractionsPort());
           // §10.2 state_changed — emit only when durable `session.state` actually
           // changed, after the record is committed so subscribers reading state
           // see the post-write value.
@@ -21267,14 +16346,6 @@ export class Session {
       // this fence also restores in-place edits to a retained tool object.
       fence: createToolSurfaceFence(sourceTools),
     };
-  }
-
-  /** Retain the admission-time definition snapshot for a later same-process resume. */
-  private _retainCurrentReplacementToolSurface(runId: string): void {
-    const current = this._currentTurnReplacementToolSurface;
-    if (!current) return;
-    this._pendingReplacementToolSurfaces.clear();
-    this._pendingReplacementToolSurfaces.set(runId, current.fence);
   }
 
   /**
@@ -21530,11 +16601,6 @@ export class Session {
     return requestContext;
   }
 
-  private _currentToolSurfaceFenceSnapshot(runId: string): string[] | undefined {
-    const fence = readToolSurfaceFence(this._currentAgentRequestContext, runId);
-    return fence ? [...fence.allowedNames] : undefined;
-  }
-
   /**
    * Whether the §4.2e permission gate is engaged for this session. True when the
    * session has ANY per-tool/category rule, OR the harness `defaultPermissionPolicy`
@@ -21632,7 +16698,7 @@ export class Session {
    * its notice owed. A no-op unless the session is live.
    */
   _internalRearmDelegationReconcile(): void {
-    this._scheduleDelegationReconcileRetry(0);
+    return internalRearmDelegationReconcile(this._delegationDriverPort());
   }
 
   /**
@@ -21754,19 +16820,28 @@ export class Session {
   _markClosed(updatedRecord: SessionRecord): void {
     this._clearQueueWakeTimer();
     this._clearPendingInteractionExpiryTimer();
-    this._clearDelegationReconcileTimers();
+    clearDelegationReconcileTimers(this._delegationDriverPort());
     this._leaseExtensionDeadline = undefined;
     this._record = updatedRecord;
     this._state = 'closed';
-    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
-    // that will never reach a terminal here) so they cannot accumulate.
-    this._openRuns.clear();
-    this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._clearTeardownCollections();
     this._drainAllTerminalObservers(new HarnessSessionClosedError(this.id));
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
+  }
+
+  /**
+   * The per-session collections that `_markClosed`, `_markDeleted` and
+   * `_markEvicted` all clear, at the same point and in the same order
+   * (PF-8699). Only plain clears belong here: drains, rejections, timer
+   * clears and state transitions stay in each method, in their own order.
+   */
+  private _clearTeardownCollections(): void {
+    // Span-summary: drop any in-flight run spans (e.g. an abandoned suspended run
+    // that will never reach a terminal here) so they cannot accumulate.
+    this._runSpans.dispose();
+    this._runToolReceipts.clear();
+    this._replacementToolSurface.dispose();
   }
 
   /** @internal — used by Harness hard-delete after storage has removed the row. */
@@ -21775,10 +16850,7 @@ export class Session {
     this._leaseExtensionDeadline = undefined;
     this._clearPendingInteractionExpiryTimer();
     this._state = 'deleted';
-    this._openRuns.clear();
-    this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._clearTeardownCollections();
     this._drainAllTerminalObservers(err);
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
@@ -21796,7 +16868,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
-    this._clearDelegationReconcileTimers();
+    clearDelegationReconcileTimers(this._delegationDriverPort());
     this._queueHead.release();
     this._queueHead.rejectAll(err);
     this._tearDownThreadSubscription(err);
@@ -21804,7 +16876,7 @@ export class Session {
 
   /** @internal — signal identities that may have written operation evidence for this live session. */
   _deletedOperationEvidenceSignalIds(): string[] {
-    return Array.from(this._operationEvidenceSignalIds);
+    return deletedOperationEvidenceSignalIds(this._signalsPort());
   }
 
   /** @internal — harness bridge subscription that remains valid while closing. */
@@ -21824,10 +16896,7 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;
     this._state = 'evicted';
-    this._openRuns.clear();
-    this._runToolReceipts.clear();
-    this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._clearTeardownCollections();
     this._drainAllTerminalObservers(err);
     this._tearDownThreadSubscription(err);
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
@@ -21844,7 +16913,7 @@ export class Session {
       this._queuedResumeRecoveryTimer = undefined;
     }
     this._clearQueueWakeTimer();
-    this._clearDelegationReconcileTimers();
+    clearDelegationReconcileTimers(this._delegationDriverPort());
     this._queueHead.release();
     this._queueHead.rejectAll(err);
   }
@@ -21881,7 +16950,7 @@ export class Session {
   /**
    * Synchronous teardown for the thread subscription on close/evict/delete.
    * Unsubscribes, marks the subscription closed, and rejects every outstanding entry in
-   * `_runCompletionPromises` so awaiters don't hang on a dead subscription.
+   * `_runCompletionWaiters` so awaiters don't hang on a dead subscription.
    * The drain loop's `for-await` exits naturally once `unsubscribe()` wakes it.
    */
   private _tearDownThreadSubscription(reason: unknown): void {
@@ -22197,34 +17266,6 @@ export class Session {
   // -------------------------------------------------------------------------
 
   /**
-   * Liveness, admission, subagent type, and §8 depth checks shared by
-   * `task_delegate` and its preflight. Reads only: nothing is written.
-   */
-  private _preflightPlanTaskDelegate(
-    input: { agentType: string; modelOverride?: string },
-    callerSignal?: AbortSignal,
-  ): { admissionEpoch: number; def: SubagentDefinition; childDepth: number } {
-    this._assertLive('task_delegate');
-    const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
-    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    const def = this._harness._getSubagentType(input.agentType);
-    if (!def) {
-      throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
-    }
-    if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
-      throw new HarnessValidationError('modelOverride', 'must be a string when provided');
-    }
-    // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
-    // spawn tool's pre-creation gate).
-    const childDepth = this.subagentDepth + 1;
-    const maxDepth = this._harness._getSubagentMaxDepth();
-    if (childDepth > maxDepth) {
-      throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
-    }
-    return { admissionEpoch, def, childDepth };
-  }
-
-  /**
    * @internal — `task_delegate` without a `taskId`. Runs the checks that do not
    * depend on a plan task, including the delegated body's byte limit, so the
    * tool can refuse a delegation that cannot start before it adds the task.
@@ -22237,16 +17278,7 @@ export class Session {
     input: { agentType: string; task?: string; modelOverride?: string },
     callerSignal?: AbortSignal,
   ): number {
-    if (input.task !== undefined) {
-      const bytes = new TextEncoder().encode(input.task).byteLength;
-      if (bytes > PLAN_TASK_DELEGATED_BODY_MAX_BYTES) {
-        throw new HarnessValidationError(
-          'task',
-          `must be at most ${PLAN_TASK_DELEGATED_BODY_MAX_BYTES} UTF-8 bytes; received ${bytes}`,
-        );
-      }
-    }
-    return this._preflightPlanTaskDelegate(input, callerSignal).admissionEpoch;
+    return planTaskDelegatePreflight(this._delegationDriverPort(), input, callerSignal);
   }
 
   /**
@@ -22288,7 +17320,7 @@ export class Session {
    * `_planTaskDelegatePreflight`, admits this delegation under the epoch the
    * caller's earlier work was admitted under instead of a fresh one.
    */
-  async _planTaskDelegate(
+  _planTaskDelegate(
     input: {
       taskId: string;
       agentType: string;
@@ -22303,270 +17335,16 @@ export class Session {
     parentTracingContext?: TracingContext,
     callerAdmissionEpoch?: number,
   ): Promise<PlanTaskView & { subagentSessionId: string }> {
-    const preflight = this._preflightPlanTaskDelegate(input, callerSignal);
-    const { def, childDepth } = preflight;
-    const admissionEpoch = callerAdmissionEpoch ?? preflight.admissionEpoch;
-    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    const delegatedRequestContext = projectInheritedRequestContextApp(
+    return sessionPlanTaskDelegate(
+      this._delegationDriverPort(),
+      input,
+      callerSignal,
+      parentToolCallId,
+      parentRunId,
       callerRequestContext,
-      this._harness._getSubagentInheritedRequestContextAppKeys(),
-    );
-    const sourceWriteGuard = this._delegatingRunSourceWriteGuard(callerRequestContext);
-
-    // Reject unknown, already-running, or dependency-blocked tasks before
-    // reserving capacity or creating a durable child. The fenced link commit
-    // repeats the same eligibility checks after child creation.
-    const scopeSnapshot = await this._serializePlanTaskWrite(() =>
-      capturePlanTaskDelegationScope(this._planTaskPort(), input.taskId, input.includeSubtree === true),
-    );
-    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    let taskBody = input.task ?? scopeSnapshot.view.content;
-    if (input.includeSubtree) {
-      // Surface the delegated subtree SUBSET so the subagent sees the unit it
-      // owns. This is a LOSSLESS transfer: every node keeps its stable taskId,
-      // parent edge, status, sibling order, and blockedBy ids, rendered by true
-      // depth (computed from the parent chain, not a flat one-level indent). A
-      // clipped subtree appends an explicit truncation marker so the subagent
-      // knows the unit it received is incomplete.
-      taskBody = `${taskBody}\n\n${this._renderDelegatedSubtree(input.taskId, scopeSnapshot.tasks, false)}`;
-    }
-    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-
-    // Durable delegation and inline spawn share the same parent-local
-    // backpressure reservation. Claim it before child creation/linking so the
-    // detached API cannot bypass `subagents.maxConcurrent`.
-    const reservation = this._internalTryReserveSubagentExecution();
-    if (!reservation.reserved) {
-      throw new HarnessSubagentConcurrencyLimitError(reservation.maxConcurrent, reservation.inFlight);
-    }
-
-    // Allocate the child identity and commit the durable plan ownership edge
-    // BEFORE creating the child row. A crash in this order leaves a link to a
-    // missing child, which recovery deterministically fails closed. The former
-    // create-then-link order could leave an unreferenced active descendant whose
-    // old-owner lease later poisoned root subtree renewal.
-    const childSessionId = `sess-${randomUUID()}`;
-    // Claim before the link write awaits storage. A reconciliation wakeup that
-    // observes the committed link before child allocation must not classify the
-    // intentionally-not-yet-created child as missing.
-    this._delegationDriverClaims.add(childSessionId);
-    const delegationStartedAt = Date.now();
-    const delegationDeadlineAt = delegationStartedAt + this._harness._getSubagentDelegationTimeoutMs();
-    let view: PlanTaskView;
-    try {
-      view = await this._serializePlanTaskWrite(() =>
-        planTaskDelegate(this._planTaskPort(), {
-          taskId: input.taskId,
-          subagentSessionId: childSessionId,
-          subagentTypeId: input.agentType,
-          includeSubtree: input.includeSubtree === true,
-          taskBody,
-          startedAt: delegationStartedAt,
-          deadlineAt: delegationDeadlineAt,
-          expectedScopeFingerprint: scopeSnapshot.fingerprint,
-          ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
-          ...(parentRunId !== undefined ? { parentRunId } : {}),
-          parentModeId: this._currentRunModeId ?? this._record.modeId,
-          ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
-          ...(sourceWriteGuard !== undefined ? { sourceWriteGuard } : {}),
-        }),
-      );
-      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    } catch (error) {
-      // No child exists yet. If the link committed before active-work
-      // invalidation won, clear it to a durable failed terminal state.
-      await this._reconcileDelegatedTask(input.taskId, childSessionId, 'failed');
-      this._delegationDriverClaims.delete(childSessionId);
-      this._internalReleaseSubagentExecution();
-      throw error;
-    }
-
-    // Create the durable subagent SESSION (reuse the subagent-tool creation path:
-    // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
-    // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
-    // tracked by the plan task across turns.
-    let child: Session;
-    try {
-      child = await this._harness.session({
-        sessionId: childSessionId,
-        resourceId: this.resourceId,
-        threadId: { fresh: true },
-        parentSessionId: this.id,
-        origin: 'subagent-tool',
-        // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
-        // documented), not the harness default mode.
-        modeId: def.modeId ?? this._record.modeId,
-        modelId: input.modelOverride ?? def.defaultModelId,
-        subagentDepth: childDepth,
-        // M4 — persist the type so the durable delegated child's per-subagent
-        // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
-        // hydrate, not only this parent's delegation-reattach.
-        subagentTypeId: input.agentType,
-      });
-    } catch (error) {
-      await this._reconcileDelegatedTask(input.taskId, childSessionId, 'failed');
-      this._delegationDriverClaims.delete(childSessionId);
-      this._internalReleaseSubagentExecution();
-      throw error;
-    }
-    const subagentWorkspaceMode = def.workspace ?? 'inherit';
-    child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
-    if (def.tools) child._subagentToolsOverride = def.tools;
-    if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
-    const delegationParentToolCallId = view.delegation?.parentToolCallId ?? `delegate:${input.taskId}`;
-    child._subagentParentToolCallId = delegationParentToolCallId;
-
-    // Stop/revision may have won while child creation was awaiting storage.
-    // The unlinked child has done no provider work, so close it and fail the
-    // stale tool call before it can create an ownership edge.
-    try {
-      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    } catch (error) {
-      // The plan ownership edge was committed before child allocation. Close
-      // the child before clearing that edge: if close fails, retaining the link
-      // keeps the active descendant discoverable and retryable by recovery.
-      let childClosed = false;
-      try {
-        await child.close();
-        childClosed = true;
-      } catch {
-        this._scheduleDelegationReconcileRetry(0);
-      }
-      if (childClosed) await this._reconcileDelegatedTask(input.taskId, child.id, 'failed');
-      this._delegationDriverClaims.delete(childSessionId);
-      this._internalReleaseSubagentExecution();
-      throw error;
-    }
-
-    // A Stop can begin while the fenced link transaction is in flight. It may
-    // have completed discovery before this new link became visible, so the
-    // delegate itself must settle the now-stale attempt and never start it.
-    try {
-      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-      const linkStillCurrent = await this._delegationLinkIsCurrent(input.taskId, child.id);
-      this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-      if (!linkStillCurrent) {
-        throw new HarnessValidationError(
-          'taskId',
-          `delegation ownership for task "${input.taskId}" changed during child allocation`,
-        );
-      }
-    } catch (error) {
-      try {
-        await child._cancelInternal({ reason: 'parent_work_aborted', requestedBy: this.id }, this.id);
-      } catch {
-        // The exact task link below still fails closed even if child cleanup
-        // races another owner; reconciliation remains retryable from storage.
-      }
-      let childClosed = false;
-      try {
-        await child.close();
-        childClosed = true;
-      } catch {
-        this._scheduleDelegationReconcileRetry(0);
-      }
-      if (childClosed) await this._reconcileDelegatedTask(input.taskId, child.id, 'failed');
-      this._delegationDriverClaims.delete(childSessionId);
-      this._internalReleaseSubagentExecution();
-      throw error;
-    }
-
-    // Track for display (mirrors the spawn tool) keyed by the subagent id so a
-    // delegated subagent renders while it runs.
-    this._activeSubagents.set(`delegate:${child.id}`, {
-      subagentSessionId: child.id,
-      agentType: input.agentType,
-      task: taskBody,
-      parentToolCallId: delegationParentToolCallId,
-      startedAt: delegationStartedAt,
-      status: 'running',
-    });
-
-    // Arm the live completion hook. Delegation uses an admitted SIGNAL instead
-    // of `message()`: signal evidence remains `pending` while the child is
-    // suspended, carries the pending interaction's `originSignalId`, and settles
-    // only after a later resume terminalizes. That gives detached HITL a durable
-    // join handle across reconnects/restarts rather than falsely completing and
-    // closing the child at the first `finishReason: suspended` segment.
-    void this._driveDelegatedSubagent(
-      input.taskId,
-      child,
-      taskBody,
-      input.agentType,
-      child._record.modelId,
-      delegationStartedAt,
-      delegationDeadlineAt,
-      delegationParentToolCallId,
-      delegatedRequestContext?.app,
       parentTracingContext,
+      callerAdmissionEpoch,
     );
-
-    return { ...view, subagentSessionId: child.id };
-  }
-
-  /**
-   * @internal — render a delegated subtree subset as a LOSSLESS structured block
-   * for the subagent. Each node keeps its stable `taskId`, parent edge, status,
-   * sibling order, and `blockedBy` ids, indented by its TRUE depth (computed from
-   * the in-subset parent chain). Nodes are ordered as a stable pre-order
-   * traversal (siblings by `order`, then `taskId`) so the same subtree always
-   * renders identically. A clipped subtree (the storage `truncated` flag, or a
-   * node whose parent fell outside the returned page) appends an explicit
-   * truncation marker so the subagent knows its unit is incomplete.
-   */
-  private _renderDelegatedSubtree(rootTaskId: string, tasks: HarnessPlanTask[], storageTruncated: boolean): string {
-    const byId = new Map(tasks.map(t => [t.taskId, t]));
-    const childrenOf = new Map<string | undefined, HarnessPlanTask[]>();
-    let parentDropped = false;
-    for (const t of tasks) {
-      // A node whose parent is not in the returned page (other than the root,
-      // whose parent is intentionally outside the subset) means the subtree was
-      // clipped above this node — flag it as truncated.
-      const parentKey =
-        t.taskId === rootTaskId
-          ? undefined
-          : t.parentTaskId !== undefined && byId.has(t.parentTaskId)
-            ? t.parentTaskId
-            : undefined;
-      if (t.taskId !== rootTaskId && (t.parentTaskId === undefined || !byId.has(t.parentTaskId))) {
-        parentDropped = true;
-      }
-      const bucket = childrenOf.get(parentKey);
-      if (bucket) bucket.push(t);
-      else childrenOf.set(parentKey, [t]);
-    }
-    for (const bucket of childrenOf.values()) {
-      bucket.sort((a, b) =>
-        a.order !== b.order ? a.order - b.order : a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0,
-      );
-    }
-    const lines: string[] = [];
-    const walk = (node: HarnessPlanTask, depth: number): void => {
-      const indent = '  '.repeat(depth);
-      const fields = [`id=${node.taskId}`, `status=${node.status}`, `order=${node.order}`];
-      if (node.blockedBy !== undefined && node.blockedBy.length > 0) {
-        fields.push(`blockedBy=${node.blockedBy.join(',')}`);
-      }
-      lines.push(`${indent}- [${fields.join(' ')}] ${node.content}`);
-      for (const child of childrenOf.get(node.taskId) ?? []) walk(child, depth + 1);
-    };
-    const root = byId.get(rootTaskId);
-    if (root) walk(root, 0);
-    let block = `Delegated subtree (lossless — taskId/status/order/blockedBy preserved):\n${lines.join('\n')}`;
-    if (storageTruncated || parentDropped) {
-      block += `\n(TRUNCATED: the subtree was clipped at ${DELEGATED_SUBTREE_MAX_NODES} nodes; some descendants are not shown.)`;
-    }
-    return block;
-  }
-
-  /**
-   * @internal — deterministic `admissionId` for a delegated subagent signal.
-   * Stable across restarts so re-issuing it re-attaches to the original durable
-   * signal result (including a suspended run) instead of dispatching duplicate
-   * specialist work.
-   */
-  private _delegationAdmissionId(taskId: string): string {
-    return delegationAdmissionId(this.id, taskId);
   }
 
   /**
@@ -22575,7 +17353,7 @@ export class Session {
    * only after a terminal resume. On terminal settlement this reconciles the
    * plan task, closes the child, and releases the shared parent reservation.
    */
-  private async _driveDelegatedSubagent(
+  private _driveDelegatedSubagent(
     taskId: string,
     child: Session,
     taskBody: string,
@@ -22587,266 +17365,19 @@ export class Session {
     requestContextApp?: Record<string, JsonValue>,
     parentTracingContext?: TracingContext,
   ): Promise<void> {
-    let outcome: DelegatedSubagentOutcome = 'failed';
-    let rawResult: unknown;
-    let publicError: { code: string; message: string } | undefined;
-    let budgetExhausted: HarnessSubagentBudgetExhaustion | undefined;
-    // §SA2 — fold the detached child's live progress into the parent's display
-    // projection (the delegate path has no event bridge of its own, unlike the
-    // spawn tool). Unsubscribed in the finally below.
-    const progressKey = `delegate:${child.id}`;
-    const childDepth = child.subagentDepth;
-    const innerToolNames = new Map<string, string>();
-    child._subagentParentToolCallId = parentToolCallId;
-    // PF-5620: stream the child's answer (its report `summary`) like the spawn tool does.
-    child._subagentAnswerDeltaListener = (delta, reportToolCallId) => {
-      this._emitSubagentEvent({
-        type: 'subagent_answer_delta',
-        toolCallId: parentToolCallId,
-        subagentSessionId: child.id,
-        agentType,
-        innerToolCallId: reportToolCallId,
-        delta,
-        depth: childDepth,
-      });
-    };
-    const unsubProgress = child.subscribe(event => {
-      this._internalUpdateSubagentProgress(progressKey, event);
-      switch (event.type) {
-        case 'text_delta':
-          if (event.delta.length > 0) {
-            this._emitSubagentEvent({
-              type: 'subagent_text_delta',
-              toolCallId: parentToolCallId,
-              subagentSessionId: child.id,
-              agentType,
-              delta: event.delta,
-              depth: childDepth,
-            });
-          }
-          break;
-        case 'reasoning_delta':
-          if (event.delta.length > 0) {
-            this._emitSubagentEvent({
-              type: 'subagent_reasoning_delta',
-              toolCallId: parentToolCallId,
-              subagentSessionId: child.id,
-              agentType,
-              delta: event.delta,
-              depth: childDepth,
-            });
-          }
-          break;
-        case 'tool_start':
-          innerToolNames.set(event.toolCallId, event.toolName);
-          this._emitSubagentEvent({
-            type: 'subagent_tool_start',
-            toolCallId: parentToolCallId,
-            subagentSessionId: child.id,
-            agentType,
-            innerToolCallId: event.toolCallId,
-            toolName: event.toolName,
-            input: event.input,
-            depth: childDepth,
-          });
-          break;
-        case 'tool_end': {
-          const toolName = innerToolNames.get(event.toolCallId) ?? event.toolName;
-          innerToolNames.delete(event.toolCallId);
-          this._emitSubagentEvent({
-            type: 'subagent_tool_end',
-            toolCallId: parentToolCallId,
-            subagentSessionId: child.id,
-            agentType,
-            innerToolCallId: event.toolCallId,
-            toolName,
-            output: event.output,
-            isError: event.isError ?? false,
-            ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
-            depth: childDepth,
-          });
-          break;
-        }
-        case 'tool_approval_required':
-        case 'tool_suspension_required':
-        case 'question_pending':
-        case 'plan_approval_required':
-          this._emitDelegatedSubagentPendingEvent(event, {
-            parentToolCallId,
-            subagentSessionId: child.id,
-          });
-          break;
-      }
-    });
-    this._emitSubagentEvent({
-      type: 'subagent_start',
-      toolCallId: parentToolCallId,
-      subagentSessionId: child.id,
+    return driveDelegatedSubagent(
+      this._delegationDriverPort(),
+      taskId,
+      child,
+      taskBody,
       agentType,
-      task: taskBody,
       modelId,
-      depth: childDepth,
-    });
-    // The delegation outlives the delegating tool call, so its child runs
-    // attach to a detached-lifetime delegation span in the parent trace
-    // (subagent-tracing.ts). It covers the whole drive through settlement and
-    // is started immediately before the try blocks whose last finally ends it.
-    // A restart re-drive has no live parent span; its child runs start their
-    // own trace.
-    const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
-    child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
-    try {
-      // The deadline covers admission/dispatch as well as the eventual result.
-      // Racing only the returned result leaves a storage/provider stall inside
-      // signal() itself able to retain the parent reservation forever.
-      const terminal = await waitForDelegationResult(
-        child
-          .signal({
-            content: taskBody,
-            admissionId: this._delegationAdmissionId(taskId),
-            ...(requestContextApp !== undefined ? { requestContext: { app: requestContextApp } } : {}),
-          })
-          .then(dispatched => dispatched.result),
-        deadlineAt,
-      );
-      if (terminal === DELEGATION_DEADLINE_REACHED) {
-        // Commit cancellation before settlement so the child cannot continue
-        // mutating tools after its parent task has released ownership.
-        try {
-          await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: this.id }, this.id);
-        } catch {
-          // Child closure below remains the ownership prerequisite. A failed
-          // cancel/close retains the durable link for restart reconciliation.
-        }
-        // The first cancel request wins: a targeted cancel committed before the
-        // deadline still settles `cancelled`, as restart reconcile would.
-        if (isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)) {
-          outcome = 'cancelled';
-          publicError = { ...DELEGATED_SUBAGENT_CANCELLED_ERROR };
-        } else {
-          outcome = 'failed';
-          publicError = {
-            code: 'harness.delegation_timeout',
-            message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
-          };
-        }
-      } else {
-        rawResult = terminal;
-        const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
-        const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
-        const declaredTerminalText = parseHarnessTerminalToolResultText(
-          (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
-        );
-        const report = verifyHarnessSubagentTerminalCompletion(rawResult);
-        // Provider finishReason is transport termination, not semantic task success.
-        // A delegated task settles only from the exact framework-owned report
-        // terminal envelope. Cancellation still overrides any concurrently
-        // produced report; a terminal tool normally ends the provider step as
-        // `tool-calls`, so requiring `stop` would reject every real first-call
-        // terminal delivery.
-        outcome =
-          child._record.cancelRequest === undefined && report !== undefined
-            ? report.outcome
-            : isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)
-              ? 'cancelled'
-              : 'failed';
-        // The framework stopped the child at its per-type budget before it
-        // reported an outcome: a typed partial result, not a generic failure.
-        budgetExhausted =
-          child._record.cancelRequest === undefined && report === undefined
-            ? (parseHarnessSubagentBudgetExhausted(rawResult) ?? child._internalSubagentBudgetExhaustion())
-            : undefined;
-        if (budgetExhausted !== undefined) {
-          publicError = harnessSubagentBudgetExhaustedError(agentType, budgetExhausted);
-        } else if (outcome !== 'completed') {
-          publicError = {
-            code:
-              child._record.cancelRequest !== undefined
-                ? 'harness.subagent_cancelled'
-                : (report?.issue?.code ??
-                  ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
-                    ? 'harness.subagent_evidence_unverified'
-                    : report === undefined
-                      ? 'harness.subagent_outcome_missing'
-                      : 'harness.subagent_incomplete')),
-            message:
-              child._record.cancelRequest !== undefined
-                ? 'The delegated subagent was cancelled before it completed'
-                : (report?.issue?.message ??
-                  (report === undefined
-                    ? declaredReport !== undefined || declaredTerminalText !== undefined
-                      ? 'The delegated subagent terminal completion did not match framework execution receipts'
-                      : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
-                    : `The delegated subagent reported ${report.outcome} after provider finish reason "${finishReason ?? 'missing'}"`)),
-          };
-        }
-      }
-    } catch (error) {
-      // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
-      // Only this parent's own cancel of the child settles as skipped work, and
-      // its error names the cancel rather than the rejection it caused.
-      const parentCancelled = isParentRequestedSubagentCancel(child._record.cancelRequest, this.id);
-      outcome = parentCancelled ? 'cancelled' : 'failed';
-      publicError = parentCancelled ? { ...DELEGATED_SUBAGENT_CANCELLED_ERROR } : projectHarnessPublicError(error);
-    } finally {
-      child._subagentAnswerDeltaListener = undefined;
-      unsubProgress();
-      // In the same step as the active entry goes, so the child never reads as
-      // neither active nor settling here.
-      this._settlingDelegations.add(child.id);
-      this._activeSubagents.delete(`delegate:${child.id}`);
-      child._subagentTracingContext = undefined;
-    }
-    // How the drive settled the delegation, recorded on the delegation span.
-    // Anything but `settled` leaves the durable task to restart reconciliation.
-    let settlement: DelegationDriveSettlement = 'error';
-    try {
-      // The parent's cancel overrides any report the child produced, so the
-      // summary leaves it out, as restart reconcile does.
-      const summary = summarizeHarnessSubagentResult(outcome === 'cancelled' ? undefined : rawResult, {
-        isError: outcome !== 'completed',
-        ...(publicError !== undefined ? { error: publicError } : {}),
-        ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
-      });
-      // Close the terminal child BEFORE clearing its durable plan link. If the
-      // process dies after close, recovery can still settle from signal evidence;
-      // if close fails, retaining the link keeps ownership discoverable and
-      // retryable instead of creating an unlinked active descendant.
-      try {
-        await child.close();
-      } catch {
-        settlement = 'close_failed';
-        this._scheduleDelegationReconcileRetry(0);
-        return;
-      }
-      const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary, {
-        childCancelRequest: child._record.cancelRequest,
-      });
-      if (!reconciled) {
-        settlement = 'not_reconciled';
-        return;
-      }
-      settlement = 'settled';
-      // A successful subagent_end is a durable settlement notification, not a
-      // provider-stop notification. Emit only after child closure and the
-      // fenced plan write both committed so reconnecting UI cannot show a
-      // completed child while the authoritative task remains in_progress.
-      this._emitSubagentEvent({
-        type: 'subagent_end',
-        toolCallId: parentToolCallId,
-        subagentSessionId: child.id,
-        agentType,
-        output: summarizeHarnessSubagentEventResult(summary),
-        isError: outcome !== 'completed',
-        durationMs: Math.max(0, Date.now() - startedAt),
-        depth: childDepth,
-      });
-    } finally {
-      this._settlingDelegations.delete(child.id);
-      this._delegationDriverClaims.delete(child.id);
-      this._internalReleaseSubagentExecution();
-      endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
-    }
+      startedAt,
+      deadlineAt,
+      parentToolCallId,
+      requestContextApp,
+      parentTracingContext,
+    );
   }
 
   /**
@@ -22855,7 +17386,7 @@ export class Session {
    * subagent can terminalize outside any parent turn. Called by the live hook AND
    * reconcile-on-rehydrate.
    */
-  async _reconcileDelegatedTask(
+  _reconcileDelegatedTask(
     taskId: string,
     subagentSessionId: string,
     outcome: DelegatedSubagentOutcome,
@@ -22867,110 +17398,7 @@ export class Session {
      */
     notify?: { childCancelRequest: SessionRecord['cancelRequest'] },
   ): Promise<boolean> {
-    if (this._state === 'closed') return false;
-    // Before the first await, so a wait that begins while this write is in
-    // flight counts the child as running when it began.
-    this._settlingDelegations.add(subagentSessionId);
-    const noticeMode =
-      notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
-    // A Stop that starts after this point must still suppress the wake.
-    const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
-    let releaseRemindSettlement: (() => void) | undefined;
-    try {
-      const durableResult =
-        result ??
-        (outcome === 'cancelled'
-          ? summarizeHarnessSubagentEventResult(
-              summarizeHarnessSubagentResult(undefined, {
-                isError: true,
-                error: { ...DELEGATED_SUBAGENT_CANCELLED_ERROR },
-              }),
-            )
-          : outcome !== 'completed'
-            ? {
-                ...summarizeHarnessSubagentEventResult(
-                  summarizeHarnessSubagentResult(undefined, {
-                    isError: true,
-                    error: {
-                      code: outcome === 'blocked' ? 'harness.delegation_blocked' : 'harness.delegation_failed',
-                      message: `The delegated task ${outcome} without usable terminal result evidence`,
-                    },
-                  }),
-                ),
-                outcome,
-              }
-            : undefined);
-      const reconcileResult = await this._serializePlanTaskWrite(() => {
-        if (noticeMode === 'remind') {
-          const starting = new Promise<void>(resolve => {
-            releaseRemindSettlement = resolve;
-          });
-          this._remindSettlementsStarting.add(starting);
-          void starting.then(() => this._remindSettlementsStarting.delete(starting));
-        }
-        return planTaskReconcileDelegation(this._planTaskPort(), {
-          taskId,
-          subagentSessionId,
-          outcome,
-          ...(durableResult !== undefined ? { result: durableResult } : {}),
-          ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
-          // Before the public delegate_settled event: a wait that event starts
-          // must not take this settlement as one from after its call.
-          onCommitted: () => {
-            this._settlingDelegations.delete(subagentSessionId);
-            for (const listener of Array.from(this._delegatedSettlementListeners)) {
-              try {
-                listener(subagentSessionId);
-              } catch {
-                // A listener only wakes a reader early. One that throws must not
-                // skip the other listeners, the notice below, or reach the
-                // reconcile retry for a settlement that is already durable.
-              }
-            }
-          },
-        });
-      });
-      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
-      if (reconcileResult.notice !== undefined) {
-        this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
-      }
-      return reconcileResult.reconciled;
-    } catch {
-      // Keep a live recovery path even when no future parent message or hydrate
-      // occurs. The durable child signal evidence is the authority; a bounded
-      // scan retry re-reads the exact link and settles it idempotently.
-      this._scheduleDelegationReconcileRetry(0);
-      return false;
-    } finally {
-      this._settlingDelegations.delete(subagentSessionId);
-      releaseRemindSettlement?.();
-    }
-  }
-
-  /**
-   * Notice mode for a detached settlement, or undefined for none. While this
-   * parent is itself cancelled, nothing is owed. Otherwise a `completed`
-   * settlement always owes its notice, even when a cancel landed on the child
-   * after its result was read. This parent's own targeted cancel (whatever its
-   * reason) suppresses only the `cancelled` settlement it caused, and its own
-   * Stop/reset cascade owes none. The driver's durable delegation timeout is an
-   * untargeted cancel and a real settlement the parent model must learn about.
-   */
-  private _delegatedSettlementNoticeMode(
-    childCancelRequest: SessionRecord['cancelRequest'],
-    outcome: DelegatedSubagentOutcome,
-  ): DelegatedSettlementNoticeMode | undefined {
-    const configured = this._harness._getSubagentDelegatedSettlementNotice();
-    if (configured === 'none') return undefined;
-    if (this._record.cancelRequest !== undefined) return undefined;
-    if (outcome === 'completed') return configured;
-    if (isParentRequestedSubagentCancel(childCancelRequest, this.id)) {
-      return outcome === 'cancelled' ? undefined : configured;
-    }
-    if (childCancelRequest?.requestedBy === this.id && childCancelRequest.reason !== 'delegation_timeout') {
-      return undefined;
-    }
-    return configured;
+    return reconcileDelegatedTask(this._delegationDriverPort(), taskId, subagentSessionId, outcome, result, notify);
   }
 
   /**
@@ -23093,14 +17521,7 @@ export class Session {
    * other case is fork main's path.
    */
   private _wakeGrantAllowed(row: WakeReminderRowOrigin | undefined, agent: Agent, modeId: string): boolean {
-    return (
-      row !== undefined &&
-      row.agent === agent &&
-      agent.__fixedMemory() === row.memory &&
-      row.modeId === modeId &&
-      this._record.modeId === modeId &&
-      this._modeSwitchEpoch === row.modeEpoch
-    );
+    return wakeGrantAllowed(this._signalsPort(), row, agent, modeId);
   }
 
   private _awaitDelegationNoticeQuiescence(live: () => boolean): Promise<void> {
@@ -23119,94 +17540,9 @@ export class Session {
     return this._settlementNoticeDelivery._delegationNoticeBackoff(attempt, live);
   }
 
-  /**
-   * Make child closure the prerequisite for clearing its plan ownership edge.
-   * Returns false on a transient/foreign-lease failure so the caller can retain
-   * the link and retry; a closed child is already safe once its recovered
-   * completion is published. The child's close publishes it while the link
-   * still names the child (PF-7499); a closed child that still owes it is
-   * reopened and closed again, so the task never settles unpublished.
-   */
-  private async _closeDelegatedChildForSettlement(childRecord: SessionRecord, taskId: string): Promise<boolean> {
-    try {
-      if (childRecord.closedAt !== undefined && !(await this._delegationCompletionOwed(childRecord, taskId))) {
-        return true;
-      }
-      const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
-      await child.close();
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Re-read the child's committed cancel request, from any source, or
-   * `undefined` when none is committed. A failed read rejects, so recovery
-   * retries instead of settling.
-   */
-  private async _loadDelegationCancel(childId: string): Promise<SessionRecord['cancelRequest']> {
-    const latest = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
-    return latest?.cancelRequest;
-  }
-
-  /**
-   * Settle a delegated task from a cancel committed on its child. Only this
-   * parent's targeted marker, not the reason, makes it `cancelled`; any other
-   * cancel fails it, keeping a framework timeout's precise deadline result.
-   */
-  private async _reconcileDelegationFromCancel(
-    taskId: string,
-    childId: string,
-    cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
-    deadlineAt: number | undefined,
-  ): Promise<void> {
-    const parentCancelled = isParentRequestedSubagentCancel(cancelRequest, this.id);
-    await this._reconcileDelegatedTask(
-      taskId,
-      childId,
-      parentCancelled ? 'cancelled' : 'failed',
-      !parentCancelled && cancelRequest.reason === 'delegation_timeout' && deadlineAt !== undefined
-        ? summarizeDelegationDeadline(deadlineAt)
-        : undefined,
-      { childCancelRequest: cancelRequest },
-    );
-  }
-
   /** Cancel timed-out work before closing it and releasing its plan ownership edge. */
-  private async _cancelAndCloseDelegatedChildForDeadline(childRecord: SessionRecord): Promise<boolean> {
-    if (childRecord.closedAt !== undefined) return true;
-    try {
-      const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
-      await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: this.id }, this.id);
-      await child.close();
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private _loadDelegationEvidence(
-    childRecord: SessionRecord,
-    taskId: string,
-  ): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
-    return this._storage.loadMessageResultEvidence({
-      harnessName: childRecord.harnessName,
-      sessionId: childRecord.id,
-      resourceId: childRecord.resourceId,
-      threadId: childRecord.threadId,
-      signalId: delegationSignalId(childRecord, this._delegationAdmissionId(taskId)),
-    });
-  }
-
-  /** Whether a closed delegated child's settled run still lacks its published completion. */
-  private async _delegationCompletionOwed(childRecord: SessionRecord, taskId: string): Promise<boolean> {
-    if (!this._storage.supportsDispatchRecovery) return false;
-    const evidence = await this._loadDelegationEvidence(childRecord, taskId);
-    if (!evidence || !('status' in evidence) || !owesRecoveredCompletion(evidence)) return false;
-    return (
-      (await this._storage.loadRunSummary({ harnessName: childRecord.harnessName, runId: evidence.runId })) === null
-    );
+  private _cancelAndCloseDelegatedChildForDeadline(childRecord: SessionRecord): Promise<boolean> {
+    return cancelAndCloseDelegatedChildForDeadline(this._delegationDriverPort(), childRecord);
   }
 
   /**
@@ -23217,70 +17553,12 @@ export class Session {
    * child and therefore remains the recovery authority after a crash. A failed
    * read rejects: it proves nothing, so the caller retries instead of settling.
    */
-  private async _loadDelegationOutcomeFromEvidence(
+  private _loadDelegationOutcomeFromEvidence(
     childRecord: SessionRecord,
     taskId: string,
     deadlineAt: number,
   ): Promise<{ outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined> {
-    const evidence = await this._loadDelegationEvidence(childRecord, taskId);
-    if (!evidence || !('status' in evidence)) return undefined;
-    if (evidence.status === 'completed' || evidence.status === 'failed') {
-      const settledAt = evidence.updatedAt;
-      if (!Number.isSafeInteger(settledAt) || settledAt > deadlineAt) {
-        return { outcome: 'failed', result: summarizeDelegationDeadline(deadlineAt) };
-      }
-    }
-    if (evidence.status === 'completed') {
-      const rawResult = (evidence as { result?: unknown }).result;
-      const finishReason = (rawResult as { finishReason?: unknown } | undefined)?.finishReason;
-      const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
-      const declaredTerminalText = parseHarnessTerminalToolResultText(
-        (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
-      );
-      const report = verifyHarnessSubagentTerminalCompletion(rawResult);
-      const outcome: DelegatedSubagentOutcome = report !== undefined ? report.outcome : 'failed';
-      // A budget stop persisted with the child's result keeps its typed code
-      // when a crash interrupted the live settlement.
-      const budgetExhausted = report === undefined ? parseHarnessSubagentBudgetExhausted(rawResult) : undefined;
-      const result = summarizeHarnessSubagentResult(rawResult, {
-        isError: outcome !== 'completed',
-        ...(budgetExhausted !== undefined
-          ? {
-              budgetExhausted,
-              error: harnessSubagentBudgetExhaustedError(childRecord.subagentTypeId ?? 'delegated', budgetExhausted),
-            }
-          : outcome !== 'completed'
-            ? {
-                error: {
-                  code:
-                    report?.issue?.code ??
-                    ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
-                      ? 'harness.subagent_evidence_unverified'
-                      : report === undefined
-                        ? 'harness.subagent_outcome_missing'
-                        : 'harness.subagent_incomplete'),
-                  message:
-                    report?.issue?.message ??
-                    (report === undefined
-                      ? declaredReport !== undefined || declaredTerminalText !== undefined
-                        ? 'The delegated subagent terminal completion did not match framework execution receipts'
-                        : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
-                      : `The delegated subagent reported ${report.outcome} after provider finish reason "${String(finishReason ?? 'missing')}"`),
-                },
-              }
-            : {}),
-      });
-      return { outcome, result };
-    }
-    if (evidence.status === 'failed') {
-      return {
-        outcome: 'failed',
-        result: summarizeHarnessSubagentEventResult(
-          summarizeHarnessSubagentResult(undefined, { isError: true, error: evidence.error }),
-        ),
-      };
-    }
-    return undefined; // 'pending' — no terminal outcome yet.
+    return loadDelegationOutcomeFromEvidence(this._delegationDriverPort(), childRecord, taskId, deadlineAt);
   }
 
   /**
@@ -23321,8 +17599,8 @@ export class Session {
     if (
       this._record.pendingResume?.runId === runId ||
       this._messageAdmissionStarts.has(admissionId) ||
-      this._runCompletionPromises.has(runId) ||
-      this._completedRuns.has(runId)
+      this._runCompletionWaiters.has(runId) ||
+      this._runOutcomes.has(runId)
     ) {
       return 'reattach';
     }
@@ -23359,53 +17637,6 @@ export class Session {
   }
 
   /**
-   * @internal — publish a recovered delegation run's completion once, from the
-   * canonical settled evidence: `agent_end` and the reconstructed
-   * `run_completed`, acknowledged by the durable run summary (as message
-   * recovery does). A run whose summary exists is already published. Throws
-   * when publication fails, so the caller keeps the child open and the task
-   * linked, and a later scan retries it.
-   */
-  async _publishRecoveredDelegationCompletion(admissionId: string): Promise<void> {
-    if (!this._storage.supportsDispatchRecovery) return;
-    const loaded = await this._storage.loadMessageResultEvidence({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: this._signalAdmissionIdentity(admissionId).signalId,
-    });
-    if (!loaded || !('status' in loaded) || !owesRecoveredCompletion(loaded)) return;
-    await this._publishRecoveredRunCompletion(loaded);
-  }
-
-  /**
-   * Publish the recovered completion of each delegation the parent's plan
-   * still links to this child. The link is cleared only when the task
-   * settles, and every settlement closes the child first, so a closing child
-   * finds every delegation whose completion can still be owed.
-   */
-  private async _publishOwedDelegationCompletions(): Promise<void> {
-    const parentSessionId = this._record.parentSessionId;
-    if (parentSessionId === undefined) return;
-    let cursor: string | undefined;
-    for (;;) {
-      const page = await this._storage.listPlanTasks({
-        harnessName: this._record.harnessName,
-        sessionId: parentSessionId,
-        limit: 500,
-        cursor,
-      });
-      for (const task of page.tasks) {
-        if (task.delegatedSubagentSessionId !== this.id) continue;
-        await this._publishRecoveredDelegationCompletion(delegationAdmissionId(parentSessionId, task.taskId));
-      }
-      if (!page.cursor || page.tasks.length === 0) return;
-      cursor = page.cursor;
-    }
-  }
-
-  /**
    * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
    * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
    * non-terminal and reconcile each against the delegated subagent session's
@@ -23427,345 +17658,17 @@ export class Session {
    * scan re-arms a capped-backoff retry so a stuck `in_progress` delegation is not left
    * with no path forward while the parent stays live.
    */
-  async _reconcileDelegationsOnHydrate(attempt = 0): Promise<void> {
-    const current = this._delegationReconcileInFlight;
-    if (current !== undefined) {
-      // Do not lose a timer/capacity-release wakeup merely because a slower scan
-      // is still reading another delegated task. The owner of `current` loops
-      // once more before releasing the singleflight.
-      this._delegationReconcileRerunRequested = true;
-      return current;
-    }
-    const run = (async () => {
-      do {
-        this._delegationReconcileRerunRequested = false;
-        await this._reconcileDelegationsOnHydratePass(attempt);
-      } while (this._state === 'live' && this._delegationReconcileRerunRequested);
-    })();
-    this._delegationReconcileInFlight = run;
-    try {
-      await run;
-    } finally {
-      if (this._delegationReconcileInFlight === run) this._delegationReconcileInFlight = undefined;
-      // A request can land after the loop's final condition but before this
-      // singleflight is cleared. Preserve that narrow wakeup with a fresh timer.
-      if (this._state === 'live' && this._delegationReconcileRerunRequested) {
-        this._delegationReconcileRerunRequested = false;
-        this._scheduleDelegationReconcileRetry(0);
-      }
-    }
+  _reconcileDelegationsOnHydrate(attempt = 0): Promise<void> {
+    return reconcileDelegationsOnHydrate(this._delegationDriverPort(), attempt);
   }
 
-  private async _reconcileDelegationsOnHydratePass(attempt: number): Promise<void> {
-    if (this._state !== 'live') return;
-    let admissionEpoch: number;
-    try {
-      admissionEpoch = this._captureActiveWorkAdmission('delegation reconciliation');
-    } catch {
-      // Stop/reset owns the branch. Its cancellation/reset pass will settle or
-      // preserve every durable edge; recovery must not attach new work behind it.
-      return;
-    }
-    let cursor: string | undefined;
-    const delegated: HarnessPlanTask[] = [];
-    const owedNotices: PendingDelegationSettlementNotice[] = [];
-    const owedKeys = new Set<string>();
-    // PF-7750: only watches kept before the listing began may be disposed; one
-    // kept while it ran belongs to a notice the listing may have missed.
-    const keptBeforeListing = new Set(this._delegationNoticeWatches.keys());
-    try {
-      for (;;) {
-        const page = await this._storage.listPlanTasks({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          limit: 500,
-          cursor,
-        });
-        for (const t of page.tasks) {
-          if (t.delegatedSubagentSessionId !== undefined && !TERMINAL_PLAN_TASK_STATUSES.has(t.status)) {
-            delegated.push(t);
-          }
-          // A settlement committed before a crash can still owe its notice.
-          // PF-7679: a notice under a live claim is being delivered; one whose
-          // claimer lost the lease or is gone is taken over.
-          const owedNotice = readPendingDelegationSettlementNotice(t);
-          if (owedNotice !== undefined) owedKeys.add(`${owedNotice.subagentSessionId}:${owedNotice.digest}`);
-          if (owedNotice !== undefined && this._delegationNoticeClaimable(owedNotice)) owedNotices.push(owedNotice);
-        }
-        if (!page.cursor || page.tasks.length === 0) break;
-        cursor = page.cursor;
-      }
-    } catch {
-      // Best-effort: the listing itself failed transiently — re-arm a
-      // retry so a delegated task is not stranded by a flaky read.
-      this._scheduleDelegationReconcileRetry(attempt);
-      return;
-    }
-
-    // PF-7679: a row watch kept for a retry ends once its notice is no longer
-    // owed (another owner or path resolved it), so no watch outlives it.
-    this._disposeKeptDelegationNoticeWatches(key => keptBeforeListing.has(key) && !owedKeys.has(key));
-    for (const owedNotice of owedNotices) {
-      this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
-    }
-
-    let needsRetry = false;
-    for (const task of delegated) {
-      const childId = task.delegatedSubagentSessionId!;
-      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
-      // A live driver in this process already owns the exact delegation. This
-      // also keeps an explicit/manual recovery kick from double-reserving it.
-      if (this._delegationDriverClaims.has(childId) || this._activeSubagents.has(`delegate:${childId}`)) continue;
-      let childRecord: SessionRecord | null;
-      try {
-        childRecord = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
-      } catch {
-        // Transient storage error reading the child — retry the whole scan later
-        // rather than silently leaving this task stuck `in_progress`.
-        needsRetry = true;
-        continue;
-      }
-      // Subagent session GONE/deleted → fail closed.
-      if (!childRecord) {
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
-          childCancelRequest: undefined,
-        });
-        continue;
-      }
-      const delegationAttempt = readDelegationAttemptMetadata(task, childId);
-      // A CANCELLED subagent never settles from its run, regardless of how the
-      // finishReason landed — mirrors the live driver's `cancelRequest` override
-      // (a run can race to `complete` after a cancel). This parent's own cancel
-      // settles the task `cancelled`; any other cancel fails it. Checked before
-      // the evidence so a `completed` evidence row from that race cannot mask
-      // the cancel. Preserve the framework-owned timeout reason across the crash
-      // window between the durable cancellation CAS and task reconciliation;
-      // otherwise recovery degrades a precise timeout into the generic
-      // delegation-failed result.
-      if (childRecord.cancelRequest !== undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
-          needsRetry = true;
-          continue;
-        }
-        await this._reconcileDelegationFromCancel(
-          task.taskId,
-          childId,
-          childRecord.cancelRequest,
-          delegationAttempt?.deadlineAt,
-        );
-        continue;
-      }
-      if (delegationAttempt === undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
-          needsRetry = true;
-          continue;
-        }
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
-          childCancelRequest: childRecord.cancelRequest,
-        });
-        continue;
-      }
-      // DURABLE terminal evidence is the authority — a delegated run that ERRORED
-      // before closing recovers as `failed`, not `completed`. Its durable
-      // settlement timestamp must also fall within the immutable attempt
-      // deadline; a late provider result cannot retroactively win recovery.
-      let durable: { outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined;
-      try {
-        durable = await this._loadDelegationOutcomeFromEvidence(childRecord, task.taskId, delegationAttempt.deadlineAt);
-      } catch {
-        // Unread evidence is not absent evidence: the closed-child fallback
-        // below would settle the task without its owed publication.
-        needsRetry = true;
-        continue;
-      }
-      if (durable !== undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
-          needsRetry = true;
-          continue;
-        }
-        // A cancel committed while the evidence read was pending wins over any
-        // evidence outcome, by the same rule as a cancel committed before it.
-        let committedCancel: SessionRecord['cancelRequest'];
-        try {
-          committedCancel = await this._loadDelegationCancel(childId);
-        } catch {
-          needsRetry = true;
-          continue;
-        }
-        if (committedCancel !== undefined) {
-          await this._reconcileDelegationFromCancel(
-            task.taskId,
-            childId,
-            committedCancel,
-            delegationAttempt.deadlineAt,
-          );
-          continue;
-        }
-        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result, {
-          childCancelRequest: undefined,
-        });
-        continue;
-      }
-      // A close marker cannot prove useful work completed. Without terminal
-      // signal evidence, fail closed rather than fabricating success.
-      if (childRecord.closedAt !== undefined) {
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
-          childCancelRequest: childRecord.cancelRequest,
-        });
-        continue;
-      }
-      // The absolute timestamp was committed with the ownership edge. Recovery
-      // must never grant a fresh duration after restart. Terminal evidence above
-      // still wins when it already proves the child settled.
-      if (Date.now() >= delegationAttempt.deadlineAt) {
-        if (!(await this._cancelAndCloseDelegatedChildForDeadline(childRecord))) {
-          needsRetry = true;
-          continue;
-        }
-        // The first cancel wins: a targeted cancel committed while the evidence
-        // read was pending survives the deadline cancel and settles `cancelled`,
-        // as in the live deadline branch. A later one never replaces the timeout.
-        let targetedCancel: SessionRecord['cancelRequest'];
-        try {
-          const committedCancel = await this._loadDelegationCancel(childId);
-          targetedCancel = isParentRequestedSubagentCancel(committedCancel, this.id) ? committedCancel : undefined;
-        } catch {
-          needsRetry = true;
-          continue;
-        }
-        await this._reconcileDelegatedTask(
-          task.taskId,
-          childId,
-          targetedCancel !== undefined ? 'cancelled' : 'failed',
-          targetedCancel !== undefined ? undefined : summarizeDelegationDeadline(delegationAttempt.deadlineAt),
-          { childCancelRequest: targetedCancel },
-        );
-        continue;
-      }
-      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
-      // Reserve from the same pool as a newly delegated/inline child before
-      // hydrating and attaching. A capacity miss is retried and is also kicked
-      // immediately when any current child releases a slot.
-      const reservation = this._internalTryReserveSubagentExecution();
-      if (!reservation.reserved) {
-        this._delegationReconcileCapacityBlocked = true;
-        needsRetry = true;
-        continue;
-      }
-      this._delegationDriverClaims.add(childId);
-
-      // Subagent still active → re-attach by re-issuing the admitted signal with
-      // the deterministic admission id. The durable dispatch fence observes the
-      // original execution or waits through HITL; it does not enqueue a second.
-      let child: Session | undefined;
-      try {
-        child = await this._harness.session({ sessionId: childId, resourceId: this.resourceId });
-      } catch {
-        this._delegationDriverClaims.delete(childId);
-        this._internalReleaseSubagentExecution();
-        // Could not re-acquire the child (locked elsewhere / transient) — retry
-        // the scan later so the task is not stranded.
-        needsRetry = true;
-        continue;
-      }
-      // Hydrating the child crossed an async ownership boundary. Stop/reset may
-      // have invalidated this recovery pass or removed/replaced the exact link;
-      // re-read both authorities before starting the admitted signal driver.
-      let linkStillCurrent = false;
-      try {
-        linkStillCurrent = await this._delegationLinkIsCurrent(task.taskId, childId);
-      } catch {
-        this._delegationDriverClaims.delete(childId);
-        this._internalReleaseSubagentExecution();
-        needsRetry = true;
-        continue;
-      }
-      if (!this._activeWorkAdmissionIsCurrent(admissionEpoch) || !linkStillCurrent) {
-        this._delegationDriverClaims.delete(childId);
-        this._internalReleaseSubagentExecution();
-        if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
-        continue;
-      }
-      // PF-7499: a dispatch the dead owner already claimed or accepted is
-      // interrupted, never replayed under the same run id. The settled
-      // evidence then rolls the task up through the durable path.
-      let orphan: 'reattach' | 'retry' | 'interrupted';
-      try {
-        orphan = await child._interruptOrphanedDelegationSignal(this._delegationAdmissionId(task.taskId));
-      } catch {
-        orphan = 'retry';
-      }
-      if (orphan !== 'reattach') {
-        this._delegationDriverClaims.delete(childId);
-        this._internalReleaseSubagentExecution();
-        const interrupted =
-          orphan === 'interrupted'
-            ? await this._loadDelegationOutcomeFromEvidence(
-                child.getRecord(),
-                task.taskId,
-                delegationAttempt.deadlineAt,
-              ).catch(() => undefined)
-            : undefined;
-        if (
-          interrupted === undefined ||
-          !(await this._closeDelegatedChildForSettlement(child.getRecord(), task.taskId))
-        ) {
-          needsRetry = true;
-          continue;
-        }
-        await this._reconcileDelegatedTask(task.taskId, childId, interrupted.outcome, interrupted.result, {
-          childCancelRequest: child.getRecord().cancelRequest,
-        });
-        continue;
-      }
-      // §9 — restore the SubagentDefinition overrides on the reattached child. The
-      // `tools` / `workspace` overrides are applied in-memory at delegate time and
-      // are not persisted on the child, so re-resolve them from the durable
-      // subagent type id before re-driving (unknown/unset type ⇒ mode-derived
-      // surface, the documented fallback).
-      if (task.delegatedSubagentTypeId !== undefined) {
-        const def = this._harness._getSubagentType(task.delegatedSubagentTypeId);
-        if (def) {
-          child._subagentInheritWorkspace = (def.workspace ?? 'inherit') === 'inherit';
-          if (def.tools) child._subagentToolsOverride = def.tools;
-          if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
-        }
-      }
-      const agentType = task.delegatedSubagentTypeId ?? childRecord.subagentTypeId ?? 'delegated';
-      child._subagentParentToolCallId = delegationAttempt.parentToolCallId;
-      this._activeSubagents.set(`delegate:${child.id}`, {
-        subagentSessionId: child.id,
-        agentType,
-        task: delegationAttempt.taskBody,
-        parentToolCallId: delegationAttempt.parentToolCallId,
-        startedAt: delegationAttempt.startedAt,
-        status: childRecord.pendingResume !== undefined ? 'awaiting_input' : 'running',
-      });
-      void this._driveDelegatedSubagent(
-        task.taskId,
-        child,
-        delegationAttempt.taskBody,
-        agentType,
-        childRecord.modelId,
-        delegationAttempt.startedAt,
-        delegationAttempt.deadlineAt,
-        delegationAttempt.parentToolCallId,
-        delegationAttempt.requestContextApp,
-      );
-    }
-    if (needsRetry) this._scheduleDelegationReconcileRetry(attempt);
+  private _reconcileDelegationsOnHydratePass(attempt: number): Promise<void> {
+    return reconcileDelegationsOnHydratePass(this._delegationDriverPort(), attempt);
   }
 
   /** Exact revision-fenced ownership check immediately before reattachment. */
-  private async _delegationLinkIsCurrent(taskId: string, childId: string): Promise<boolean> {
-    const snapshot = await this._storage.loadPlanTaskSubtree({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      rootTaskId: taskId,
-      limit: 1,
-    });
-    const current = snapshot.tasks.find(task => task.taskId === taskId);
-    return current?.delegatedSubagentSessionId === childId && !TERMINAL_PLAN_TASK_STATUSES.has(current.status);
+  private _delegationLinkIsCurrent(taskId: string, childId: string): Promise<boolean> {
+    return delegationLinkIsCurrent(this._delegationDriverPort(), taskId, childId);
   }
 
   private _disposeKeptDelegationNoticeWatches(drop: (key: string) => boolean): void {
@@ -23781,22 +17684,7 @@ export class Session {
    * capacity release (`attempt === 0`) replaces a slower pending timer.
    */
   private _scheduleDelegationReconcileRetry(attempt: number): void {
-    if (this._state !== 'live') return;
-    if (this._delegationReconcileRetryTimers.size > 0) {
-      if (attempt !== 0) return;
-      for (const existing of this._delegationReconcileRetryTimers) clearTimeout(existing);
-      this._delegationReconcileRetryTimers.clear();
-    }
-    const next = attempt + 1;
-    const exponent = Math.min(Math.max(0, attempt), 16);
-    const backoffMs = Math.min(DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** exponent, DELEGATION_RECONCILE_RETRY_MAX_MS);
-    const timer = setTimeout(() => {
-      this._delegationReconcileRetryTimers.delete(timer);
-      if (this._state !== 'live') return;
-      void this._reconcileDelegationsOnHydrate(next);
-    }, backoffMs);
-    if (typeof timer.unref === 'function') timer.unref();
-    this._delegationReconcileRetryTimers.add(timer);
+    return scheduleDelegationReconcileRetry(this._delegationDriverPort(), attempt);
   }
 
   /** @internal — accessor for the Harness when it needs the owner id back. */
@@ -23815,163 +17703,7 @@ export class Session {
   }
 }
 
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
-
-function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
-  if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
-  return record[key];
-}
-
-function appendExpiredPendingInteraction(
-  current: SessionRecord['expiredPendingInteractions'],
-  receipt: NonNullable<SessionRecord['expiredPendingInteractions']>[string],
-): NonNullable<SessionRecord['expiredPendingInteractions']> {
-  const next = { ...(current ?? {}), [receipt.generationKey]: receipt };
-  const retained = Object.values(next)
-    .sort((a, b) => b.expiredAt - a.expiredAt || b.generationKey.localeCompare(a.generationKey))
-    .slice(0, MAX_EXPIRED_PENDING_INTERACTIONS);
-  return Object.fromEntries(retained.map(entry => [entry.generationKey, entry]));
-}
-
-function pendingInteractionGenerationKey(input: {
-  kind: PendingResume['kind'];
-  itemId?: string;
-  runId: string;
-  toolCallId: string;
-  requestedAt: number;
-}): string {
-  return sha256CanonicalJson([input.kind, input.itemId ?? null, input.runId, input.toolCallId, input.requestedAt]);
-}
-
-const DISCARDED_ERROR_CODE = 'harness.pending_interaction_discarded';
-
-/** The exact pending generation a discard is fenced to. */
-interface DiscardGeneration {
-  kind: PendingResume['kind'];
-  itemId: string;
-  runId: string;
-  toolCallId: string;
-  pendingRequestedAt: number;
-}
-
-function parseDiscardPendingInteractionOptions(opts: unknown): DiscardPendingInteractionOptions {
-  if (opts === null || typeof opts !== 'object') {
-    throw new HarnessValidationError('discardPendingInteraction()', 'options must be an object');
-  }
-  const read = (key: string): unknown => getOwnRecordValue(opts as Record<string, unknown>, key);
-  const requireString = (key: string, maxLength?: number): string => {
-    const value = read(key);
-    if (typeof value !== 'string' || value.length === 0) {
-      throw new HarnessValidationError(`discardPendingInteraction().${key}`, `${key} must be a non-empty string`);
-    }
-    if (maxLength !== undefined && value.length > maxLength) {
-      throw new HarnessValidationError(
-        `discardPendingInteraction().${key}`,
-        `${key} must be at most ${maxLength} characters`,
-      );
-    }
-    return value;
-  };
-  const kind = read('kind');
-  if (typeof kind !== 'string' || !DISCARD_PENDING_INTERACTION_KINDS.has(kind as PendingResume['kind'])) {
-    throw new HarnessValidationError('discardPendingInteraction().kind', 'kind must be a pending interaction kind');
-  }
-  const pendingRequestedAt = read('pendingRequestedAt');
-  if (typeof pendingRequestedAt !== 'number' || !Number.isSafeInteger(pendingRequestedAt) || pendingRequestedAt < 0) {
-    throw new HarnessValidationError(
-      'discardPendingInteraction().pendingRequestedAt',
-      'pendingRequestedAt must be a non-negative integer',
-    );
-  }
-  return {
-    kind: kind as PendingResume['kind'],
-    itemId: requireString('itemId'),
-    runId: requireString('runId'),
-    toolCallId: requireString('toolCallId'),
-    pendingRequestedAt,
-    responseId: requireString('responseId'),
-    reason: requireString('reason', MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH),
-  };
-}
-
-function discardGeneration(input: DiscardPendingInteractionOptions): DiscardGeneration {
-  return {
-    kind: input.kind,
-    itemId: input.itemId,
-    runId: input.runId,
-    toolCallId: input.toolCallId,
-    pendingRequestedAt: input.pendingRequestedAt,
-  };
-}
-
-function pendingMatchesDiscardGeneration(pending: PendingResume, generation: DiscardGeneration): boolean {
-  return (
-    pending.kind === generation.kind &&
-    (pending.itemId ?? pending.toolCallId) === generation.itemId &&
-    pending.runId === generation.runId &&
-    pending.toolCallId === generation.toolCallId &&
-    pending.requestedAt === generation.pendingRequestedAt
-  );
-}
-
-function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generation: DiscardGeneration): boolean {
-  return (
-    receipt.kind === generation.kind &&
-    receipt.itemId === generation.itemId &&
-    receipt.runId === generation.runId &&
-    receipt.toolCallId === generation.toolCallId &&
-    receipt.pendingRequestedAt === generation.pendingRequestedAt
-  );
-}
-
-/** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
-function receiptGenerationDiscarded(record: SessionRecord, receipt: InboxResponseReceipt): boolean {
-  return (
-    findDiscardReceiptIn(record, {
-      kind: receipt.kind,
-      itemId: receipt.itemId,
-      runId: receipt.runId,
-      toolCallId: receipt.toolCallId,
-      pendingRequestedAt: receipt.pendingRequestedAt,
-    }) !== undefined
-  );
-}
-
-/** The `discardPendingInteraction` receipt for `generation` in `record`, if any. */
-function findDiscardReceiptIn(record: SessionRecord, generation: DiscardGeneration): InboxResponseReceipt | undefined {
-  return Object.values(record.inboxResponseReceipts ?? {}).find(
-    receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
-  );
-}
-
-/**
- * The `discardPendingInteraction` receipt whose claim (`expiryStartedAt`) is
- * stamped on `pending` in `record`, if that generation is discard-owned.
- */
-function discardClaimReceipt(record: SessionRecord, pending: PendingResume): InboxResponseReceipt | undefined {
-  if (pending.expiryStartedAt === undefined) return undefined;
-  const generation: DiscardGeneration = {
-    kind: pending.kind,
-    itemId: pending.itemId ?? pending.toolCallId,
-    runId: pending.runId,
-    toolCallId: pending.toolCallId,
-    pendingRequestedAt: pending.requestedAt,
-  };
-  return Object.values(record.inboxResponseReceipts ?? {}).find(
-    receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
-  );
-}
-
-function publicErrorProjectionToError(error: { code: string; message: string }): Error {
-  // Every stored-error replay (receipts, signal/queue/message evidence)
-  // comes through here: a discard outcome replays as its typed error, even
-  // after the discard receipt itself has been pruned.
-  if (error.code === DISCARDED_ERROR_CODE) return HarnessPendingInteractionDiscardedError.fromProjection(error);
-  const projected = new Error(error.message);
-  projected.name = error.code;
-  (projected as Error & { code: string }).code = error.code;
-  return projected;
-}
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 /**
  * Snapshot a caller-supplied terminal admission seed for hashing + persistence.
@@ -23998,42 +17730,8 @@ function snapshotTerminalAdmissionSeed(seed: JsonValue): JsonValue {
   }
 }
 
-function cloneAttachmentMetadata(metadata: Record<string, JsonValue>): Record<string, JsonValue> {
-  return JSON.parse(JSON.stringify(metadata)) as Record<string, JsonValue>;
-}
-
 function clonePersistedAttachment(attachment: PersistedAttachment): PersistedAttachment {
   return JSON.parse(JSON.stringify(attachment)) as PersistedAttachment;
-}
-
-function clonePersistedRequestContext(input: PersistedRequestContextInput): PersistedRequestContextInput {
-  return JSON.parse(JSON.stringify(input)) as PersistedRequestContextInput;
-}
-
-function lineagedSignalAcceptanceError(path: string, action: string): HarnessConfigError {
-  if (action === 'discard' || action === 'deliver') {
-    return new HarnessConfigError(path, 'a full logical message identity cannot be delivered into an active run');
-  }
-  if (action === 'blocked') {
-    return new HarnessConfigError(path, 'a full logical message identity was blocked by a suspended thread');
-  }
-  return new HarnessConfigError(path, `a full logical message identity was not accepted (${action})`);
-}
-
-/**
- * A dispatched native terminal run whose own output rejected (a provider or
- * agent error). Settled through the terminal commit as a durable `failed`
- * result; the finalizer receives no output.
- */
-class RejectedTerminalRun {
-  constructor(readonly error: unknown) {}
-}
-
-function lineagedSignalRunMismatchError(path: string, expectedRunId: string, actualRunId: string): HarnessConfigError {
-  return new HarnessConfigError(
-    path,
-    `a full logical message identity was accepted by run "${actualRunId}" instead of its reserved run "${expectedRunId}"`,
-  );
 }
 
 class QueueRecoveryPendingError extends HarnessError {
@@ -24054,57 +17752,4 @@ class QueueRecoveryStaleError extends HarnessError {
     super('queued turn was accepted by the signal runtime but no live run or durable terminal result is available');
     this.name = 'harness.queue_recovery_stale';
   }
-}
-
-class ResumeRecoveryStaleError extends HarnessError {
-  readonly code = 'harness.resume_recovery_stale';
-
-  constructor() {
-    super('resume was admitted but no live owner or durable terminal result is available');
-    this.name = 'harness.resume_recovery_stale';
-  }
-}
-
-class QueuePostRunFinalizationPendingError extends HarnessError {
-  readonly code = 'harness.queue_post_run_finalization_pending';
-  readonly retryAt: number;
-  readonly cause: unknown;
-
-  constructor(retryAt: number, cause: unknown) {
-    super('queued turn completed and is waiting for post-run finalization to persist');
-    this.name = 'harness.queue_post_run_finalization_pending';
-    this.retryAt = retryAt;
-    this.cause = cause;
-  }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined, path: string): void {
-  if (!signal?.aborted) return;
-  throw signal.reason ?? new HarnessValidationError(path, 'operation aborted');
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal, 'delay()');
-  return new Promise((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout>;
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal?.reason ?? new HarnessValidationError('delay()', 'operation aborted'));
-    };
-    timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
 }
