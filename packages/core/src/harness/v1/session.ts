@@ -349,6 +349,7 @@ import {
   UNSUSPENDED_AGENTIC_LOOP_STATUSES,
 } from './session-persistence';
 import { QueueHead } from './session-queue-head';
+import { ReplacementToolSurfaceSlot } from './session-replacement-tool-surface-slot';
 import { RunCompletionWaiters } from './session-run-completion-waiters';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
@@ -1521,8 +1522,8 @@ export class Session {
     toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
     fence: ToolSurfaceFence;
   };
-  /** At most one process-local replacement snapshot per Session pending slot. */
-  private readonly _pendingReplacementToolSurfaces = new Map<string, ToolSurfaceFence>();
+  /** PF-8547: at most one process-local replacement snapshot per Session pending slot. */
+  private readonly _replacementToolSurface = new ReplacementToolSurfaceSlot();
   private _currentMessageId?: string;
   private _currentTraceId?: string;
   /**
@@ -4553,7 +4554,7 @@ export class Session {
       return 'discarded';
     }
     if (!expiryStarted || expiredPending === undefined) return 'none';
-    this._pendingReplacementToolSurfaces.delete(expiredPending.runId);
+    this._replacementToolSurface.drop(expiredPending.runId);
     const activeController = this._currentTurnAbortController;
     if (activeController !== undefined) activeController.abort(expiryError);
 
@@ -4930,7 +4931,7 @@ export class Session {
     });
     if (!finalized) return false;
 
-    this._pendingReplacementToolSurfaces.delete(recoveringPending.runId);
+    this._replacementToolSurface.drop(recoveringPending.runId);
     if (recoveringQueuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
       this._emit({
@@ -6654,7 +6655,7 @@ export class Session {
     if (!discarded) return false;
 
     this._clearPendingInteractionExpiryTimer();
-    this._pendingReplacementToolSurfaces.delete(pending.runId);
+    this._replacementToolSurface.drop(pending.runId);
     if (queuedItemId !== undefined) {
       const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
@@ -7321,7 +7322,7 @@ export class Session {
       delete next.pendingResume;
       return next;
     });
-    if (cleared) this._pendingReplacementToolSurfaces.delete(runId);
+    if (cleared) this._replacementToolSurface.drop(runId);
   }
 
   private _rejectNonTerminalRunCompletions(reason: unknown): void {
@@ -15826,7 +15827,7 @@ export class Session {
     if (!cleared) return false;
 
     this._clearPendingInteractionExpiryTimer();
-    this._pendingReplacementToolSurfaces.delete(claimedPending.runId);
+    this._replacementToolSurface.drop(claimedPending.runId);
     if (queuedItemId !== undefined) {
       const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
@@ -16655,7 +16656,7 @@ export class Session {
     const resumeMode = this._harness._getMode(resumeModeId);
     let resumeToolSurface = this._buildToolSurface(resumeMode);
     if (pending.toolSurfaceFence !== undefined) {
-      const retainedFence = this._pendingReplacementToolSurfaces.get(pending.runId);
+      const retainedFence = this._replacementToolSurface.fenceFor(pending.runId);
       if (retainedFence === undefined) {
         throw new HarnessValidationError(
           `respond[${expectedKind}]`,
@@ -17656,7 +17657,7 @@ export class Session {
       // re-apply its cumulative usage after a reopen empties the sets.
       this._messageTokenLedger.markAccounted(pending.runId);
     } else {
-      this._pendingReplacementToolSurfaces.delete(pending.runId);
+      this._replacementToolSurface.drop(pending.runId);
     }
 
     // §10.2 defines no suspension_resolved event — resolution is observed via
@@ -17865,7 +17866,7 @@ export class Session {
     );
 
     if (!terminalized) return false;
-    this._pendingReplacementToolSurfaces.delete(pending.runId);
+    this._replacementToolSurface.drop(pending.runId);
 
     if (queuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
@@ -21226,8 +21227,7 @@ export class Session {
   private _retainCurrentReplacementToolSurface(runId: string): void {
     const current = this._currentTurnReplacementToolSurface;
     if (!current) return;
-    this._pendingReplacementToolSurfaces.clear();
-    this._pendingReplacementToolSurfaces.set(runId, current.fence);
+    this._replacementToolSurface.retain(runId, current.fence);
   }
 
   /**
@@ -21716,7 +21716,7 @@ export class Session {
     this._openRuns.clear();
     this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._replacementToolSurface.dispose();
     this._drainAllTerminalObservers(new HarnessSessionClosedError(this.id));
     this._tearDownThreadSubscription(new HarnessValidationError('session.close()', 'Session closed'));
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
@@ -21731,7 +21731,7 @@ export class Session {
     this._openRuns.clear();
     this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._replacementToolSurface.dispose();
     this._drainAllTerminalObservers(err);
     this._rejectIdleWaiters(err);
     this._rejectActiveTurnWaiters(err);
@@ -21780,7 +21780,7 @@ export class Session {
     this._openRuns.clear();
     this._runToolReceipts.clear();
     this._finalizedRunIds.clear();
-    this._pendingReplacementToolSurfaces.clear();
+    this._replacementToolSurface.dispose();
     this._drainAllTerminalObservers(err);
     this._tearDownThreadSubscription(err);
     this._rejectIdleWaiters(new HarnessSessionClosedError(this.id));
