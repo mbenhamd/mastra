@@ -1,14 +1,16 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
 // statements; we need the shared instance store and constructor to be
 // reachable at hoist time.
 
-const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
+const { composioInstances, makeFakeComposio, composioTransport } = vi.hoisted(() => {
   interface FakeComposioInstance {
     apiKey: string;
     allowTracking?: boolean;
@@ -43,7 +45,13 @@ const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
     return inst;
   };
 
-  return { composioInstances: instances, makeFakeComposio: factory };
+  return {
+    composioInstances: instances,
+    makeFakeComposio: factory,
+    composioTransport: {
+      create: undefined as ((opts: { apiKey: string; allowTracking?: boolean }) => object) | undefined,
+    },
+  };
 });
 
 type FakeComposioInstance = ReturnType<typeof makeFakeComposio>;
@@ -53,6 +61,7 @@ vi.mock('@composio/core', () => ({
     this: Record<string, unknown>,
     opts: { apiKey: string; provider?: unknown; allowTracking?: boolean },
   ) {
+    if (composioTransport.create) return composioTransport.create(opts);
     Object.assign(this, makeFakeComposio(opts));
   },
 }));
@@ -83,6 +92,7 @@ function createRequestContext(values: Record<string, unknown>): RequestContext {
 
 beforeEach(() => {
   composioInstances.length = 0;
+  composioTransport.create = undefined;
 });
 
 describe('ComposioToolProvider — identity & capabilities', () => {
@@ -1101,9 +1111,9 @@ describe('ComposioToolProvider — listConnections', () => {
       limit: 50,
     });
     expect(result.items).toEqual([
-      { connectionId: 'ca_1', status: 'active', createdAt: '2026-01-01T00:00:00Z' },
-      { connectionId: 'ca_2', status: 'inactive', createdAt: undefined },
-      { connectionId: 'ca_3', status: 'inactive', createdAt: undefined },
+      { connectionId: 'ca_1', status: 'active', createdAt: '2026-01-01T00:00:00Z', authorId: 'user_42', owned: true },
+      { connectionId: 'ca_2', status: 'inactive', createdAt: undefined, authorId: 'user_42', owned: true },
+      { connectionId: 'ca_3', status: 'inactive', createdAt: undefined, authorId: 'user_42', owned: true },
     ]);
   });
 
@@ -1155,7 +1165,7 @@ describe('ComposioToolProvider — listConnections', () => {
     expect(raw.connectedAccounts.list).not.toHaveBeenCalled();
   });
 
-  it('clamps perPage and surfaces hasMore + per-item authorId from adapter', async () => {
+  it('clamps perPage and surfaces hasMore + the requested bucket as authorId', async () => {
     const integration = new ComposioToolProvider({ apiKey: 'k' });
     await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
     const raw = getRawInstance();
@@ -1167,7 +1177,6 @@ describe('ComposioToolProvider — listConnections', () => {
           status: 'ACTIVE',
           isDisabled: false,
           createdAt: '2026-01-01T00:00:00Z',
-          user_id: 'user_42',
         },
       ],
       nextCursor: 'next_page',
@@ -1193,6 +1202,7 @@ describe('ComposioToolProvider — listConnections', () => {
           status: 'active',
           createdAt: '2026-01-01T00:00:00Z',
           authorId: 'user_42',
+          owned: true,
         },
       ],
       pagination: { page: 1, perPage: 200, hasMore: true },
@@ -1249,7 +1259,65 @@ describe('ComposioToolProvider — listConnections', () => {
       const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a', 'user_b'] });
 
       expect(result.items.map(i => i.connectionId)).toEqual(['ca_all', 'ca_allowed']);
-      expect(result.items[0]).toMatchObject({ status: 'active', authorId: 'admin' });
+      expect(result.items[0]).toMatchObject({ status: 'active', owned: false, accountType: 'SHARED' });
+      // The raw `user_id` is not on the SDK's response schema, so it is never read.
+      expect(result.items[0]!.authorId).toBeUndefined();
+    });
+
+    it.each([
+      { name: 'an EXPIRED own account next to an ACTIVE SHARED one', ownStatus: 'EXPIRED', ownMapped: 'failed' },
+      { name: 'an ACTIVE own account next to an ACTIVE SHARED one', ownStatus: 'ACTIVE', ownMapped: 'active' },
+    ])("marks which account is the user's own for $name", async ({ ownStatus, ownMapped }) => {
+      const { integration } = await setup(
+        [{ id: 'ca_mine', status: ownStatus, isDisabled: false, experimental: { accountType: 'PRIVATE' } }],
+        [sharedAccount('ca_admin', { allowAllUsers: true })],
+      );
+
+      const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] });
+
+      expect(result.items).toEqual([
+        { connectionId: 'ca_mine', status: ownMapped, authorId: 'user_a', owned: true, accountType: 'PRIVATE' },
+        { connectionId: 'ca_admin', status: 'active', owned: false, accountType: 'SHARED' },
+      ]);
+    });
+
+    it("keeps the user's own SHARED account owned when the owned page is cut short", async () => {
+      const ownShared = sharedAccount('ca_own_shared', { allowAllUsers: true });
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+      await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
+      const raw = getRawInstance();
+      raw.connectedAccounts.list.mockClear();
+      raw.connectedAccounts.list.mockImplementation(
+        async (query: { accountType?: string; userIds?: string[]; cursor?: string }) => {
+          if (query.accountType === 'ALL') {
+            return { items: [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }], nextCursor: 'more' };
+          }
+          // Composio's SHARED accounts and their owners; a userIds filter
+          // keeps only the accounts those users own.
+          const sharedByOwner = [
+            { owner: 'user_a', account: sharedAccount('ca_other_own') },
+            { owner: 'user_a', account: ownShared },
+            { owner: 'admin', account: sharedAccount('ca_admin', { allowAllUsers: true }) },
+          ];
+          const matching = sharedByOwner
+            .filter(entry => !query.userIds || query.userIds.includes(entry.owner))
+            .map(entry => entry.account);
+          if (!query.userIds) return { items: matching, nextCursor: null };
+          // The bucket's own SHARED accounts, over two pages.
+          return query.cursor === 'own_2'
+            ? { items: matching.slice(1), nextCursor: null }
+            : { items: matching.slice(0, 1), nextCursor: 'own_2' };
+        },
+      );
+
+      const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'], perPage: 1 });
+
+      expect(result.items.map(i => [i.connectionId, i.owned])).toEqual([
+        ['ca_mine', true],
+        ['ca_own_shared', true],
+        ['ca_admin', false],
+      ]);
+      expect(result.pagination.hasMore).toBe(true);
     });
 
     it('leaves out other users SHARED accounts when ownedOnly is set', async () => {
@@ -1285,6 +1353,112 @@ describe('ComposioToolProvider — listConnections', () => {
       const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] });
 
       expect(result.pagination.hasMore).toBe(true);
+    });
+  });
+
+  describe('connections through the real SDK and HTTP responses', () => {
+    let actual: typeof import('@composio/core');
+    let baseURL: string;
+    let response: (query: URLSearchParams) => object;
+    const server = createServer((request, reply) => {
+      const url = new URL(request.url!, baseURL);
+      if (url.pathname !== '/api/v3.1/connected_accounts' || request.method !== 'GET') {
+        reply.writeHead(404).end();
+        return;
+      }
+      reply.writeHead(200, { 'content-type': 'application/json' });
+      reply.end(JSON.stringify({ total_pages: 1, ...response(url.searchParams) }));
+    });
+    beforeAll(async () => {
+      actual = await vi.importActual<typeof import('@composio/core')>('@composio/core');
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+    beforeEach(() => {
+      composioTransport.create = opts =>
+        new actual.Composio({ ...opts, baseURL, allowTracking: false, disableVersionCheck: true });
+    });
+    afterAll(async () => {
+      composioTransport.create = undefined;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+    });
+
+    const openToAll = { allow_all_users: true, allowed_user_ids: [], not_allowed_user_ids: [] };
+    const account = (id: string, status: string, owner: string, accountType: 'PRIVATE' | 'SHARED') => ({
+      id,
+      user_id: owner,
+      auth_config: { id: 'ac_1', is_composio_managed: true, is_disabled: false },
+      status,
+      status_reason: null,
+      toolkit: { slug: 'gmail' },
+      is_disabled: false,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      experimental: {
+        account_type: accountType,
+        ...(accountType === 'SHARED' ? { acl_config_for_shared: openToAll } : {}),
+      },
+    });
+
+    async function list(userIds: string[], owned: unknown[], shared: unknown[]) {
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+      response = query => ({
+        items:
+          query.get('account_type') === 'SHARED' ? shared : query.get('user_ids') === userIds.join(',') ? owned : [],
+        next_cursor: null,
+      });
+      return integration.listConnections({ toolkit: 'gmail', userIds });
+    }
+
+    it("tells the user's expired own account apart from another user's active SHARED account", async () => {
+      const result = await list(
+        ['user_a'],
+        [account('ca_mine', 'EXPIRED', 'user_a', 'PRIVATE')],
+        [account('ca_shared', 'ACTIVE', 'admin', 'SHARED')],
+      );
+
+      // Composio's EXPIRED maps to the existing 'failed' status.
+      expect(result.items).toEqual([
+        {
+          connectionId: 'ca_mine',
+          status: 'failed',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          owned: true,
+          accountType: 'PRIVATE',
+        },
+        {
+          connectionId: 'ca_shared',
+          status: 'active',
+          createdAt: '2026-01-01T00:00:00Z',
+          owned: false,
+          accountType: 'SHARED',
+        },
+      ]);
+    });
+
+    it('claims no owner when several buckets were requested and the response carries none', async () => {
+      const result = await list(['user_a', 'user_b'], [account('ca_mine', 'ACTIVE', 'user_b', 'PRIVATE')], []);
+
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0]).toMatchObject({ connectionId: 'ca_mine', owned: true, accountType: 'PRIVATE' });
+      expect(result.items[0]).not.toHaveProperty('authorId');
+    });
+
+    it('rejects an incomplete ownership lookup when its cursor repeats', async () => {
+      response = query => {
+        if (query.get('account_type') === 'ALL') return { items: [], next_cursor: 'more-owned' };
+        if (!query.has('user_ids')) {
+          return { items: [account('ca_unresolved', 'ACTIVE', 'user_a', 'SHARED')], next_cursor: null };
+        }
+        return { items: [], next_cursor: 'repeated-owner-page' };
+      };
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+
+      await expect(integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] })).rejects.toThrow(
+        'Composio repeated a cursor before connection ownership could be resolved',
+      );
     });
   });
 });
