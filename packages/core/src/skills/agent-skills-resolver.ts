@@ -180,12 +180,37 @@ class MergedWorkspaceSkills implements WorkspaceSkills {
   }
 
   async search(query: string, options?: Parameters<WorkspaceSkills['search']>[1]) {
+    let secondaryOptions = options;
+    if (options?.distinctSkills) {
+      const [primarySkills, secondarySkills] = await Promise.all([this.#primary.list(), this.#secondary.list()]);
+      const primaryNames = new Set(primarySkills.map(skill => skill.name));
+      // Match get()/list() precedence before secondary results consume topK slots.
+      secondaryOptions = {
+        ...options,
+        skillNames: secondarySkills
+          .filter(
+            skill => !primaryNames.has(skill.name) && (!options.skillNames || options.skillNames.includes(skill.name)),
+          )
+          .map(skill => skill.name),
+      };
+    }
+
     const [primaryResults, secondaryResults] = await Promise.all([
       this.#primary.search(query, options),
-      this.#secondary.search(query, options),
+      this.#secondary.search(query, secondaryOptions),
     ]);
     // Combine and sort by score
-    return [...primaryResults, ...secondaryResults].sort((a, b) => b.score - a.score);
+    const results = [...primaryResults, ...secondaryResults].sort((a, b) => b.score - a.score);
+    if (!options?.distinctSkills) return results;
+
+    const seen = new Set<string>();
+    return results
+      .filter(result => {
+        if (seen.has(result.skillName)) return false;
+        seen.add(result.skillName);
+        return true;
+      })
+      .slice(0, options.topK ?? 5);
   }
 
   async getReference(skillName: string, referencePath: string) {

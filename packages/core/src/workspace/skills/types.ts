@@ -196,6 +196,8 @@ export interface SkillSearchOptions extends BaseSearchOptions {
   skillNames?: string[];
   /** Include reference files in search (default: true) */
   includeReferences?: boolean;
+  /** Return at most one matching document per skill before applying topK (default: false) */
+  distinctSkills?: boolean;
 }
 
 // =============================================================================
