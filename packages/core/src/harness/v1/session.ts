@@ -370,6 +370,7 @@ import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } f
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
 import { TerminalStagingLedger } from './session-terminal-staging-ledger';
+import { TerminalSubagentAnswers } from './session-terminal-subagent-answers';
 import {
   assertPolicy,
   assertToolCategory,
@@ -399,11 +400,7 @@ import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
-import type {
-  HarnessSubagentDirectAnswer,
-  HarnessSubagentResultSummary,
-  HarnessSubagentToolReceipt,
-} from './terminal-subagent-result';
+import type { HarnessSubagentResultSummary, HarnessSubagentToolReceipt } from './terminal-subagent-result';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   harnessSubagentOutcomeReportSchema,
@@ -1653,10 +1650,7 @@ export class Session {
    */
   private _modeSwitchEpoch = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
-  private readonly _pendingTerminalSubagentAnswers = new Map<
-    string,
-    { partId: string; answer: HarnessSubagentDirectAnswer }
-  >();
+  private readonly _terminalSubagentAnswers = new TerminalSubagentAnswers();
   /** `${runId}:${partId}` deduplication for duplicate/replayed terminal frames. */
   private readonly _deliveredTerminalSubagentAnswers = new Set<string>();
   private readonly _assistantDrafts = new Map<string, HarnessAssistantDraft>();
@@ -3036,7 +3030,7 @@ export class Session {
    * run is dropped first, while `_currentRunId` still names that run.
    */
   private _clearTurnIdentity(): void {
-    if (this._currentRunId !== undefined) this._pendingTerminalSubagentAnswers.delete(this._currentRunId);
+    if (this._currentRunId !== undefined) this._terminalSubagentAnswers.drop(this._currentRunId);
     this._currentRunId = undefined;
     this._currentRunStartedAt = undefined;
     this._currentRunModeId = undefined;
@@ -7959,21 +7953,15 @@ export class Session {
         if (!answer) return;
         const deliveryKey = `${runId}:${chunk.id}`;
         if (this._deliveredTerminalSubagentAnswers.has(deliveryKey)) return;
-        const pending = this._pendingTerminalSubagentAnswers.get(runId);
-        if (pending && pending.partId !== chunk.id) {
-          // More than one candidate for a run is ambiguous. The framework
-          // protocol will fail the run; Harness must not guess which to render.
-          this._pendingTerminalSubagentAnswers.delete(runId);
-          return;
-        }
-        this._pendingTerminalSubagentAnswers.set(runId, { partId: chunk.id, answer });
+        // More than one candidate for a run is ambiguous. The framework
+        // protocol will fail the run; Harness must not guess which to render.
+        this._terminalSubagentAnswers.offer(runId, chunk.id, answer);
         return;
       }
       case 'step-finish': {
         if (runId === undefined) return;
-        const pending = this._pendingTerminalSubagentAnswers.get(runId);
+        const pending = this._terminalSubagentAnswers.take(runId);
         if (!pending) return;
-        this._pendingTerminalSubagentAnswers.delete(runId);
         const payload = chunk.payload as { messageId?: unknown; terminalToolResult?: unknown } | undefined;
         const authoritative = parseHarnessSubagentTerminalResult(payload?.terminalToolResult);
         if (
@@ -8002,7 +7990,7 @@ export class Session {
         return;
       }
       case 'finish': {
-        if (runId !== undefined) this._pendingTerminalSubagentAnswers.delete(runId);
+        if (runId !== undefined) this._terminalSubagentAnswers.drop(runId);
         return;
       }
       case 'tool-call-input-streaming-start': {
