@@ -11,7 +11,7 @@
  *   - Queue depth + `currentQueuedItemId` track the running queued item.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MockAgent } from './__test-utils__/mock-agent';
 import { setupHarness } from './__test-utils__/setup';
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
@@ -916,6 +916,115 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
     } finally {
       release();
       await runB.catch(() => {});
+    }
+  });
+
+  it("links its own signal() run to its signal and its start time when the run's first chunk arrives before agent_start", async () => {
+    const acknowledgedAt = 2_000_000;
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // The runtime may start the stream before it acknowledges the signal: hold
+    // the acknowledgement so the run's first chunk is drained before the
+    // session emits agent_start.
+    const sendSignal = agent.sendSignal.bind(agent);
+    agent.sendSignal = ((...args: Parameters<typeof agent.sendSignal>) => {
+      const sent = sendSignal(...args);
+      return {
+        ...sent,
+        accepted: sent.accepted.then(async accepted => {
+          await new Promise(resolve => setTimeout(resolve, 30));
+          vi.setSystemTime(acknowledgedAt);
+          return accepted;
+        }),
+      };
+    }) as typeof agent.sendSignal;
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    agent.enqueueRun({
+      finishReason: 'stop',
+      text: 'ok',
+      chunks: [{ type: 'text-delta', payload: { id: 'm', text: 'hi' } }],
+      holdUntil: hold,
+    });
+    const order: string[] = [];
+    let atAgentStart: ReturnType<typeof session.getDisplayState>['currentRun'];
+    const off = session.subscribe(event => {
+      order.push(event.type);
+      if (event.type === 'agent_start') atAgentStart = session.getDisplayState().currentRun;
+    });
+    try {
+      // Only Date is faked: the clock moves when the signal is acknowledged, so
+      // the run's start time differs from any earlier record activity time.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(1_000_000);
+      const signal = await session.signal({ content: 'hi', admissionId: 'own-signal-run' });
+      for (let i = 0; i < 100 && atAgentStart === undefined; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(order).toContain('text_delta');
+      expect(order.indexOf('text_delta')).toBeLessThan(order.indexOf('agent_start'));
+      expect(atAgentStart).toMatchObject({
+        status: 'running',
+        startedAt: acknowledgedAt,
+        operation: { kind: 'signal', signalId: signal.id },
+      });
+    } finally {
+      release();
+      off();
+      vi.useRealTimers();
+    }
+  });
+
+  // PF-8698: a run woken through the agent on the session's thread while the
+  // session is idle is not the session's run, so it is never stamped as the
+  // current run and nothing is left behind once it has ended.
+  it('reports no current run during or after a run woken through the agent on an idle session', async () => {
+    const { harness, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // A first turn opens the session's thread subscription.
+    agent.enqueueRun({ finishReason: 'stop', text: 'first' });
+    await session.message({ content: 'first' });
+
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let receivedDelta = false;
+    const off = session.subscribe(event => {
+      if (event.type === 'text_delta' && event.delta === 'woken') receivedDelta = true;
+    });
+    try {
+      agent.enqueueRun({
+        finishReason: 'stop',
+        text: 'woken',
+        chunks: [{ type: 'text-delta', payload: { id: 'm', text: 'woken' } }],
+        holdUntil: hold,
+      });
+      const sent = agent.sendSignal(
+        { type: 'user-message', contents: 'woken through the agent' },
+        { resourceId: 'u', threadId: session.threadId, ifIdle: { behavior: 'wake' } },
+      );
+      const accepted = await sent.accepted;
+      expect(accepted.action).toBe('wake');
+      if (accepted.action !== 'wake') return;
+      await waitFor(() => receivedDelta, 'agent-woken run text delta');
+      const during = session.getDisplayState();
+      expect(during.isRunning).toBe(false);
+      expect(during.currentRunId).toBeUndefined();
+      expect(during.currentRun).toBeUndefined();
+
+      release();
+      await accepted.output.getFullOutput();
+      // Let the thread subscription drain the run's last chunks.
+      for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0));
+
+      const after = session.getDisplayState();
+      expect(after.isRunning).toBe(false);
+      expect(after.currentRunId).toBeUndefined();
+      expect(after.currentRun).toBeUndefined();
+    } finally {
+      release();
+      off();
     }
   });
 });
