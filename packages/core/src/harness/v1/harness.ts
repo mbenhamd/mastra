@@ -101,7 +101,8 @@ import type { HarnessSessionDeleteBlocker } from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS } from './plan-task-session';
-import { delegatedChildOwesRecoveredCompletion, Session, terminalFinalizerKey } from './session';
+import { delegatedChildOwesRecoveredCompletion, Session } from './session';
+import { terminalFinalizerKey } from './session-terminal-finalizers';
 import type {
   AttachmentDeleteOptions,
   AttachmentRef,
