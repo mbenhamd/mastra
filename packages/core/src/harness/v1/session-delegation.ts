@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { TracingContext } from '../../observability';
+import type { RequestContext } from '../../request-context';
 import { HARNESS_RUN_INTERRUPTED_ERROR_CODE } from '../../storage/domains/harness';
 import type {
   AgentSignalResultEvidence,
@@ -8,8 +10,14 @@ import type {
   OperationAdmissionTombstone,
   SessionRecord,
 } from '../../storage/domains/harness';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { sha256CanonicalJsonChecked as sha256CanonicalJson } from './canonical-json';
-import { HarnessSubagentDepthExceededError, HarnessValidationError } from './errors';
+import {
+  HarnessSubagentConcurrencyLimitError,
+  HarnessSubagentDepthExceededError,
+  HarnessValidationError,
+} from './errors';
+import { projectHarnessPublicError } from './events';
 import type {
   EmitInput,
   EventEmitter,
@@ -25,8 +33,10 @@ import type {
 import type { Harness } from './harness';
 import { TERMINAL_PLAN_TASK_STATUSES } from './plan-task-hierarchy';
 import {
+  capturePlanTaskDelegationScope,
   PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
   PLAN_TASK_MAX_NODES,
+  planTaskDelegate,
   planTaskReconcileDelegation,
   readDelegationAttemptMetadata,
   readPendingDelegationSettlementNotice,
@@ -36,7 +46,9 @@ import type {
   DelegatedSubagentOutcome,
   PendingDelegationSettlementNotice,
   PlanTaskSessionPort,
+  PlanTaskView,
 } from './plan-task-session';
+import { projectInheritedRequestContextApp } from './request-context-input';
 import type {
   ActiveSubagentState,
   JsonValue,
@@ -46,6 +58,9 @@ import type {
 } from './session';
 import type { QueueHead } from './session-queue-head';
 import { harnessSubagentBudgetExhaustedError } from './subagent-budget';
+import type { HarnessSubagentBudgetExhaustion } from './subagent-budget';
+import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
+import type { DelegationDriveSettlement } from './subagent-tracing';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   parseHarnessSubagentBudgetExhausted,
@@ -173,10 +188,8 @@ export const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
  * `Session` and is reached through this port: the claim, settling and
  * listener sets, the reconcile timers and flags, the in-flight execution
  * count, and the notice watches and `remind` starts that settlement-notice
- * delivery also reads. Seven driver members stay on `Session` (see
- * `_delegationDriverPort()`): five reach private members of another `Session`,
- * one uses a module-private constant shared with another member, and one is a
- * one-line getter.
+ * delivery also reads. Two driver members stay on `Session` (see
+ * `_delegationDriverPort()`).
  */
 export interface DelegationDriverSessionPort {
   readonly id: string;
@@ -242,6 +255,10 @@ export interface DelegationDriverSessionPort {
   delegationLinkIsCurrent(taskId: string, childId: string): Promise<boolean>;
   reconcileDelegationsOnHydratePass(attempt: number): Promise<void>;
   reconcileDelegationsOnHydrate(attempt?: number): Promise<void>;
+  delegatingRunSourceWriteGuard: (
+    callerRequestContext: RequestContext<unknown> | undefined,
+  ) => ObservationalMemorySourceWriteGuard | undefined;
+  readonly currentRunModeId: string | undefined;
 }
 
 export function emitSubagentEvent(
@@ -1268,4 +1285,594 @@ export function scheduleDelegationReconcileRetry(port: DelegationDriverSessionPo
   }, backoffMs);
   if (typeof timer.unref === 'function') timer.unref();
   port.delegationReconcileRetryTimers.add(timer);
+}
+
+export async function cancelSubagent(
+  port: DelegationDriverSessionPort,
+  opts: { subagentSessionId: string; reason?: string },
+): Promise<void> {
+  port.assertNotDeleted();
+  // Ownership guard: only cancel a subagent THIS session is actively running.
+  const isOwnChild = Array.from(port.activeSubagents.values()).some(
+    s => s.subagentSessionId === opts.subagentSessionId,
+  );
+  if (!isOwnChild) return;
+  const child = port.harness._internalGetLiveSession(opts.subagentSessionId);
+  if (!child) return; // not live in this process — best-effort no-op
+  try {
+    await child._cancelInternal(
+      { reason: opts.reason ?? 'subagent_cancelled', requestedBy: port.id },
+      port.id,
+      undefined,
+      true,
+    );
+  } catch {
+    // Best-effort: a late race (child already settling/closed) must not throw.
+  }
+}
+
+export async function cancelOwnedSubagentSessions(
+  port: DelegationDriverSessionPort,
+  subagentSessionIds: Iterable<string>,
+  reason: string,
+  assertAdmitted?: () => void,
+  targeted = false,
+): Promise<{ cancelled: string[]; unavailable: string[] }> {
+  const cancelled: string[] = [];
+  const unavailable: string[] = [];
+  for (const childId of new Set(subagentSessionIds)) {
+    if (childId === port.id) {
+      unavailable.push(childId);
+      continue;
+    }
+    let child = port.harness._internalGetLiveSession(childId);
+    if (child === undefined) {
+      let stored: SessionRecord | null;
+      try {
+        stored = await port.storage.loadSession({
+          harnessName: port.record.harnessName,
+          sessionId: childId,
+        });
+      } catch {
+        unavailable.push(childId);
+        continue;
+      }
+      if (stored === null || stored.closedAt !== undefined || stored.closingAt !== undefined) {
+        continue;
+      }
+      if (stored.parentSessionId !== port.id || stored.resourceId !== port.resourceId) {
+        unavailable.push(childId);
+        continue;
+      }
+      try {
+        child = await port.harness.session({ sessionId: childId, resourceId: port.resourceId });
+      } catch {
+        unavailable.push(childId);
+        continue;
+      }
+    }
+    if (child.parentSessionId !== port.id || child.resourceId !== port.resourceId) {
+      unavailable.push(childId);
+      continue;
+    }
+    assertAdmitted?.();
+    try {
+      const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
+      const nested = await child._cancelInternal({ reason, requestedBy: port.id }, port.id, assertAdmitted, targeted);
+      if (!alreadyCancelled) cancelled.push(childId);
+      unavailable.push(...nested.unavailable);
+    } catch (error) {
+      // The caller lost admission mid-cancel: nothing was written; surface it.
+      if (assertAdmitted !== undefined && admissionLost(assertAdmitted)) throw error;
+      unavailable.push(childId);
+    }
+  }
+  return { cancelled: Array.from(new Set(cancelled)), unavailable: Array.from(new Set(unavailable)) };
+}
+
+export async function sessionPlanTaskDelegate(
+  port: DelegationDriverSessionPort,
+  input: {
+    taskId: string;
+    agentType: string;
+    task?: string;
+    includeSubtree?: boolean;
+    modelOverride?: string;
+  },
+  callerSignal?: AbortSignal,
+  parentToolCallId?: string,
+  parentRunId?: string,
+  callerRequestContext?: RequestContext,
+  parentTracingContext?: TracingContext,
+  callerAdmissionEpoch?: number,
+): Promise<PlanTaskView & { subagentSessionId: string }> {
+  const preflight = preflightPlanTaskDelegate(port, input, callerSignal);
+  const { def, childDepth } = preflight;
+  const admissionEpoch = callerAdmissionEpoch ?? preflight.admissionEpoch;
+  port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+  const delegatedRequestContext = projectInheritedRequestContextApp(
+    callerRequestContext,
+    port.harness._getSubagentInheritedRequestContextAppKeys(),
+  );
+  const sourceWriteGuard = port.delegatingRunSourceWriteGuard(callerRequestContext);
+
+  // Reject unknown, already-running, or dependency-blocked tasks before
+  // reserving capacity or creating a durable child. The fenced link commit
+  // repeats the same eligibility checks after child creation.
+  const scopeSnapshot = await port.serializePlanTaskWrite(() =>
+    capturePlanTaskDelegationScope(port.planTaskPort(), input.taskId, input.includeSubtree === true),
+  );
+  port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+  let taskBody = input.task ?? scopeSnapshot.view.content;
+  if (input.includeSubtree) {
+    // Surface the delegated subtree SUBSET so the subagent sees the unit it
+    // owns. This is a LOSSLESS transfer: every node keeps its stable taskId,
+    // parent edge, status, sibling order, and blockedBy ids, rendered by true
+    // depth (computed from the parent chain, not a flat one-level indent). A
+    // clipped subtree appends an explicit truncation marker so the subagent
+    // knows the unit it received is incomplete.
+    taskBody = `${taskBody}\n\n${renderDelegatedSubtree(port, input.taskId, scopeSnapshot.tasks, false)}`;
+  }
+  port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+
+  // Durable delegation and inline spawn share the same parent-local
+  // backpressure reservation. Claim it before child creation/linking so the
+  // detached API cannot bypass `subagents.maxConcurrent`.
+  const reservation = internalTryReserveSubagentExecution(port);
+  if (!reservation.reserved) {
+    throw new HarnessSubagentConcurrencyLimitError(reservation.maxConcurrent, reservation.inFlight);
+  }
+
+  // Allocate the child identity and commit the durable plan ownership edge
+  // BEFORE creating the child row. A crash in this order leaves a link to a
+  // missing child, which recovery deterministically fails closed. The former
+  // create-then-link order could leave an unreferenced active descendant whose
+  // old-owner lease later poisoned root subtree renewal.
+  const childSessionId = `sess-${randomUUID()}`;
+  // Claim before the link write awaits storage. A reconciliation wakeup that
+  // observes the committed link before child allocation must not classify the
+  // intentionally-not-yet-created child as missing.
+  port.delegationDriverClaims.add(childSessionId);
+  const delegationStartedAt = Date.now();
+  const delegationDeadlineAt = delegationStartedAt + port.harness._getSubagentDelegationTimeoutMs();
+  let view: PlanTaskView;
+  try {
+    view = await port.serializePlanTaskWrite(() =>
+      planTaskDelegate(port.planTaskPort(), {
+        taskId: input.taskId,
+        subagentSessionId: childSessionId,
+        subagentTypeId: input.agentType,
+        includeSubtree: input.includeSubtree === true,
+        taskBody,
+        startedAt: delegationStartedAt,
+        deadlineAt: delegationDeadlineAt,
+        expectedScopeFingerprint: scopeSnapshot.fingerprint,
+        ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+        ...(parentRunId !== undefined ? { parentRunId } : {}),
+        parentModeId: port.currentRunModeId ?? port.record.modeId,
+        ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
+        ...(sourceWriteGuard !== undefined ? { sourceWriteGuard } : {}),
+      }),
+    );
+    port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+  } catch (error) {
+    // No child exists yet. If the link committed before active-work
+    // invalidation won, clear it to a durable failed terminal state.
+    await reconcileDelegatedTask(port, input.taskId, childSessionId, 'failed');
+    port.delegationDriverClaims.delete(childSessionId);
+    internalReleaseSubagentExecution(port);
+    throw error;
+  }
+
+  // Create the durable subagent SESSION (reuse the subagent-tool creation path:
+  // origin 'subagent-tool' + parentSessionId so cascade/depth/lease-sharing all
+  // apply per §5.6). It is NOT auto-closed at delegate time — its lifecycle is
+  // tracked by the plan task across turns.
+  let child: Session;
+  try {
+    child = await port.harness.session({
+      sessionId: childSessionId,
+      resourceId: port.resourceId,
+      threadId: { fresh: true },
+      parentSessionId: port.id,
+      origin: 'subagent-tool',
+      // §9 — an unset `def.modeId` inherits the PARENT's current mode (as
+      // documented), not the harness default mode.
+      modeId: def.modeId ?? port.record.modeId,
+      modelId: input.modelOverride ?? def.defaultModelId,
+      subagentDepth: childDepth,
+      // M4 — persist the type so the durable delegated child's per-subagent
+      // overrides (tools / workspace / toolAllowlist) survive a direct-by-id
+      // hydrate, not only this parent's delegation-reattach.
+      subagentTypeId: input.agentType,
+    });
+  } catch (error) {
+    await reconcileDelegatedTask(port, input.taskId, childSessionId, 'failed');
+    port.delegationDriverClaims.delete(childSessionId);
+    internalReleaseSubagentExecution(port);
+    throw error;
+  }
+  const subagentWorkspaceMode = def.workspace ?? 'inherit';
+  child._subagentInheritWorkspace = subagentWorkspaceMode === 'inherit';
+  if (def.tools) child._subagentToolsOverride = def.tools;
+  if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
+  const delegationParentToolCallId = view.delegation?.parentToolCallId ?? `delegate:${input.taskId}`;
+  child._subagentParentToolCallId = delegationParentToolCallId;
+
+  // Stop/revision may have won while child creation was awaiting storage.
+  // The unlinked child has done no provider work, so close it and fail the
+  // stale tool call before it can create an ownership edge.
+  try {
+    port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+  } catch (error) {
+    // The plan ownership edge was committed before child allocation. Close
+    // the child before clearing that edge: if close fails, retaining the link
+    // keeps the active descendant discoverable and retryable by recovery.
+    let childClosed = false;
+    try {
+      await child.close();
+      childClosed = true;
+    } catch {
+      scheduleDelegationReconcileRetry(port, 0);
+    }
+    if (childClosed) await reconcileDelegatedTask(port, input.taskId, child.id, 'failed');
+    port.delegationDriverClaims.delete(childSessionId);
+    internalReleaseSubagentExecution(port);
+    throw error;
+  }
+
+  // A Stop can begin while the fenced link transaction is in flight. It may
+  // have completed discovery before this new link became visible, so the
+  // delegate itself must settle the now-stale attempt and never start it.
+  try {
+    port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    const linkStillCurrent = await port.delegationLinkIsCurrent(input.taskId, child.id);
+    port.assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    if (!linkStillCurrent) {
+      throw new HarnessValidationError(
+        'taskId',
+        `delegation ownership for task "${input.taskId}" changed during child allocation`,
+      );
+    }
+  } catch (error) {
+    try {
+      await child._cancelInternal({ reason: 'parent_work_aborted', requestedBy: port.id }, port.id);
+    } catch {
+      // The exact task link below still fails closed even if child cleanup
+      // races another owner; reconciliation remains retryable from storage.
+    }
+    let childClosed = false;
+    try {
+      await child.close();
+      childClosed = true;
+    } catch {
+      scheduleDelegationReconcileRetry(port, 0);
+    }
+    if (childClosed) await reconcileDelegatedTask(port, input.taskId, child.id, 'failed');
+    port.delegationDriverClaims.delete(childSessionId);
+    internalReleaseSubagentExecution(port);
+    throw error;
+  }
+
+  // Track for display (mirrors the spawn tool) keyed by the subagent id so a
+  // delegated subagent renders while it runs.
+  port.activeSubagents.set(`delegate:${child.id}`, {
+    subagentSessionId: child.id,
+    agentType: input.agentType,
+    task: taskBody,
+    parentToolCallId: delegationParentToolCallId,
+    startedAt: delegationStartedAt,
+    status: 'running',
+  });
+
+  // Arm the live completion hook. Delegation uses an admitted SIGNAL instead
+  // of `message()`: signal evidence remains `pending` while the child is
+  // suspended, carries the pending interaction's `originSignalId`, and settles
+  // only after a later resume terminalizes. That gives detached HITL a durable
+  // join handle across reconnects/restarts rather than falsely completing and
+  // closing the child at the first `finishReason: suspended` segment.
+  void port.driveDelegatedSubagent(
+    input.taskId,
+    child,
+    taskBody,
+    input.agentType,
+    child.getRecord().modelId,
+    delegationStartedAt,
+    delegationDeadlineAt,
+    delegationParentToolCallId,
+    delegatedRequestContext?.app,
+    parentTracingContext,
+  );
+
+  return { ...view, subagentSessionId: child.id };
+}
+
+export async function driveDelegatedSubagent(
+  port: DelegationDriverSessionPort,
+  taskId: string,
+  child: Session,
+  taskBody: string,
+  agentType: string,
+  modelId: string,
+  startedAt: number,
+  deadlineAt: number,
+  parentToolCallId: string,
+  requestContextApp?: Record<string, JsonValue>,
+  parentTracingContext?: TracingContext,
+): Promise<void> {
+  let outcome: DelegatedSubagentOutcome = 'failed';
+  let rawResult: unknown;
+  let publicError: { code: string; message: string } | undefined;
+  let budgetExhausted: HarnessSubagentBudgetExhaustion | undefined;
+  // §SA2 — fold the detached child's live progress into the parent's display
+  // projection (the delegate path has no event bridge of its own, unlike the
+  // spawn tool). Unsubscribed in the finally below.
+  const progressKey = `delegate:${child.id}`;
+  const childDepth = child.subagentDepth;
+  const innerToolNames = new Map<string, string>();
+  child._subagentParentToolCallId = parentToolCallId;
+  // PF-5620: stream the child's answer (its report `summary`) like the spawn tool does.
+  child._subagentAnswerDeltaListener = (delta, reportToolCallId) => {
+    emitSubagentEvent(port, {
+      type: 'subagent_answer_delta',
+      toolCallId: parentToolCallId,
+      subagentSessionId: child.id,
+      agentType,
+      innerToolCallId: reportToolCallId,
+      delta,
+      depth: childDepth,
+    });
+  };
+  const unsubProgress = child.subscribe(event => {
+    internalUpdateSubagentProgress(port, progressKey, event);
+    switch (event.type) {
+      case 'text_delta':
+        if (event.delta.length > 0) {
+          emitSubagentEvent(port, {
+            type: 'subagent_text_delta',
+            toolCallId: parentToolCallId,
+            subagentSessionId: child.id,
+            agentType,
+            delta: event.delta,
+            depth: childDepth,
+          });
+        }
+        break;
+      case 'reasoning_delta':
+        if (event.delta.length > 0) {
+          emitSubagentEvent(port, {
+            type: 'subagent_reasoning_delta',
+            toolCallId: parentToolCallId,
+            subagentSessionId: child.id,
+            agentType,
+            delta: event.delta,
+            depth: childDepth,
+          });
+        }
+        break;
+      case 'tool_start':
+        innerToolNames.set(event.toolCallId, event.toolName);
+        emitSubagentEvent(port, {
+          type: 'subagent_tool_start',
+          toolCallId: parentToolCallId,
+          subagentSessionId: child.id,
+          agentType,
+          innerToolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: event.input,
+          depth: childDepth,
+        });
+        break;
+      case 'tool_end': {
+        const toolName = innerToolNames.get(event.toolCallId) ?? event.toolName;
+        innerToolNames.delete(event.toolCallId);
+        emitSubagentEvent(port, {
+          type: 'subagent_tool_end',
+          toolCallId: parentToolCallId,
+          subagentSessionId: child.id,
+          agentType,
+          innerToolCallId: event.toolCallId,
+          toolName,
+          output: event.output,
+          isError: event.isError ?? false,
+          ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+          depth: childDepth,
+        });
+        break;
+      }
+      case 'tool_approval_required':
+      case 'tool_suspension_required':
+      case 'question_pending':
+      case 'plan_approval_required':
+        emitDelegatedSubagentPendingEvent(port, event, {
+          parentToolCallId,
+          subagentSessionId: child.id,
+        });
+        break;
+    }
+  });
+  emitSubagentEvent(port, {
+    type: 'subagent_start',
+    toolCallId: parentToolCallId,
+    subagentSessionId: child.id,
+    agentType,
+    task: taskBody,
+    modelId,
+    depth: childDepth,
+  });
+  // The delegation outlives the delegating tool call, so its child runs
+  // attach to a detached-lifetime delegation span in the parent trace
+  // (subagent-tracing.ts). It covers the whole drive through settlement and
+  // is started immediately before the try blocks whose last finally ends it.
+  // A restart re-drive has no live parent span; its child runs start their
+  // own trace.
+  const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
+  child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
+  try {
+    // The deadline covers admission/dispatch as well as the eventual result.
+    // Racing only the returned result leaves a storage/provider stall inside
+    // signal() itself able to retain the parent reservation forever.
+    const terminal = await waitForDelegationResult(
+      child
+        .signal({
+          content: taskBody,
+          admissionId: sessionDelegationAdmissionId(port, taskId),
+          ...(requestContextApp !== undefined ? { requestContext: { app: requestContextApp } } : {}),
+        })
+        .then(dispatched => dispatched.result),
+      deadlineAt,
+    );
+    if (terminal === DELEGATION_DEADLINE_REACHED) {
+      // Commit cancellation before settlement so the child cannot continue
+      // mutating tools after its parent task has released ownership.
+      try {
+        await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: port.id }, port.id);
+      } catch {
+        // Child closure below remains the ownership prerequisite. A failed
+        // cancel/close retains the durable link for restart reconciliation.
+      }
+      // The first cancel request wins: a targeted cancel committed before the
+      // deadline still settles `cancelled`, as restart reconcile would.
+      if (isParentRequestedSubagentCancel(child.getRecord().cancelRequest, port.id)) {
+        outcome = 'cancelled';
+        publicError = { ...DELEGATED_SUBAGENT_CANCELLED_ERROR };
+      } else {
+        outcome = 'failed';
+        publicError = {
+          code: 'harness.delegation_timeout',
+          message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
+        };
+      }
+    } else {
+      rawResult = terminal;
+      const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
+      const declaredReport = parseHarnessSubagentOutcomeReport(rawResult);
+      const declaredTerminalText = parseHarnessTerminalToolResultText(
+        (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
+      );
+      const report = verifyHarnessSubagentTerminalCompletion(rawResult);
+      // Provider finishReason is transport termination, not semantic task success.
+      // A delegated task settles only from the exact framework-owned report
+      // terminal envelope. Cancellation still overrides any concurrently
+      // produced report; a terminal tool normally ends the provider step as
+      // `tool-calls`, so requiring `stop` would reject every real first-call
+      // terminal delivery.
+      outcome =
+        child.getRecord().cancelRequest === undefined && report !== undefined
+          ? report.outcome
+          : isParentRequestedSubagentCancel(child.getRecord().cancelRequest, port.id)
+            ? 'cancelled'
+            : 'failed';
+      // The framework stopped the child at its per-type budget before it
+      // reported an outcome: a typed partial result, not a generic failure.
+      budgetExhausted =
+        child.getRecord().cancelRequest === undefined && report === undefined
+          ? (parseHarnessSubagentBudgetExhausted(rawResult) ?? child._internalSubagentBudgetExhaustion())
+          : undefined;
+      if (budgetExhausted !== undefined) {
+        publicError = harnessSubagentBudgetExhaustedError(agentType, budgetExhausted);
+      } else if (outcome !== 'completed') {
+        publicError = {
+          code:
+            child.getRecord().cancelRequest !== undefined
+              ? 'harness.subagent_cancelled'
+              : (report?.issue?.code ??
+                ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
+                  ? 'harness.subagent_evidence_unverified'
+                  : report === undefined
+                    ? 'harness.subagent_outcome_missing'
+                    : 'harness.subagent_incomplete')),
+          message:
+            child.getRecord().cancelRequest !== undefined
+              ? 'The delegated subagent was cancelled before it completed'
+              : (report?.issue?.message ??
+                (report === undefined
+                  ? declaredReport !== undefined || declaredTerminalText !== undefined
+                    ? 'The delegated subagent terminal completion did not match framework execution receipts'
+                    : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
+                  : `The delegated subagent reported ${report.outcome} after provider finish reason "${finishReason ?? 'missing'}"`)),
+        };
+      }
+    }
+  } catch (error) {
+    // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
+    // Only this parent's own cancel of the child settles as skipped work, and
+    // its error names the cancel rather than the rejection it caused.
+    const parentCancelled = isParentRequestedSubagentCancel(child.getRecord().cancelRequest, port.id);
+    outcome = parentCancelled ? 'cancelled' : 'failed';
+    publicError = parentCancelled ? { ...DELEGATED_SUBAGENT_CANCELLED_ERROR } : projectHarnessPublicError(error);
+  } finally {
+    child._subagentAnswerDeltaListener = undefined;
+    unsubProgress();
+    // In the same step as the active entry goes, so the child never reads as
+    // neither active nor settling here.
+    port.settlingDelegations.add(child.id);
+    port.activeSubagents.delete(`delegate:${child.id}`);
+    child._subagentTracingContext = undefined;
+  }
+  // How the drive settled the delegation, recorded on the delegation span.
+  // Anything but `settled` leaves the durable task to restart reconciliation.
+  let settlement: DelegationDriveSettlement = 'error';
+  try {
+    // The parent's cancel overrides any report the child produced, so the
+    // summary leaves it out, as restart reconcile does.
+    const summary = summarizeHarnessSubagentResult(outcome === 'cancelled' ? undefined : rawResult, {
+      isError: outcome !== 'completed',
+      ...(publicError !== undefined ? { error: publicError } : {}),
+      ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
+    });
+    // Close the terminal child BEFORE clearing its durable plan link. If the
+    // process dies after close, recovery can still settle from signal evidence;
+    // if close fails, retaining the link keeps ownership discoverable and
+    // retryable instead of creating an unlinked active descendant.
+    try {
+      await child.close();
+    } catch {
+      settlement = 'close_failed';
+      scheduleDelegationReconcileRetry(port, 0);
+      return;
+    }
+    const reconciled = await reconcileDelegatedTask(port, taskId, child.id, outcome, summary, {
+      childCancelRequest: child.getRecord().cancelRequest,
+    });
+    if (!reconciled) {
+      settlement = 'not_reconciled';
+      return;
+    }
+    settlement = 'settled';
+    // A successful subagent_end is a durable settlement notification, not a
+    // provider-stop notification. Emit only after child closure and the
+    // fenced plan write both committed so reconnecting UI cannot show a
+    // completed child while the authoritative task remains in_progress.
+    emitSubagentEvent(port, {
+      type: 'subagent_end',
+      toolCallId: parentToolCallId,
+      subagentSessionId: child.id,
+      agentType,
+      output: summarizeHarnessSubagentEventResult(summary),
+      isError: outcome !== 'completed',
+      durationMs: Math.max(0, Date.now() - startedAt),
+      depth: childDepth,
+    });
+  } finally {
+    port.settlingDelegations.delete(child.id);
+    port.delegationDriverClaims.delete(child.id);
+    internalReleaseSubagentExecution(port);
+    endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
+  }
+}
+
+export async function cancelAndCloseDelegatedChildForDeadline(
+  port: DelegationDriverSessionPort,
+  childRecord: SessionRecord,
+): Promise<boolean> {
+  if (childRecord.closedAt !== undefined) return true;
+  try {
+    const child = await port.harness.session({ sessionId: childRecord.id, resourceId: port.resourceId });
+    await child._cancelInternal({ reason: 'delegation_timeout', requestedBy: port.id }, port.id);
+    await child.close();
+    return true;
+  } catch {
+    return false;
+  }
 }
