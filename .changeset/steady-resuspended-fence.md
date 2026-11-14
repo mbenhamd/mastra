@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Harness replacement-mode runs keep their tool fence when they suspend again after a resume. A warm or cold resume is capped to the tools the run was admitted with, and a re-suspension records the same fence and per-call tool names. A later resume after a restart is therefore still refused or capped, instead of running with the mode's current tools.
+Fixed Harness replacement-mode runs losing their tool restrictions when they suspend again after a resume. A re-suspended run keeps the tools it was admitted with. A later resume after a restart still refuses tools passed only for the original call and offers no newly registered tools.
