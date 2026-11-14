@@ -422,6 +422,7 @@ import type {
   PendingExpiryOutcome,
   PendingInteractionsSessionPort,
   QueueResumeRecoveryResult,
+  ResumedToolSurfaceFence,
 } from './session-pending-interactions';
 import {
   ASSISTANT_DRAFT_FLUSH_DELAY_MS,
@@ -1383,6 +1384,8 @@ export class Session {
   private _currentTurnReplacementToolSurface?: {
     toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
     fence: ToolSurfaceFence;
+    /** PF-8974: the persisted fence a resumed run was admitted with (see `ResumedToolSurfaceFence`). */
+    resumedFence?: ResumedToolSurfaceFence;
   };
   /** PF-8547: at most one process-local replacement snapshot per Session pending slot. */
   private readonly _replacementToolSurface = new ReplacementToolSurfaceSlot();
@@ -12388,6 +12391,9 @@ export class Session {
           );
         }
       }
+      // PF-8974: resume, and retain for a re-suspension, only the admitted
+      // names. The agent caps its surface the same way.
+      resumeToolSurface = capToolSurfaceToNames(resumeToolSurface, pending.toolSurfaceFence);
     }
     let agent: Agent;
     try {
@@ -12719,6 +12725,15 @@ export class Session {
     // user approved a tool that's now grinding through a long workflow).
     const turnAbortController = this._beginTurn(undefined, undefined, pending.observationalMemorySourceWriteGuard);
     this._setCurrentTurnReplacementToolSurface(resumeToolSurface);
+    if (pending.toolSurfaceFence !== undefined && this._currentTurnReplacementToolSurface) {
+      // PF-8974: the agent stamps the resumed segment's fence on its own copy
+      // of the request context, so a re-suspension reads this record instead.
+      this._currentTurnReplacementToolSurface.resumedFence = {
+        runId: pending.runId,
+        names: [...pending.toolSurfaceFence],
+        callToolNames: [...(pending.toolSurfaceCallToolNames ?? [])],
+      };
+    }
     // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
     // Re-arm the transient so a re-suspend on this resumed run persists it again.
     this._currentTurnYolo = pending.yolo === true;
@@ -17781,4 +17796,19 @@ class QueueRecoveryStaleError extends HarnessError {
     super('queued turn was accepted by the signal runtime but no live run or durable terminal result is available');
     this.name = 'harness.queue_recovery_stale';
   }
+}
+
+/** PF-8974: the replacement surface restricted to tools whose provider-safe name is admitted. */
+function capToolSurfaceToNames(
+  toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>,
+  names: readonly string[],
+): Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'> {
+  const admitted = new Set(names);
+  const toolsets = Object.fromEntries(
+    Object.entries(toolSurface.toolsets ?? {}).map(([key, toolset]) => [
+      key,
+      Object.fromEntries(Object.entries(toolset ?? {}).filter(([name]) => admitted.has(providerSafeToolName(name)))),
+    ]),
+  ) as NonNullable<typeof toolSurface.toolsets>;
+  return { ...toolSurface, toolsets };
 }

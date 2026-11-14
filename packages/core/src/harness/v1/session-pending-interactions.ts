@@ -324,7 +324,11 @@ export interface PendingInteractionsSessionPort {
   readonly currentRunId: string | undefined;
   readonly currentTurnAbortController: AbortController | undefined;
   readonly currentTurnReplacementToolSurface:
-    | { toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>; fence: ToolSurfaceFence }
+    | {
+        toolSurface: Pick<AgentExecutionOptionsBase<unknown>, 'toolsets' | 'toolsetsMode'>;
+        fence: ToolSurfaceFence;
+        resumedFence?: ResumedToolSurfaceFence;
+      }
     | undefined;
   readonly currentTurnRequestContext: PersistedRequestContextInput | undefined;
   readonly currentTurnSourceWriteGuard: ObservationalMemorySourceWriteGuard | undefined;
@@ -3371,9 +3375,13 @@ function toolSurfaceFenceProjection(
   if (!toolSurfaceFence) return {};
   const admitted = new Set(toolSurfaceFence);
   const callTools = port.currentTurnReplacementToolSurface?.toolSurface.toolsets?.['call:additional'];
-  const toolSurfaceCallToolNames = Object.keys(callTools ?? {})
-    .map(providerSafeToolName)
-    .filter(name => admitted.has(name));
+  const resumed = port.currentTurnReplacementToolSurface?.resumedFence;
+  const toolSurfaceCallToolNames = [
+    ...new Set([
+      ...(resumed?.runId === runId ? resumed.callToolNames : []),
+      ...Object.keys(callTools ?? {}).map(providerSafeToolName),
+    ]),
+  ].filter(name => admitted.has(name));
   return { toolSurfaceFence, ...(toolSurfaceCallToolNames.length > 0 ? { toolSurfaceCallToolNames } : {}) };
 }
 
@@ -3382,5 +3390,16 @@ export function currentToolSurfaceFenceSnapshot(
   runId: string,
 ): string[] | undefined {
   const fence = readToolSurfaceFence(port.currentAgentRequestContext, runId);
-  return fence ? [...fence.allowedNames] : undefined;
+  if (fence) return [...fence.allowedNames];
+  // PF-8974: a resumed segment's fence lives on the agent's copy of the
+  // request context, so fall back to the fence this run resumed with.
+  const resumed = port.currentTurnReplacementToolSurface?.resumedFence;
+  return resumed?.runId === runId ? [...resumed.names] : undefined;
 }
+
+/** PF-8974: the persisted fence (and per-call names) a resumed replacement run was admitted with. */
+export type ResumedToolSurfaceFence = {
+  readonly runId: string;
+  readonly names: readonly string[];
+  readonly callToolNames: readonly string[];
+};
