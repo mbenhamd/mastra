@@ -988,8 +988,8 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
     }
   });
 
-  it('fails closed after the suspended run loses its process-local replacement implementations', async () => {
-    const approvedExecute = vi.fn(async () => 'must not run');
+  it('resumes a rehydrated replacement run against the tools its mode registers, capped to the admitted names', async () => {
+    const approvedExecute = vi.fn(async () => 'approved ran');
     const approvalTool = createTool({
       id: 'approvalTool',
       description: 'replacement approval tool',
@@ -997,38 +997,45 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       requireApproval: true,
       execute: approvedExecute,
     });
+    const laterTool = createTool({
+      id: 'laterTool',
+      description: 'registered only after the restart',
+      inputSchema: z.object({}),
+      execute: async () => 'must not be offered',
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
     const model = new MockLanguageModelV2({
-      doStream: async () => ({
-        rawCall: { rawPrompt: null, rawSettings: {} },
-        warnings: [],
-        stream: toolCallStream('approval-call', 'approvalTool', '{}'),
-      }),
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('approval-call', 'approvalTool', '{}')
+              : textStream(['resumed after restart']),
+        };
+      },
     });
     const agent = new Agent({
-      id: 'replacement-registry-loss-agent',
-      name: 'replacement-registry-loss-agent',
-      instructions: 'test replacement registry loss',
+      id: 'replacement-rehydrated-resume-agent',
+      name: 'replacement-rehydrated-resume-agent',
+      instructions: 'test replacement rehydrated resume',
       model,
     });
     const storage = new InMemoryStore();
-    const modes = [
-      {
-        id: 'default',
-        agentId: 'default',
-        tools: { approvalTool },
-        harnessBuiltins: 'exclude' as const,
-      },
-    ];
     const harness = new Harness({
       agents: { default: agent } as any,
       storage,
-      modes,
+      modes: [{ id: 'default', agentId: 'default', tools: { approvalTool }, harnessBuiltins: 'exclude' as const }],
       defaultModeId: 'default',
     });
     let rehydratedHarness: Harness | undefined;
 
     try {
-      const session = await harness.session({ resourceId: 'replacement-loss-user', threadId: { fresh: true } });
+      const session = await harness.session({ resourceId: 'replacement-rehydrated-user', threadId: { fresh: true } });
       const suspended = (await session.message({ content: 'run approval tool' })) as any;
       expect(suspended.finishReason).toBe('suspended');
       expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
@@ -1038,19 +1045,81 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       rehydratedHarness = new Harness({
         agents: { default: agent } as any,
         storage,
-        modes,
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            tools: { approvalTool, laterTool },
+            harnessBuiltins: 'exclude' as const,
+          },
+        ],
         defaultModeId: 'default',
       });
-      const rehydrated = await rehydratedHarness.session({
-        resourceId: 'replacement-loss-user',
-        threadId,
-      });
-      expect(rehydrated.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-rehydrated-user', threadId });
+
+      const resumed = (await rehydrated.respondToToolApproval({ approved: true })) as any;
+
+      expect(resumed.text).toBe('resumed after restart');
+      expect(approvedExecute).toHaveBeenCalledOnce();
+      expect(visibleTools).toEqual([['approvalTool'], ['approvalTool']]);
+      expect(rehydrated.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+
+  it('fails closed after rehydration when the admitted surface used per-call tools the mode does not register', async () => {
+    const ephemeralExecute = vi.fn(async () => 'must not run');
+    const ephemeralApproval = createTool({
+      id: 'ephemeralApproval',
+      description: 'per-call approval tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: ephemeralExecute,
+    });
+    const baseTool = createTool({
+      id: 'baseTool',
+      description: 'registered mode tool',
+      inputSchema: z.object({}),
+      execute: async () => 'base',
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: toolCallStream('ephemeral-call', 'ephemeralApproval', '{}'),
+      }),
+    });
+    const agent = new Agent({
+      id: 'replacement-registry-loss-agent',
+      name: 'replacement-registry-loss-agent',
+      instructions: 'test replacement registry loss',
+      model,
+    });
+    const storage = new InMemoryStore();
+    const modes = [{ id: 'default', agentId: 'default', tools: { baseTool }, harnessBuiltins: 'exclude' as const }];
+    const harness = new Harness({ agents: { default: agent } as any, storage, modes, defaultModeId: 'default' });
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-loss-user', threadId: { fresh: true } });
+      const suspended = (await session.message({
+        content: 'run ephemeral approval tool',
+        additionalTools: { ephemeralApproval },
+      })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['baseTool', 'ephemeralApproval']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = new Harness({ agents: { default: agent } as any, storage, modes, defaultModeId: 'default' });
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-loss-user', threadId });
 
       await expect(rehydrated.respondToToolApproval({ approved: true })).rejects.toThrow(
-        /original tool implementations are no longer available/,
+        /resumed mode does not register: ephemeralApproval/,
       );
-      expect(approvedExecute).not.toHaveBeenCalled();
+      expect(ephemeralExecute).not.toHaveBeenCalled();
       expect(rehydrated.getRecord().pendingResume?.resumedAt).toBeUndefined();
     } finally {
       await rehydratedHarness?.shutdown();

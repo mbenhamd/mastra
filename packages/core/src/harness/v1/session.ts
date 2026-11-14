@@ -12347,18 +12347,35 @@ export class Session {
     let resumeToolSurface = this._buildToolSurface(resumeMode);
     if (pending.toolSurfaceFence !== undefined) {
       const retainedFence = this._replacementToolSurface.fenceFor(pending.runId);
-      if (retainedFence === undefined) {
-        throw new HarnessValidationError(
-          `respond[${expectedKind}]`,
-          'cannot resume the replacement tool surface because its original tool implementations are no longer available in this process',
+      if (retainedFence !== undefined) {
+        resumeToolSurface = {
+          toolsets: {
+            'harness:retained-replacement': materializeToolSurfaceFence(retainedFence) as ToolsInput,
+          },
+          toolsetsMode: 'replace',
+        };
+      } else {
+        // PF-8942: a reopened or rehydrated session has no process-local
+        // snapshot. Resume only against the surface the resumed mode
+        // registers, and only when it still replaces the agent's tools and
+        // provides every name persisted at admission. Per-call or other
+        // process-local tools are absent from the rebuilt surface, so a run
+        // that depended on them still fails closed here. The agent then caps
+        // the rebuilt surface to the persisted names (staged restore below),
+        // so the resume can never widen it.
+        const rebuiltNames = new Set(
+          Object.values(resumeToolSurface.toolsets ?? {}).flatMap(toolset => Object.keys(toolset ?? {})),
         );
+        const missing = pending.toolSurfaceFence.filter(name => !rebuiltNames.has(name));
+        if (resumeToolSurface.toolsetsMode !== 'replace' || missing.length > 0) {
+          throw new HarnessValidationError(
+            `respond[${expectedKind}]`,
+            resumeToolSurface.toolsetsMode !== 'replace'
+              ? 'cannot resume the replacement tool surface because the resumed mode no longer replaces the agent tools'
+              : `cannot resume the replacement tool surface because the resumed mode does not register: ${missing.join(', ')}`,
+          );
+        }
       }
-      resumeToolSurface = {
-        toolsets: {
-          'harness:retained-replacement': materializeToolSurfaceFence(retainedFence) as ToolsInput,
-        },
-        toolsetsMode: 'replace',
-      };
     }
     let agent: Agent;
     try {
