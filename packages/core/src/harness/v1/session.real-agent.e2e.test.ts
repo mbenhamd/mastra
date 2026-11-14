@@ -1222,6 +1222,176 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       await harness.shutdown();
     }
   });
+
+  it('keeps the fence and per-call names when a warm resume suspends again, so a cold resume still refuses', async () => {
+    const modeExecute = vi.fn(async () => 'mode approval ran');
+    const ephemeralExecute = vi.fn(async () => 'must not run');
+    const modeApproval = createTool({
+      id: 'modeApproval',
+      description: 'registered approval tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: modeExecute,
+    });
+    const ephemeralApproval = createTool({
+      id: 'ephemeralApproval',
+      description: 'per-call approval tool',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: ephemeralExecute,
+    });
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('mode-call', 'modeApproval', '{}')
+              : callCount === 2
+                ? toolCallStream('ephemeral-call', 'ephemeralApproval', '{}')
+                : textStream(['must not finish']),
+        };
+      },
+    });
+    const createHarness = () =>
+      new Harness({
+        agents: {
+          default: new Agent({
+            id: 'replacement-warm-resuspend-agent',
+            name: 'replacement-warm-resuspend-agent',
+            instructions: 'test replacement warm re-suspension',
+            model,
+          }),
+        } as any,
+        storage,
+        modes: [{ id: 'default', agentId: 'default', tools: { modeApproval }, harnessBuiltins: 'exclude' as const }],
+        defaultModeId: 'default',
+      });
+    const storage = new InMemoryStore();
+    const harness = createHarness();
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-warm-user', threadId: { fresh: true } });
+      const suspended = (await session.message({
+        content: 'run both approvals',
+        additionalTools: { ephemeralApproval },
+      })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      const admitted = session.getRecord().pendingResume?.toolSurfaceFence;
+      expect([...(admitted ?? [])].sort()).toEqual(['ephemeralApproval', 'modeApproval']);
+
+      const resuspended = (await session.respondToToolApproval({ approved: true })) as any;
+      expect(resuspended.finishReason).toBe('suspended');
+      expect(modeExecute).toHaveBeenCalledOnce();
+      expect(session.getRecord().pendingResume?.toolCallId).toBe('ephemeral-call');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(admitted);
+      expect(session.getRecord().pendingResume?.toolSurfaceCallToolNames).toEqual(['ephemeralApproval']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = createHarness();
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-warm-user', threadId });
+
+      await expect(rehydrated.respondToToolApproval({ approved: true })).rejects.toThrow(
+        /admitted with tools passed only for that call: ephemeralApproval/,
+      );
+      expect(ephemeralExecute).not.toHaveBeenCalled();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps the fence when a cold resume suspends again, and caps the next warm resume to it', async () => {
+    const firstExecute = vi.fn(async () => 'first ran');
+    const secondExecute = vi.fn(async () => 'second ran');
+    const approvalTool = (id: string, execute: () => Promise<string>) =>
+      createTool({ id, description: `${id} approval`, inputSchema: z.object({}), requireApproval: true, execute });
+    const laterTool = createTool({
+      id: 'laterTool',
+      description: 'registered only after the first restart',
+      inputSchema: z.object({}),
+      execute: async () => 'must not be offered',
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('first-call', 'firstApproval', '{}')
+              : callCount === 2
+                ? toolCallStream('second-call', 'secondApproval', '{}')
+                : textStream(['done after a restart']),
+        };
+      },
+    });
+    const storage = new InMemoryStore();
+    const createHarness = (extra: Record<string, unknown> = {}) =>
+      new Harness({
+        agents: {
+          default: new Agent({
+            id: 'replacement-cold-resuspend-agent',
+            name: 'replacement-cold-resuspend-agent',
+            instructions: 'test replacement cold re-suspension',
+            model,
+          }),
+        } as any,
+        storage,
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            tools: {
+              firstApproval: approvalTool('firstApproval', firstExecute),
+              secondApproval: approvalTool('secondApproval', secondExecute),
+              ...extra,
+            } as any,
+            harnessBuiltins: 'exclude' as const,
+          },
+        ],
+        defaultModeId: 'default',
+      });
+    const harnesses = [createHarness()];
+
+    try {
+      const session = await harnesses[0]!.session({ resourceId: 'replacement-cold-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'run both approvals' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      const admitted = session.getRecord().pendingResume?.toolSurfaceFence;
+      expect([...(admitted ?? [])].sort()).toEqual(['firstApproval', 'secondApproval']);
+      const threadId = session.threadId;
+
+      await harnesses[0]!.shutdown();
+      harnesses.push(createHarness({ laterTool }));
+      const afterFirstRestart = await harnesses[1]!.session({ resourceId: 'replacement-cold-user', threadId });
+      const resuspended = (await afterFirstRestart.respondToToolApproval({ approved: true })) as any;
+      expect(resuspended.finishReason).toBe('suspended');
+      expect(firstExecute).toHaveBeenCalledOnce();
+      expect(afterFirstRestart.getRecord().pendingResume?.toolCallId).toBe('second-call');
+      expect(afterFirstRestart.getRecord().pendingResume?.toolSurfaceFence).toEqual(admitted);
+
+      // Warm resume of the re-suspended run: it retains the capped surface, not laterTool.
+      const resumed = (await afterFirstRestart.respondToToolApproval({ approved: true })) as any;
+
+      expect(resumed.text).toBe('done after a restart');
+      expect(secondExecute).toHaveBeenCalledOnce();
+      expect(visibleTools).toHaveLength(3);
+      for (const names of visibleTools) expect([...names].sort()).toEqual(['firstApproval', 'secondApproval']);
+      expect(afterFirstRestart.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      for (const harness of harnesses) await harness.shutdown();
+    }
+  });
 });
 
 // ===========================================================================
