@@ -253,6 +253,7 @@ import {
   createToolSurfaceFence,
   enforceToolSurfaceFence,
   materializeToolSurfaceFence,
+  providerSafeToolName,
   readToolSurfaceFence,
   stageToolSurfaceFenceRestore,
   stampToolSurfaceFence,
@@ -8644,11 +8645,7 @@ export class Agent<
 
     for (const key of Object.keys(tools)) {
       if (tools[key] && (key.length > 63 || key.match(INVALID_CHAR_REGEX) || !key[0]!.match(STARTING_CHAR_REGEX))) {
-        let newKey = key.replace(INVALID_CHAR_REGEX, '_');
-        if (!newKey[0]!.match(STARTING_CHAR_REGEX)) {
-          newKey = '_' + newKey;
-        }
-        newKey = newKey.slice(0, 63);
+        const newKey = providerSafeToolName(key);
 
         if (tools[newKey]) {
           const mastraError = new MastraError({

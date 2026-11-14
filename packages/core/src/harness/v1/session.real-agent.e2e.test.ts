@@ -1069,6 +1069,80 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
     }
   });
 
+  it('denies a rehydrated replacement run whose mode rebuilds fresh tools under a provider-renamed key', async () => {
+    const executions = vi.fn(async () => 'must not run');
+    const searchTool = () =>
+      createTool({
+        id: 'papers.search',
+        description: 'replacement approval tool with a dotted key',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: executions,
+      });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('search-call', 'papers_search', '{}')
+              : textStream(['denied after restart']),
+        };
+      },
+    });
+    const createAgent = () =>
+      new Agent({
+        id: 'replacement-rehydrated-deny-agent',
+        name: 'replacement-rehydrated-deny-agent',
+        instructions: 'test replacement rehydrated deny',
+        model,
+      });
+    const createHarness = () =>
+      new Harness({
+        agents: { default: createAgent() } as any,
+        storage,
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            tools: { 'papers.search': searchTool() },
+            harnessBuiltins: 'exclude' as const,
+          },
+        ],
+        defaultModeId: 'default',
+      });
+    const storage = new InMemoryStore();
+    const harness = createHarness();
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-deny-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'search papers' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['papers_search']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = createHarness();
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-deny-user', threadId });
+
+      const resumed = (await rehydrated.respondToToolApproval({ approved: false })) as any;
+
+      expect(resumed.text).toBe('denied after restart');
+      expect(executions).not.toHaveBeenCalled();
+      expect(visibleTools).toEqual([['papers_search'], ['papers_search']]);
+      expect(rehydrated.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+
   it('fails closed after rehydration when the admitted surface used per-call tools the mode does not register', async () => {
     const ephemeralExecute = vi.fn(async () => 'must not run');
     const ephemeralApproval = createTool({

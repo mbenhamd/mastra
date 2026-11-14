@@ -1358,6 +1358,25 @@ export function enforceReconstructibleToolSurface(
   return providerTools;
 }
 
+const INVALID_TOOL_NAME_CHAR = /[^a-zA-Z0-9_-]/;
+const INVALID_TOOL_NAME_CHARS = /[^a-zA-Z0-9_-]/g;
+const VALID_TOOL_NAME_START = /[a-zA-Z_]/;
+
+/**
+ * The provider-safe name the agent gives a registered tool key, which is also
+ * the name a fence records. Valid keys are returned unchanged.
+ */
+export function providerSafeToolName(name: string): string {
+  if (name.length <= 63 && !INVALID_TOOL_NAME_CHAR.test(name) && VALID_TOOL_NAME_START.test(name.charAt(0))) {
+    return name;
+  }
+  let safeName = name.replace(INVALID_TOOL_NAME_CHARS, '_');
+  if (!VALID_TOOL_NAME_START.test(safeName.charAt(0))) {
+    safeName = '_' + safeName;
+  }
+  return safeName.slice(0, 63);
+}
+
 /** Recreate the complete trusted tool map for a same-process resume. */
 export function materializeToolSurfaceFence(fence: ToolSurfaceFence): Record<string, unknown> {
   return enforceToolSurfaceFence(fence.originalTools as Record<string, unknown>, fence);
