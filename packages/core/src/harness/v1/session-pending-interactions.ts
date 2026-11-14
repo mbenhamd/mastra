@@ -4,6 +4,7 @@ import type { ToolApprovalDecision } from '../../agent/tool-call-identity';
 import {
   captureSuspendedToolSurfaceFenceLease,
   clearSuspendedToolSurfaceFence,
+  providerSafeToolName,
   readToolSurfaceFence,
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
@@ -2174,9 +2175,7 @@ export function pendingResumeFromSuspendedOutput(
     ...(port.currentTurnSourceWriteGuard
       ? { observationalMemorySourceWriteGuard: port.currentTurnSourceWriteGuard }
       : {}),
-    ...(currentToolSurfaceFenceSnapshot(port, full.runId)
-      ? { toolSurfaceFence: currentToolSurfaceFenceSnapshot(port, full.runId) }
-      : {}),
+    ...toolSurfaceFenceProjection(port, full.runId),
     ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
     ...toolReceiptProjection,
     ...subagentBudgetSpentProjection(port),
@@ -3178,9 +3177,7 @@ export async function registerQuestion(
     ...(port.currentTurnSourceWriteGuard
       ? { observationalMemorySourceWriteGuard: port.currentTurnSourceWriteGuard }
       : {}),
-    ...(currentToolSurfaceFenceSnapshot(port, runId)
-      ? { toolSurfaceFence: currentToolSurfaceFenceSnapshot(port, runId) }
-      : {}),
+    ...toolSurfaceFenceProjection(port, runId),
     ...subagentBudgetSpentProjection(port),
     payload: {
       question: params.question,
@@ -3250,9 +3247,7 @@ export async function registerSandboxAccess(
     ...(port.currentTurnSourceWriteGuard
       ? { observationalMemorySourceWriteGuard: port.currentTurnSourceWriteGuard }
       : {}),
-    ...(currentToolSurfaceFenceSnapshot(port, runId)
-      ? { toolSurfaceFence: currentToolSurfaceFenceSnapshot(port, runId) }
-      : {}),
+    ...toolSurfaceFenceProjection(port, runId),
     ...subagentBudgetSpentProjection(port),
     payload: {
       sandboxAccess: {
@@ -3335,9 +3330,7 @@ export async function registerPlanApproval(
     ...(port.currentTurnSourceWriteGuard
       ? { observationalMemorySourceWriteGuard: port.currentTurnSourceWriteGuard }
       : {}),
-    ...(currentToolSurfaceFenceSnapshot(port, runId)
-      ? { toolSurfaceFence: currentToolSurfaceFenceSnapshot(port, runId) }
-      : {}),
+    ...toolSurfaceFenceProjection(port, runId),
     ...subagentBudgetSpentProjection(port),
     payload: {
       ...(params.title !== undefined ? { title: params.title } : {}),
@@ -3364,6 +3357,24 @@ export function retainCurrentReplacementToolSurface(port: PendingInteractionsSes
   const current = port.currentTurnReplacementToolSurface;
   if (!current) return;
   port.replacementToolSurface.retain(runId, current.fence);
+}
+
+/**
+ * The persisted fence for a parked replacement turn, plus the admitted names
+ * that came from per-call `additionalTools` (which a cold resume cannot rebuild).
+ */
+function toolSurfaceFenceProjection(
+  port: PendingInteractionsSessionPort,
+  runId: string,
+): Pick<PendingResume, 'toolSurfaceFence' | 'toolSurfaceCallToolNames'> {
+  const toolSurfaceFence = currentToolSurfaceFenceSnapshot(port, runId);
+  if (!toolSurfaceFence) return {};
+  const admitted = new Set(toolSurfaceFence);
+  const callTools = port.currentTurnReplacementToolSurface?.toolSurface.toolsets?.['call:additional'];
+  const toolSurfaceCallToolNames = Object.keys(callTools ?? {})
+    .map(providerSafeToolName)
+    .filter(name => admitted.has(name));
+  return { toolSurfaceFence, ...(toolSurfaceCallToolNames.length > 0 ? { toolSurfaceCallToolNames } : {}) };
 }
 
 export function currentToolSurfaceFenceSnapshot(

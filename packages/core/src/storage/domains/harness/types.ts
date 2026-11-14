@@ -234,6 +234,13 @@ export interface PendingResume {
    */
   toolSurfaceFence?: string[];
   /**
+   * Fence names that were admitted from per-call `additionalTools`. Their
+   * implementations cannot be rebuilt after the session closes, so a cold
+   * resume refuses while any are present, even when a registered tool shares
+   * the name.
+   */
+  toolSurfaceCallToolNames?: string[];
+  /**
    * Cumulative provider usage already committed for this run when it parked.
    * Resume outputs restore that cumulative counter, so Harness subtracts this
    * durable baseline before adding the resumed segment to session usage.

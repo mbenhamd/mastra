@@ -100,6 +100,7 @@ export type SessionDisplayPending = Omit<
   | 'runtimeDependencies'
   | 'requestContext'
   | 'toolSurfaceFence'
+  | 'toolSurfaceCallToolNames'
   | 'toolReceipts'
   | 'toolReceiptsOverflow'
   | 'subagentBudgetSpent'
@@ -115,6 +116,7 @@ export function pendingResumeForDisplay(pending: SessionRecord['pendingResume'])
     runtimeDependencies: _runtimeDependencies,
     requestContext: _requestContext,
     toolSurfaceFence: _toolSurfaceFence,
+    toolSurfaceCallToolNames: _toolSurfaceCallToolNames,
     toolReceipts: _toolReceipts,
     toolReceiptsOverflow: _toolReceiptsOverflow,
     subagentBudgetSpent: _subagentBudgetSpent,

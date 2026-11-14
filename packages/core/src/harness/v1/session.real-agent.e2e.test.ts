@@ -988,20 +988,201 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
     }
   });
 
-  it('fails closed after the suspended run loses its process-local replacement implementations', async () => {
-    const approvedExecute = vi.fn(async () => 'must not run');
-    const approvalTool = createTool({
-      id: 'approvalTool',
-      description: 'replacement approval tool',
+  it('resumes a rehydrated replacement run against the tools its mode registers, capped to the admitted names', async () => {
+    const createApprovalTool = (execute: () => Promise<string>) =>
+      createTool({
+        id: 'approvalTool',
+        description: 'replacement approval tool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute,
+      });
+    const admittedExecute = vi.fn(async () => 'admitting process ran');
+    const restartedExecute = vi.fn(async () => 'approved ran');
+    const laterTool = createTool({
+      id: 'laterTool',
+      description: 'registered only after the restart',
+      inputSchema: z.object({}),
+      execute: async () => 'must not be offered',
+    });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('approval-call', 'approvalTool', '{}')
+              : textStream(['resumed after restart']),
+        };
+      },
+    });
+    const createAgent = () =>
+      new Agent({
+        id: 'replacement-rehydrated-resume-agent',
+        name: 'replacement-rehydrated-resume-agent',
+        instructions: 'test replacement rehydrated resume',
+        model,
+      });
+    const storage = new InMemoryStore();
+    const harness = new Harness({
+      agents: { default: createAgent() } as any,
+      storage,
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { approvalTool: createApprovalTool(admittedExecute) },
+          harnessBuiltins: 'exclude' as const,
+        },
+      ],
+      defaultModeId: 'default',
+    });
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-rehydrated-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'run approval tool' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = new Harness({
+        agents: { default: createAgent() } as any,
+        storage,
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            tools: { approvalTool: createApprovalTool(restartedExecute), laterTool },
+            harnessBuiltins: 'exclude' as const,
+          },
+        ],
+        defaultModeId: 'default',
+      });
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-rehydrated-user', threadId });
+
+      const resumed = (await rehydrated.respondToToolApproval({ approved: true })) as any;
+
+      expect(resumed.text).toBe('resumed after restart');
+      expect(restartedExecute).toHaveBeenCalledOnce();
+      expect(admittedExecute).not.toHaveBeenCalled();
+      expect(visibleTools).toEqual([['approvalTool'], ['approvalTool']]);
+      expect(rehydrated.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+
+  it('denies a rehydrated replacement run whose mode rebuilds fresh tools under a provider-renamed key', async () => {
+    const executions = vi.fn(async () => 'must not run');
+    const searchTool = () =>
+      createTool({
+        id: 'papers.search',
+        description: 'replacement approval tool with a dotted key',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute: executions,
+      });
+    const visibleTools: string[][] = [];
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        visibleTools.push((options.tools ?? []).map(tool => tool.name));
+        callCount++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            callCount === 1
+              ? toolCallStream('search-call', 'papers_search', '{}')
+              : textStream(['denied after restart']),
+        };
+      },
+    });
+    const createAgent = () =>
+      new Agent({
+        id: 'replacement-rehydrated-deny-agent',
+        name: 'replacement-rehydrated-deny-agent',
+        instructions: 'test replacement rehydrated deny',
+        model,
+      });
+    const createHarness = () =>
+      new Harness({
+        agents: { default: createAgent() } as any,
+        storage,
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            tools: { 'papers.search': searchTool() },
+            harnessBuiltins: 'exclude' as const,
+          },
+        ],
+        defaultModeId: 'default',
+      });
+    const storage = new InMemoryStore();
+    const harness = createHarness();
+    let rehydratedHarness: Harness | undefined;
+
+    try {
+      const session = await harness.session({ resourceId: 'replacement-deny-user', threadId: { fresh: true } });
+      const suspended = (await session.message({ content: 'search papers' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['papers_search']);
+
+      const threadId = session.threadId;
+      await harness.shutdown();
+      rehydratedHarness = createHarness();
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-deny-user', threadId });
+
+      const resumed = (await rehydrated.respondToToolApproval({ approved: false })) as any;
+
+      expect(resumed.text).toBe('denied after restart');
+      expect(executions).not.toHaveBeenCalled();
+      expect(visibleTools).toEqual([['papers_search'], ['papers_search']]);
+      expect(rehydrated.getRecord().pendingResume).toBeUndefined();
+    } finally {
+      await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+
+  it('fails closed after rehydration when the admitted surface used per-call tools, including one shadowing a mode tool', async () => {
+    const ephemeralExecute = vi.fn(async () => 'must not run');
+    const shadowExecute = vi.fn(async () => 'must not run');
+    const modeExecute = vi.fn(async () => 'must not run');
+    const ephemeralApproval = createTool({
+      id: 'ephemeralApproval',
+      description: 'per-call approval tool',
       inputSchema: z.object({}),
       requireApproval: true,
-      execute: approvedExecute,
+      execute: ephemeralExecute,
+    });
+    const baseTool = createTool({
+      id: 'baseTool',
+      description: 'registered mode tool',
+      inputSchema: z.object({}),
+      execute: modeExecute,
+    });
+    const shadowingBaseTool = createTool({
+      id: 'baseTool',
+      description: 'per-call tool shadowing the registered name',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: shadowExecute,
     });
     const model = new MockLanguageModelV2({
       doStream: async () => ({
         rawCall: { rawPrompt: null, rawSettings: {} },
         warnings: [],
-        stream: toolCallStream('approval-call', 'approvalTool', '{}'),
+        stream: toolCallStream('shadow-call', 'baseTool', '{}'),
       }),
     });
     const agent = new Agent({
@@ -1011,46 +1192,30 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       model,
     });
     const storage = new InMemoryStore();
-    const modes = [
-      {
-        id: 'default',
-        agentId: 'default',
-        tools: { approvalTool },
-        harnessBuiltins: 'exclude' as const,
-      },
-    ];
-    const harness = new Harness({
-      agents: { default: agent } as any,
-      storage,
-      modes,
-      defaultModeId: 'default',
-    });
+    const modes = [{ id: 'default', agentId: 'default', tools: { baseTool }, harnessBuiltins: 'exclude' as const }];
+    const harness = new Harness({ agents: { default: agent } as any, storage, modes, defaultModeId: 'default' });
     let rehydratedHarness: Harness | undefined;
 
     try {
       const session = await harness.session({ resourceId: 'replacement-loss-user', threadId: { fresh: true } });
-      const suspended = (await session.message({ content: 'run approval tool' })) as any;
+      const suspended = (await session.message({
+        content: 'run ephemeral approval tool',
+        additionalTools: { baseTool: shadowingBaseTool, ephemeralApproval },
+      })) as any;
       expect(suspended.finishReason).toBe('suspended');
-      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+      expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['baseTool', 'ephemeralApproval']);
 
       const threadId = session.threadId;
       await harness.shutdown();
-      rehydratedHarness = new Harness({
-        agents: { default: agent } as any,
-        storage,
-        modes,
-        defaultModeId: 'default',
-      });
-      const rehydrated = await rehydratedHarness.session({
-        resourceId: 'replacement-loss-user',
-        threadId,
-      });
-      expect(rehydrated.getRecord().pendingResume?.toolSurfaceFence).toEqual(['approvalTool']);
+      rehydratedHarness = new Harness({ agents: { default: agent } as any, storage, modes, defaultModeId: 'default' });
+      const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-loss-user', threadId });
 
       await expect(rehydrated.respondToToolApproval({ approved: true })).rejects.toThrow(
-        /original tool implementations are no longer available/,
+        /admitted with tools passed only for that call: baseTool, ephemeralApproval/,
       );
-      expect(approvedExecute).not.toHaveBeenCalled();
+      expect(shadowExecute).not.toHaveBeenCalled();
+      expect(modeExecute).not.toHaveBeenCalled();
+      expect(ephemeralExecute).not.toHaveBeenCalled();
       expect(rehydrated.getRecord().pendingResume?.resumedAt).toBeUndefined();
     } finally {
       await rehydratedHarness?.shutdown();
