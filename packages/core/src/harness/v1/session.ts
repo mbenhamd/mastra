@@ -12365,6 +12365,14 @@ export class Session {
         // the rebuilt surface to the persisted names (staged restore below),
         // so the resume can never widen it. The fence records the agent's
         // provider-safe names, so compare against those, not the raw keys.
+        // A name admitted from per-call tools cannot be rebuilt, even when a
+        // registered tool shares it, so such a run refuses outright.
+        if (pending.toolSurfaceCallToolNames?.length) {
+          throw new HarnessValidationError(
+            `respond[${expectedKind}]`,
+            `cannot resume the replacement tool surface because the run was admitted with tools passed only for that call: ${pending.toolSurfaceCallToolNames.join(', ')}`,
+          );
+        }
         const rebuiltNames = new Set(
           Object.values(resumeToolSurface.toolsets ?? {}).flatMap(toolset =>
             Object.keys(toolset ?? {}).map(providerSafeToolName),

@@ -989,14 +989,16 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
   });
 
   it('resumes a rehydrated replacement run against the tools its mode registers, capped to the admitted names', async () => {
-    const approvedExecute = vi.fn(async () => 'approved ran');
-    const approvalTool = createTool({
-      id: 'approvalTool',
-      description: 'replacement approval tool',
-      inputSchema: z.object({}),
-      requireApproval: true,
-      execute: approvedExecute,
-    });
+    const createApprovalTool = (execute: () => Promise<string>) =>
+      createTool({
+        id: 'approvalTool',
+        description: 'replacement approval tool',
+        inputSchema: z.object({}),
+        requireApproval: true,
+        execute,
+      });
+    const admittedExecute = vi.fn(async () => 'admitting process ran');
+    const restartedExecute = vi.fn(async () => 'approved ran');
     const laterTool = createTool({
       id: 'laterTool',
       description: 'registered only after the restart',
@@ -1019,17 +1021,25 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
         };
       },
     });
-    const agent = new Agent({
-      id: 'replacement-rehydrated-resume-agent',
-      name: 'replacement-rehydrated-resume-agent',
-      instructions: 'test replacement rehydrated resume',
-      model,
-    });
+    const createAgent = () =>
+      new Agent({
+        id: 'replacement-rehydrated-resume-agent',
+        name: 'replacement-rehydrated-resume-agent',
+        instructions: 'test replacement rehydrated resume',
+        model,
+      });
     const storage = new InMemoryStore();
     const harness = new Harness({
-      agents: { default: agent } as any,
+      agents: { default: createAgent() } as any,
       storage,
-      modes: [{ id: 'default', agentId: 'default', tools: { approvalTool }, harnessBuiltins: 'exclude' as const }],
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: { approvalTool: createApprovalTool(admittedExecute) },
+          harnessBuiltins: 'exclude' as const,
+        },
+      ],
       defaultModeId: 'default',
     });
     let rehydratedHarness: Harness | undefined;
@@ -1043,13 +1053,13 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       const threadId = session.threadId;
       await harness.shutdown();
       rehydratedHarness = new Harness({
-        agents: { default: agent } as any,
+        agents: { default: createAgent() } as any,
         storage,
         modes: [
           {
             id: 'default',
             agentId: 'default',
-            tools: { approvalTool, laterTool },
+            tools: { approvalTool: createApprovalTool(restartedExecute), laterTool },
             harnessBuiltins: 'exclude' as const,
           },
         ],
@@ -1060,7 +1070,8 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       const resumed = (await rehydrated.respondToToolApproval({ approved: true })) as any;
 
       expect(resumed.text).toBe('resumed after restart');
-      expect(approvedExecute).toHaveBeenCalledOnce();
+      expect(restartedExecute).toHaveBeenCalledOnce();
+      expect(admittedExecute).not.toHaveBeenCalled();
       expect(visibleTools).toEqual([['approvalTool'], ['approvalTool']]);
       expect(rehydrated.getRecord().pendingResume).toBeUndefined();
     } finally {
@@ -1143,8 +1154,10 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
     }
   });
 
-  it('fails closed after rehydration when the admitted surface used per-call tools the mode does not register', async () => {
+  it('fails closed after rehydration when the admitted surface used per-call tools, including one shadowing a mode tool', async () => {
     const ephemeralExecute = vi.fn(async () => 'must not run');
+    const shadowExecute = vi.fn(async () => 'must not run');
+    const modeExecute = vi.fn(async () => 'must not run');
     const ephemeralApproval = createTool({
       id: 'ephemeralApproval',
       description: 'per-call approval tool',
@@ -1156,13 +1169,20 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       id: 'baseTool',
       description: 'registered mode tool',
       inputSchema: z.object({}),
-      execute: async () => 'base',
+      execute: modeExecute,
+    });
+    const shadowingBaseTool = createTool({
+      id: 'baseTool',
+      description: 'per-call tool shadowing the registered name',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: shadowExecute,
     });
     const model = new MockLanguageModelV2({
       doStream: async () => ({
         rawCall: { rawPrompt: null, rawSettings: {} },
         warnings: [],
-        stream: toolCallStream('ephemeral-call', 'ephemeralApproval', '{}'),
+        stream: toolCallStream('shadow-call', 'baseTool', '{}'),
       }),
     });
     const agent = new Agent({
@@ -1180,7 +1200,7 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       const session = await harness.session({ resourceId: 'replacement-loss-user', threadId: { fresh: true } });
       const suspended = (await session.message({
         content: 'run ephemeral approval tool',
-        additionalTools: { ephemeralApproval },
+        additionalTools: { baseTool: shadowingBaseTool, ephemeralApproval },
       })) as any;
       expect(suspended.finishReason).toBe('suspended');
       expect(session.getRecord().pendingResume?.toolSurfaceFence).toEqual(['baseTool', 'ephemeralApproval']);
@@ -1191,8 +1211,10 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       const rehydrated = await rehydratedHarness.session({ resourceId: 'replacement-loss-user', threadId });
 
       await expect(rehydrated.respondToToolApproval({ approved: true })).rejects.toThrow(
-        /resumed mode does not register: ephemeralApproval/,
+        /admitted with tools passed only for that call: baseTool, ephemeralApproval/,
       );
+      expect(shadowExecute).not.toHaveBeenCalled();
+      expect(modeExecute).not.toHaveBeenCalled();
       expect(ephemeralExecute).not.toHaveBeenCalled();
       expect(rehydrated.getRecord().pendingResume?.resumedAt).toBeUndefined();
     } finally {
