@@ -188,12 +188,23 @@ type SubmitPlanOutput = z.infer<typeof submitPlanOutputSchema>;
  *
  * A bare `{ approved: false }` left the model to guess between revising,
  * asking and stopping. A decline is now explicit: notes mean revise and
- * resubmit; no notes (or only whitespace) mean the plan is cancelled. The
- * stored result and the host payload stay `{ approved, revision?, transitionToMode? }`.
+ * resubmit; no notes (or only whitespace) mean the plan is cancelled. An
+ * approval with notes tells the model to apply them. The stored result and the
+ * host payload stay `{ approved, revision?, transitionToMode? }`.
  */
-export function submitPlanModelDecision(output: SubmitPlanOutput) {
-  if (output.approved) return { ...output, outcome: 'approved' as const };
+function submitPlanModelDecision(output: SubmitPlanOutput) {
   const revision = output.revision?.trim();
+  if (output.approved) {
+    const { revision: _notes, ...approved } = output;
+    return revision
+      ? {
+          ...approved,
+          outcome: 'approved' as const,
+          revision,
+          next: 'Proceed with the approved plan and apply these notes.',
+        }
+      : { ...approved, outcome: 'approved' as const };
+  }
   if (revision) {
     return {
       approved: false,

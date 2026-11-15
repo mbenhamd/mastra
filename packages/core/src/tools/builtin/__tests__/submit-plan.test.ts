@@ -147,5 +147,8 @@ describe('submitPlan tool (standalone)', () => {
       value: { approved: false, outcome: 'revise', revision: 'Swap the second paper.' },
     });
     await expect(seen({ approved: true })).resolves.toMatchObject({ value: { approved: true, outcome: 'approved' } });
+    await expect(seen({ approved: true, revision: ' Add a sensitivity check. ' })).resolves.toMatchObject({
+      value: { approved: true, outcome: 'approved', revision: 'Add a sensitivity check.', next: expect.any(String) },
+    });
   });
 });
