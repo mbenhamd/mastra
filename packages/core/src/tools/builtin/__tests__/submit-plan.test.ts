@@ -129,4 +129,26 @@ describe('submitPlan tool (standalone)', () => {
       /submit_plan requires an agent execution context/,
     );
   });
+
+  it('tells the model a decline without notes cancels the plan, and a decline with notes revises it', async () => {
+    const seen = (resumeData: SubmitPlanResume) =>
+      submitPlan.execute!({ plan: '# Overview' }, makeAgentCtx({ resumeData })).then(result =>
+        submitPlan.toModelOutput!(result as SubmitPlanResume),
+      );
+
+    await expect(seen({ approved: false })).resolves.toMatchObject({
+      type: 'json',
+      value: { approved: false, outcome: 'cancelled' },
+    });
+    await expect(seen({ approved: false, revision: '  ' })).resolves.toMatchObject({
+      value: { outcome: 'cancelled' },
+    });
+    await expect(seen({ approved: false, revision: 'Swap the second paper.' })).resolves.toMatchObject({
+      value: { approved: false, outcome: 'revise', revision: 'Swap the second paper.' },
+    });
+    await expect(seen({ approved: true })).resolves.toMatchObject({ value: { approved: true, outcome: 'approved' } });
+    await expect(seen({ approved: true, revision: ' Add a sensitivity check. ' })).resolves.toMatchObject({
+      value: { approved: true, outcome: 'approved', revision: 'Add a sensitivity check.', next: expect.any(String) },
+    });
+  });
 });
