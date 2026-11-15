@@ -181,6 +181,34 @@ const submitPlanOutputSchema = z.object({
 
 const submitPlanResumeSchema = submitPlanOutputSchema;
 
+type SubmitPlanOutput = z.infer<typeof submitPlanOutputSchema>;
+
+/**
+ * The decision the model sees for a `submitPlan` result ([PF-8915]).
+ *
+ * A bare `{ approved: false }` left the model to guess between revising,
+ * asking and stopping. A decline is now explicit: notes mean revise and
+ * resubmit; no notes (or only whitespace) mean the plan is cancelled. The
+ * stored result and the host payload stay `{ approved, revision?, transitionToMode? }`.
+ */
+export function submitPlanModelDecision(output: SubmitPlanOutput) {
+  if (output.approved) return { ...output, outcome: 'approved' as const };
+  const revision = output.revision?.trim();
+  if (revision) {
+    return {
+      approved: false,
+      outcome: 'revise' as const,
+      revision,
+      next: 'Revise the plan using these notes, then submit the revised plan with submit_plan and wait.',
+    };
+  }
+  return {
+    approved: false,
+    outcome: 'cancelled' as const,
+    next: 'The user declined without revision notes, so the plan is cancelled. Acknowledge the cancellation and stop: do not run any step of it, resubmit it, or ask whether to revise it.',
+  };
+}
+
 /**
  * `submitPlan` — pause execution and submit a plan for review ([PF-349] Harness lane).
  *
@@ -190,8 +218,8 @@ const submitPlanResumeSchema = submitPlanOutputSchema;
  *
  * Unlike `submitPlanTool` (which submits a plan file path and formats the
  * decision for the model), this variant carries the plan body inline, durably
- * registers the pending approval with the Harness before suspending, and passes
- * the resume payload through unchanged.
+ * registers the pending approval with the Harness before suspending, and returns
+ * the resume payload unchanged. The model sees `submitPlanModelDecision` of it.
  *
  * Inside a Harness, `Session.respondToPlanApproval(...)` performs the resume
  * with this exact shape; when `approved` and `transitionToMode` is supplied
@@ -206,6 +234,7 @@ export const submitPlan = createTool({
   outputSchema: submitPlanOutputSchema,
   suspendSchema: z.object({}),
   resumeSchema: submitPlanResumeSchema,
+  toModelOutput: output => ({ type: 'json', value: submitPlanModelDecision(output) }),
   execute: async (_input, ctx) => {
     const input = _input as z.infer<typeof submitPlanInputSchema>;
     const resumeData = ctx.agent?.resumeData as z.infer<typeof submitPlanResumeSchema> | undefined;
