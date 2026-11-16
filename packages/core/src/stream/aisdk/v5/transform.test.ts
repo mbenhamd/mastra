@@ -724,12 +724,12 @@ describe('convertFullStreamChunkToMastra', () => {
       }
     });
 
-    it('reads Azure OpenAI Responses cache writes from provider metadata', () => {
+    it.each(['openai', 'azure'])('reads %s cache writes from provider metadata', providerKey => {
       const chunk: StreamPart = {
         type: 'finish',
         finishReason: 'stop',
         usage: { inputTokens: 1000, outputTokens: 20, totalTokens: 1020, cachedInputTokens: 600 },
-        providerMetadata: { azure: { responseId: 'resp_1', usage: { cacheWriteTokens: 300 } } },
+        providerMetadata: { [providerKey]: { responseId: 'resp_1', usage: { cacheWriteTokens: 300 } } },
         messages: { all: [], user: [], nonUser: [] },
       };
 
