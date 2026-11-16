@@ -724,6 +724,42 @@ describe('convertFullStreamChunkToMastra', () => {
       }
     });
 
+    it('reads Azure OpenAI Responses cache writes from provider metadata', () => {
+      const chunk: StreamPart = {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 1000, outputTokens: 20, totalTokens: 1020, cachedInputTokens: 600 },
+        providerMetadata: { azure: { responseId: 'resp_1', usage: { cacheWriteTokens: 300 } } },
+        messages: { all: [], user: [], nonUser: [] },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.inputTokens).toBe(1000);
+        expect(result.payload.output.usage.cachedInputTokens).toBe(600);
+        expect(result.payload.output.usage.cacheCreationInputTokens).toBe(300);
+      }
+    });
+
+    it('keeps OpenAI cache writes unknown when the provider does not report them', () => {
+      const chunk: StreamPart = {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 1000, outputTokens: 20, totalTokens: 1020, cachedInputTokens: 600 },
+        providerMetadata: { openai: { responseId: 'resp_1' } },
+        messages: { all: [], user: [], nonUser: [] },
+      };
+
+      const result = convertFullStreamChunkToMastra(chunk, { runId: 'test-run-123' });
+
+      expect(result?.type).toBe('finish');
+      if (result?.type === 'finish') {
+        expect(result.payload.output.usage.cacheCreationInputTokens).toBeUndefined();
+      }
+    });
+
     it('keeps a derived V3 total unknown when input usage is missing', () => {
       const chunk = {
         type: 'finish',
