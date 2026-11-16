@@ -723,6 +723,21 @@ function getAnthropicCacheCreationUsage(
   };
 }
 
+/**
+ * `@ai-sdk/openai` (Responses and Chat Completions) reports prompt-cache writes only as
+ * `providerMetadata.<provider>.usage.cacheWriteTokens`, never in V2 usage. The Responses model
+ * keys its metadata by provider name (`openai`, or `azure` for Azure OpenAI).
+ */
+function getOpenAICacheWriteTokens(providerMetadata?: SharedV2ProviderMetadata): number | undefined {
+  for (const key of ['openai', 'azure'] as const) {
+    const usage = providerMetadata?.[key]?.usage;
+    if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) continue;
+    const cacheWriteTokens = (usage as Record<string, unknown>).cacheWriteTokens;
+    if (typeof cacheWriteTokens === 'number') return cacheWriteTokens;
+  }
+  return undefined;
+}
+
 function normalizeUsage(
   usage: LanguageModelV2Usage | LanguageModelV3Usage | undefined,
   providerMetadata?: SharedV2ProviderMetadata,
@@ -771,7 +786,9 @@ function normalizeUsage(
         : undefined),
     reasoningTokens: (v2Usage as { reasoningTokens?: number }).reasoningTokens,
     cachedInputTokens: (v2Usage as { cachedInputTokens?: number }).cachedInputTokens,
-    cacheCreationInputTokens: (v2Usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens,
+    cacheCreationInputTokens:
+      (v2Usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens ??
+      getOpenAICacheWriteTokens(providerMetadata),
     ...cacheCreationUsage,
     raw: usage,
   };
