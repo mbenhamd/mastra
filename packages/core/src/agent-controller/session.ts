@@ -31,7 +31,7 @@ import type { MastraMemory } from '../memory/memory';
 import type { SendNotificationSignalInput } from '../notifications';
 import type { TracingContext, TracingOptions } from '../observability';
 import { RequestContext } from '../request-context';
-import { toStandardSchema } from '../schema';
+import { toStandardSchema, jsonSchemaValidatorReady } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON } from '../schema';
 import type { StorageListMessagesOutput } from '../storage/types';
 import type { SubmitPlanResumeData } from '../tools/builtin/submit-plan';
@@ -3229,6 +3229,7 @@ class SessionState<TState = unknown> {
     let validatedState: TState;
 
     if (this.#schema) {
+      await jsonSchemaValidatorReady();
       const result = await this.#schema['~standard'].validate(newState);
       if (result.issues) {
         const messages = result.issues.map(i => i.message).join('; ');

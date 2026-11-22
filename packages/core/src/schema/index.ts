@@ -14,4 +14,9 @@ export type {
 export type ZodSchema = ZodSchemaV3 | ZodTypeV4;
 export type ZodType = ZodSchema;
 
-export { toStandardSchema, isStandardSchemaWithJSON, standardSchemaToJSONSchema } from '@mastra/schema-compat/schema';
+export {
+  toStandardSchema,
+  isStandardSchemaWithJSON,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorReady,
+} from '@mastra/schema-compat/schema';

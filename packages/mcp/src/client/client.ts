@@ -5,6 +5,7 @@ import { MastraBase } from '@mastra/core/base';
 import type { RequestContext } from '@mastra/core/di';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import type { AnySpan, TracingContext } from '@mastra/core/observability';
+import { jsonSchemaValidatorReady } from '@mastra/core/schema';
 import { createTool, validateToolOutput } from '@mastra/core/tools';
 import type { NeedsApprovalFn, Tool } from '@mastra/core/tools';
 import { toStandardSchema } from '@mastra/schema-compat';
@@ -1760,6 +1761,7 @@ export class InternalMastraMCPClient extends MastraBase {
                 // shape createTool produces so the model can self-correct.
                 if (outputSchema) {
                   const validationSchema = await getOutputValidationSchema();
+                  await jsonSchemaValidatorReady();
                   const validation = validateToolOutput(validationSchema, res.structuredContent, tool.name);
                   if (validation.error) {
                     this.log('debug', `Tool output failed schema validation: ${tool.name}`, {

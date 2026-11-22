@@ -1,6 +1,11 @@
 import type { RequestContext } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
-import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../schema';
+import {
+  isStandardSchemaWithJSON,
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorReady,
+} from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '../schema';
 import { getZodTypeName, isZodArray, isZodObject, unwrapZodType } from '../utils/zod-utils';
 
@@ -116,6 +121,7 @@ async function safeValidateAsync<T>(
 ): Promise<{ value: T } | { issues: readonly StandardSchemaIssue[] }> {
   let result;
   try {
+    await jsonSchemaValidatorReady();
     result = await schema['~standard'].validate(data);
   } catch {
     throw new ToolSchemaValidationError();

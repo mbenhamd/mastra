@@ -35,7 +35,12 @@ import { SpanType, wrapMastra, EntityType, getOrCreateSpan, createObservabilityC
 import type { AnySpan } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
 import { isInfrastructureRequestContextKey, RequestContext } from '../../request-context';
-import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
+import {
+  isStandardSchemaWithJSON,
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorReady,
+} from '../../schema';
 import type { StandardSchemaWithJSON } from '../../schema';
 import {
   getNeedsApprovalFn,
@@ -815,6 +820,7 @@ export class CoreToolBuilder extends MastraBase {
       !isVercelTool(tool) && 'mcpMetadata' in tool ? (tool as { mcpMetadata?: McpMetadata }).mcpMetadata : undefined;
 
     const execFunction = async (args: unknown, execOptions: MastraToolInvocationOptions, toolSpan?: AnySpan) => {
+      await jsonSchemaValidatorReady();
       // Without a tool span (skipToolSpan), nested work attaches to the caller's span instead.
       const contextSpan = toolSpan ?? (execOptions?.tracingContext || options.tracingContext)?.currentSpan;
       try {
@@ -1333,30 +1339,32 @@ export class CoreToolBuilder extends MastraBase {
             io: 'input',
           }),
           {
-            validate: (value: unknown) => {
-              const result = schemaToUse['~standard'].validate(value);
-              // standard-schema validate may return a Promise
-              if (result instanceof Promise) {
-                return result.then(r => {
-                  if ('issues' in r && r.issues) {
-                    return {
-                      success: false as const,
-                      error: createStandardSchemaIssuesError(r.issues),
-                    };
-                  }
-                  return { success: true as const, value: (r as { value: unknown }).value };
-                });
-              }
-              // standard-schema returns { value } on success or { issues } on failure,
-              // but AI SDK expects { success: boolean, value/error }
-              if ('issues' in result && result.issues) {
-                return {
-                  success: false as const,
-                  error: createStandardSchemaIssuesError(result.issues),
-                };
-              }
-              return { success: true as const, value: (result as { value: unknown }).value };
-            },
+            // Wait for the JSON Schema validator import, so a call right after startup is not refused.
+            validate: (value: unknown) =>
+              jsonSchemaValidatorReady().then(() => {
+                const result = schemaToUse['~standard'].validate(value);
+                // standard-schema validate may return a Promise
+                if (result instanceof Promise) {
+                  return result.then(r => {
+                    if ('issues' in r && r.issues) {
+                      return {
+                        success: false as const,
+                        error: createStandardSchemaIssuesError(r.issues),
+                      };
+                    }
+                    return { success: true as const, value: (r as { value: unknown }).value };
+                  });
+                }
+                // standard-schema returns { value } on success or { issues } on failure,
+                // but AI SDK expects { success: boolean, value/error }
+                if ('issues' in result && result.issues) {
+                  return {
+                    success: false as const,
+                    error: createStandardSchemaIssuesError(result.issues),
+                  };
+                }
+                return { success: true as const, value: (result as { value: unknown }).value };
+              }),
           },
         );
       } else {

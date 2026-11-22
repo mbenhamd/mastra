@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { toStandardSchema } from '@mastra/core/schema';
+import { toStandardSchema, jsonSchemaValidatorReady } from '@mastra/core/schema';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { ProtocolError } from '@modelcontextprotocol/server';
 
@@ -110,6 +110,7 @@ export class ServerEventRegistry {
    */
   async validateArguments(event: RegisteredEvent, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!event.inputSchema) return args;
+    await jsonSchemaValidatorReady();
     const result = await event.inputSchema['~standard'].validate(args);
     if (result.issues) {
       const issues = result.issues.map(issue => ({
@@ -146,6 +147,7 @@ export class ServerEventRegistry {
     }
     let payload = data;
     if (event.payloadSchema) {
+      await jsonSchemaValidatorReady();
       const result = await event.payloadSchema['~standard'].validate(data);
       if (result.issues) {
         throw new MastraError({

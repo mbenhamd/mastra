@@ -15,7 +15,12 @@ import type {
 import { EntityType, SpanType, getOrCreateSpan } from '@mastra/core/observability';
 import type { Span, TracingContext } from '@mastra/core/observability';
 import { RequestContext } from '@mastra/core/request-context';
-import { isStandardSchemaWithJSON, standardSchemaToJSONSchema, toStandardSchema } from '@mastra/core/schema';
+import {
+  isStandardSchemaWithJSON,
+  standardSchemaToJSONSchema,
+  toStandardSchema,
+  jsonSchemaValidatorReady,
+} from '@mastra/core/schema';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { createTool, isValidationError } from '@mastra/core/tools';
 import type { InternalCoreTool, MCPToolExecutionContext, MCPToolType, ToolAction } from '@mastra/core/tools';
@@ -818,6 +823,7 @@ export class MCPServer extends MCPServerBase {
     const argsHash = hashArguments(args);
     const continuation = readContinuation(ctx, requestContext, { method, name, argsHash });
     if (continuation?.outcome === 'accept' && resumeSchema) {
+      await jsonSchemaValidatorReady();
       const validation = await resumeSchema['~standard'].validate(continuation.resumeData);
       if (validation.issues) {
         throw new ProtocolError(

@@ -2,7 +2,7 @@ import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
 import { getRequestContextInputSource, REQUEST_CONTEXT_INPUT_SOURCE } from '../request-context/input-source';
-import { toStandardSchema } from '../schema';
+import { toStandardSchema, jsonSchemaValidatorReady } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
 import { consumeBuilderValidatedInput, consumeBuilderValidatedSuspend } from './builder-validation-context';
@@ -512,6 +512,7 @@ export class Tool<
     const originalExecute = opts.renderOnly ? async () => ({ acknowledged: true }) : opts.execute;
     if (originalExecute) {
       this.execute = async (inputData: TSchemaIn, context?: any) => {
+        await jsonSchemaValidatorReady();
         // When a tool is being resumed (resumeData present in context), validation
         // must not FAIL the call: the original args were already validated during
         // the initial execution, and delegated resumes replay control fields the

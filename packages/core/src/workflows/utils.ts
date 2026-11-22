@@ -3,6 +3,7 @@ import { ErrorCategory, ErrorDomain, getErrorFromUnknown, MastraError } from '..
 import type { IMastraLogger } from '../logger';
 import type { RequestContext } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
+import { jsonSchemaValidatorReady } from '../schema';
 import type { StandardSchemaWithJSON } from '../schema';
 import { removeUndefinedValues } from '../utils';
 import type { ExecutionGraph } from './execution-engine';
@@ -29,6 +30,7 @@ async function validateWithStandardSchema<T>(
   schema: StandardSchemaWithJSON<T>,
   data: unknown,
 ): Promise<{ success: true; data: T } | { success: false; issues: { path?: (string | number)[]; message: string }[] }> {
+  await jsonSchemaValidatorReady();
   const result = schema['~standard'].validate(data);
   const resolvedResult = result instanceof Promise ? await result : result;
 
