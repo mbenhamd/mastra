@@ -40,7 +40,11 @@ describe('tool input validation while the JSON Schema validator is loading', () 
     release = undefined;
   });
 
-  it('refuses an AI SDK v4 tool call with invalid input, never running the tool', async () => {
+  // With valid input the refusal can only come from the loading window, not from schema validation.
+  it.each([
+    ['invalid', { name: 42 }],
+    ['valid', { name: 'Dero' }],
+  ])('refuses an AI SDK v4 tool call with %s input, never running the tool', async (_label, args) => {
     const execute = vi.fn(async () => ({ found: true }));
     const findUser = createTool({ id: 'find_user', description: 'Find a user', inputSchema: nameSchema, execute });
     const model = new MockLanguageModelV1({
@@ -50,7 +54,7 @@ describe('tool input validation while the JSON Schema validator is loading', () 
         usage: { promptTokens: 10, completionTokens: 20 },
         text: undefined,
         toolCalls: [
-          { toolCallType: 'function', toolCallId: 'call-1', toolName: 'findUser', args: JSON.stringify({ name: 42 }) },
+          { toolCallType: 'function', toolCallId: 'call-1', toolName: 'findUser', args: JSON.stringify(args) },
         ],
       }),
     });
@@ -61,7 +65,7 @@ describe('tool input validation while the JSON Schema validator is loading', () 
       logger: false,
     }).getAgent('finder');
 
-    // Hold the window for the whole call, so the refusal can only come from the loading window.
+    // Hold the window for the whole call, so the validator is still loading when AI SDK v4 parses it.
     release = holdValidatorLoading();
     await expect(agent.generateLegacy('Find Dero', { maxSteps: 1, toolChoice: 'required' })).rejects.toThrow(
       /Invalid arguments for tool findUser/,
