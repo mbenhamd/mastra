@@ -70,7 +70,12 @@ import { ProcessorStepOutputSchema, ProcessorStepInputSchema } from '../processo
 import type { ProcessorStepInput, ProcessorStepOutput } from '../processors/step-schema';
 import { MASTRA_AUTH_ORGANIZATION_KEY } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
-import { standardSchemaToJSONSchema, toStandardSchema, jsonSchemaValidatorReady } from '../schema';
+import {
+  standardSchemaToJSONSchema,
+  toStandardSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+} from '../schema';
 import type { InferPublicSchema, InferStandardSchemaOutput, PublicSchema, StandardSchemaWithJSON } from '../schema';
 import type { StorageListWorkflowRunsInput } from '../storage';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
@@ -5348,7 +5353,7 @@ export class Run<
   }
 
   async #validateSchema<TInput>(schema: StandardSchemaWithJSON<TInput>, data: TInput, type: string) {
-    await jsonSchemaValidatorReady();
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const validatedInputData = await schema['~standard'].validate(data);
 
     if (validatedInputData.issues) {
@@ -5384,7 +5389,7 @@ export class Run<
   protected async _validateRequestContext(requestContext?: RequestContext) {
     if (this.validateInputs && this.requestContextSchema) {
       const contextValues = getRequestContextInputValues(requestContext);
-      await jsonSchemaValidatorReady();
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       const validation = this.requestContextSchema['~standard'].validate(contextValues);
 
       if (validation instanceof Promise) {

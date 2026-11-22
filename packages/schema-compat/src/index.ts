@@ -67,4 +67,4 @@ export {
   standardSchemaToJSONSchema,
   JSON_SCHEMA_LIBRARY_OPTIONS,
 } from './standard-schema/standard-schema';
-export { jsonSchemaValidatorReady } from './standard-schema/adapters/json-schema';
+export { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from './standard-schema/adapters/json-schema';

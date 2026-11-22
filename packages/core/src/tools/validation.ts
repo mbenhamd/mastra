@@ -4,6 +4,7 @@ import {
   isStandardSchemaWithJSON,
   toStandardSchema,
   standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
 } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '../schema';
@@ -121,7 +122,7 @@ async function safeValidateAsync<T>(
 ): Promise<{ value: T } | { issues: readonly StandardSchemaIssue[] }> {
   let result;
   try {
-    await jsonSchemaValidatorReady();
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     result = await schema['~standard'].validate(data);
   } catch {
     throw new ToolSchemaValidationError();

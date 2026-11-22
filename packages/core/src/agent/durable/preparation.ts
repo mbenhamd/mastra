@@ -30,7 +30,7 @@ import {
 } from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
 import { getRequestContextInputValues } from '../../request-context/input-source';
-import { toStandardSchema, jsonSchemaValidatorReady } from '../../schema';
+import { toStandardSchema, jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../../schema';
 import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage';
 import { structuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
 import { getSemanticJsonSchema } from '../../stream/base/schema';
@@ -609,7 +609,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // silently ignored on the durable path.
   if (typedAgent.requestContextSchema) {
     const contextValues = getRequestContextInputValues(requestContext);
-    await jsonSchemaValidatorReady();
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const validation = await typedAgent.requestContextSchema['~standard'].validate(contextValues);
 
     if (validation.issues) {

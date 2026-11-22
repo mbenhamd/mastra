@@ -17,7 +17,7 @@ import type { RequestContext } from '@mastra/core/request-context';
 import { standardSchemaToJSONSchema, toStandardSchema } from '@mastra/core/schema';
 import type { ChunkType, FullOutput, JSONValue, LanguageModelUsage, ProviderMetadata } from '@mastra/core/stream';
 import { ChunkFrom, MastraModelOutput } from '@mastra/core/stream';
-import { jsonSchemaValidatorReady } from '@mastra/schema-compat';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '@mastra/schema-compat';
 
 type MastraModelOutputOptions<OUTPUT = undefined> = ConstructorParameters<
   typeof MastraModelOutput<OUTPUT>
@@ -922,7 +922,7 @@ export async function getStructuredOutputFromValue<OUTPUT>(
   }
 
   const schema = toStandardSchema(structuredOutput.schema);
-  await jsonSchemaValidatorReady();
+  if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
   const result = await schema['~standard'].validate(parsed);
   if (!result.issues) {
     return result.value as OUTPUT;

@@ -5,7 +5,12 @@ import type { StructuredOutputOptions } from '../../agent/types';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import type { IMastraLogger } from '../../logger';
 import type { ZodType, PublicSchema, StandardSchemaWithJSON } from '../../schema';
-import { toStandardSchema, standardSchemaToJSONSchema, jsonSchemaValidatorReady } from '../../schema';
+import {
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+} from '../../schema';
 import type { ValidationResult } from '../aisdk/v5/compat';
 import { ChunkFrom } from '../types';
 import type { ChunkType, MastraFinishReason } from '../types';
@@ -225,7 +230,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
     if (this.isZodSchema(schema)) {
       // Use Standard Schema for consistent error message format + safeParse for ZodError cause
       try {
-        await jsonSchemaValidatorReady();
+        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
         const ssResult = await schema['~standard'].validate(value);
 
         if (!ssResult.issues) {
@@ -269,7 +274,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
     // All schemas are wrapped via toStandardSchema() before reaching here,
     // so we can use ~standard.validate() uniformly.
     try {
-      await jsonSchemaValidatorReady();
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       const ssResult = await schema['~standard'].validate(value);
 
       if (!ssResult.issues) {

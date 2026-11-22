@@ -27,7 +27,7 @@ import type { ProcessorState, ProcessorStreamWriter } from '../../../../processo
 import { BACKGROUND_WORK_CONTEXT } from '../../../../processors/background-work-signals';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../../../processors/runner';
 import type { RequestContext } from '../../../../request-context';
-import { jsonSchemaValidatorReady } from '../../../../schema';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../../../../schema';
 import type { ChunkType, ProviderMetadata } from '../../../../stream/types';
 import { ChunkFrom } from '../../../../stream/types';
 import {
@@ -2330,7 +2330,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                 return execution.result;
               }
 
-              await jsonSchemaValidatorReady();
+              if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
               const outputValidation = validateToolOutput(
                 resolveToolOutputValidationSchema(tool),
                 execution.result,

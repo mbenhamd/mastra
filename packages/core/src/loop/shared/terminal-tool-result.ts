@@ -5,7 +5,7 @@ import {
   MAX_TERMINAL_TOOL_RESULT_ENVELOPE_BYTES,
   materializeTerminalToolResult,
 } from '../../agent/message-list/terminal-tool-result';
-import { toStandardSchema, jsonSchemaValidatorReady } from '../../schema';
+import { toStandardSchema, jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../../schema';
 import type { CoreTool, TerminalToolResult, ToolTerminalResultConfig } from '../../tools';
 import { isValidationError } from '../../tools';
 import { findProviderToolByName } from '../../tools/provider-tool-utils';
@@ -146,7 +146,7 @@ async function validateProjection(
 ): Promise<unknown> {
   let result: { value?: unknown; issues?: ReadonlyArray<unknown> };
   try {
-    await jsonSchemaValidatorReady();
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     result = await toStandardSchema(policy.outputSchema)['~standard'].validate(value);
   } catch {
     throw terminalPolicyError(toolName, 'output schema validation threw');

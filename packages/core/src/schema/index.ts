@@ -18,5 +18,6 @@ export {
   toStandardSchema,
   isStandardSchemaWithJSON,
   standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
 } from '@mastra/schema-compat/schema';

@@ -14,7 +14,8 @@ const VENDOR = 'json-schema';
  * a browser worker created from a blob URL. It is imported lazily, starting when this module loads,
  * so importing this package never fails there. Until that import has finished, and if it fails,
  * validation fails closed with a "JSON Schema validator unavailable" issue; it never reports
- * success. Callers that can await should await {@link jsonSchemaValidatorReady} first.
+ * success. Callers that can await should await {@link jsonSchemaValidatorReady} first while
+ * {@link jsonSchemaValidatorLoading} is true.
  */
 let ValidatorClass: typeof Validator | undefined;
 let validatorUnavailableReason = 'still loading';
@@ -28,8 +29,8 @@ const validatorLoad: Promise<void> = import('@cfworker/json-schema').then(
 );
 
 /**
- * Every copy of this adapter in the process registers its load here: a package can bundle its own copy
- * (`@mastra/mcp` does), or an install can hold two versions. Awaiting any copy's
+ * Every copy of this adapter in the process registers its load here until it settles: a package can
+ * bundle its own copy (`@mastra/mcp` does), or an install can hold two versions. Awaiting any copy's
  * {@link jsonSchemaValidatorReady} then also waits for the copy that built the schema being validated.
  */
 const VALIDATOR_LOADS: unique symbol = Symbol.for('mastra.schemaCompat.jsonSchemaValidatorLoads');
@@ -37,9 +38,20 @@ const validatorLoads: Set<Promise<void>> = ((globalThis as { [VALIDATOR_LOADS]?:
   VALIDATOR_LOADS
 ] ??= new Set());
 validatorLoads.add(validatorLoad);
+void validatorLoad.then(() => {
+  validatorLoads.delete(validatorLoad);
+});
 
 /**
- * Resolves once every JSON Schema validator copy loaded so far has loaded or failed to load; it never rejects.
+ * Whether any JSON Schema validator copy in the process is still loading. Once it is false, validation
+ * needs no wait, so a caller can skip awaiting {@link jsonSchemaValidatorReady} and keep its timing.
+ */
+export function jsonSchemaValidatorLoading(): boolean {
+  return validatorLoads.size > 0;
+}
+
+/**
+ * Resolves once every JSON Schema validator copy loading so far has loaded or failed to load; it never rejects.
  */
 export function jsonSchemaValidatorReady(): Promise<void> {
   return Promise.all(validatorLoads).then(() => undefined);

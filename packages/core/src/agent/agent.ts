@@ -133,7 +133,12 @@ import {
 import { getRequestContextInputValues } from '../request-context/input-source';
 import type { DeclaredAgentSchedule } from '../schedules/define';
 import type { InferStandardSchemaOutput } from '../schema';
-import { toStandardSchema, standardSchemaToJSONSchema, jsonSchemaValidatorReady } from '../schema';
+import {
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+} from '../schema';
 import type { SignalProvider } from '../signals/signal-provider';
 import { resolveAgentSkills, mergeWorkspaceSkills } from '../skills/agent-skills-resolver';
 import type { AgentSkillsInput, AgentSkillsResolver, SkillInput } from '../skills/types';
@@ -2178,7 +2183,7 @@ export class Agent<
   async #validateRequestContext(requestContext?: RequestContext) {
     if (this.#requestContextSchema) {
       const contextValues = getRequestContextInputValues(requestContext);
-      await jsonSchemaValidatorReady();
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       const validation = await this.#requestContextSchema['~standard'].validate(contextValues);
 
       if (validation.issues) {
@@ -9659,7 +9664,7 @@ export class Agent<
     const tool = tools[target.toolName] ?? Object.values(tools).find(t => t?.id === target.toolName);
     // Tools resolved elsewhere (workspace, processors) keep the tool-call step's validation.
     if (!tool?.resumeSchema) return;
-    await jsonSchemaValidatorReady();
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const validation = validateToolInput(tool.resumeSchema, resumeData, target.toolName);
     if (!validation.error) return;
 
