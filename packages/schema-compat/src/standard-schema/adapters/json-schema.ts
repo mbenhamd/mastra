@@ -113,7 +113,10 @@ const UNDEFINED_PROPERTY_DEPTH = 256;
  * The value is copied only along the paths that hold such a property, so a
  * value without one is validated as is. Copies keep every other own key,
  * including `__proto__`, and the object's prototype. Arrays keep their items.
- * Cycles reuse the copy already made, and nesting past
+ * An object reached twice reuses its finished copy. A reference back to an
+ * object that is still being walked gets the original, so a cycle cannot
+ * loop but an `undefined` property reached only through it is still
+ * rejected; JSON has no cycles. Nesting past
  * {@link UNDEFINED_PROPERTY_DEPTH} is left as is.
  */
 function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<object, unknown>()): unknown {
