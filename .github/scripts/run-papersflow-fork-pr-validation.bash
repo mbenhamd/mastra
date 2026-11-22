@@ -1629,6 +1629,111 @@ if (lines.join('\n') !== headLock) {
 NODE
 }
 
+# PF-9666 admits one reviewed devDependency: @cfworker/json-schema@^4.1.6 in
+# packages/schema-compat (MIT, no runtime dependencies, no install scripts). The
+# package is already in the graph at 4.1.1 through @modelcontextprotocol/sdk,
+# which keeps it. Admission is bound to PR 631's metadata, the head manifest
+# blob, and an exact delta: the manifest gains only that key, and the lockfile
+# gains only its three importer lines plus the integrity-pinned 4.1.6 package
+# and its dependency-free snapshot.
+pf9666_config() {
+  PF9666_PR_NUMBER="${PAPERSFLOW_PF9666_PR_NUMBER:-631}"
+  PF9666_HEAD_REPOSITORY="${PAPERSFLOW_PF9666_HEAD_REPOSITORY:-mbenhamd/mastra}"
+  PF9666_HEAD_REF="${PAPERSFLOW_PF9666_HEAD_REF:-fix/pf-9666-schema-compat-no-codegen}"
+  PF9666_BASE_REF="${PAPERSFLOW_PF9666_BASE_REF:-main}"
+  PF9666_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256:-1edadeb05c30dcfa2f97814bdd41d90518ae2a5f7867f04bc5f4f5899a920a66}"
+}
+
+verify_pf9666_cfworker_dependency() {
+  pf9666_config
+  if [[ "${PR_NUMBER:-}" != "$PF9666_PR_NUMBER" || "${HEAD_REPOSITORY:-}" != "$PF9666_HEAD_REPOSITORY" || \
+    "${HEAD_REF:-}" != "$PF9666_HEAD_REF" || "${BASE_REF:-}" != "$PF9666_BASE_REF" ]]; then
+    echo 'PF-9666 cfworker devDependency admission is bound to reviewed PR 631 metadata.' >&2
+    return 1
+  fi
+  if ! git_regular_file_at_revision "$2" packages/schema-compat/package.json || \
+    [[ "$(git_blob_sha256 "$2" packages/schema-compat/package.json)" != "$PF9666_PACKAGE_JSON_SHA256" ]]; then
+    echo 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' >&2
+    return 1
+  fi
+  if ! git_regular_file_at_revision "$2" pnpm-lock.yaml; then
+    echo 'PF-9666 pnpm-lock.yaml is not a regular file.' >&2
+    return 1
+  fi
+  node - "$1" "$2" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { isDeepStrictEqual } = require('node:util');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, path) =>
+  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+const dependency = '@cfworker/json-schema';
+
+const manifestPath = 'packages/schema-compat/package.json';
+const baseManifest = JSON.parse(readAt(baseSha, manifestPath));
+for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+  if (Object.hasOwn(baseManifest[field] ?? {}, dependency)) {
+    throw new Error(`PF-9666 base already declares ${dependency} in ${field}.`);
+  }
+}
+const expectedManifest = structuredClone(baseManifest);
+expectedManifest.devDependencies = { ...expectedManifest.devDependencies, [dependency]: '^4.1.6' };
+if (!isDeepStrictEqual(JSON.parse(readAt(headSha, manifestPath)), expectedManifest)) {
+  throw new Error('PF-9666 package.json may only add the reviewed @cfworker/json-schema devDependency.');
+}
+
+const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
+if (baseLock.split('\n').some(line => line.startsWith("  '@cfworker/json-schema@4.1.6'"))) {
+  throw new Error('PF-9666 base lockfile already resolves @cfworker/json-schema@4.1.6.');
+}
+
+const lines = readAt(headSha, 'pnpm-lock.yaml').split('\n');
+const indentation = line => line.length - line.trimStart().length;
+const sectionEnd = start => {
+  let end = start + 1;
+  while (end < lines.length && (lines[end] === '' || indentation(lines[end]) > indentation(lines[start]))) end += 1;
+  return end;
+};
+const uniqueLine = (marker, start = 0, end = lines.length) => {
+  const matches = [];
+  for (let index = start; index < end; index += 1) if (lines[index] === marker) matches.push(index);
+  if (matches.length !== 1) {
+    throw new Error(`PF-9666 expected exactly one lockfile line ${JSON.stringify(marker)}, found ${matches.length}.`);
+  }
+  return matches[0];
+};
+// Removes the exact reviewed block at `marker`, or fails.
+const removeExact = (marker, block, start, end) => {
+  const at = uniqueLine(marker, start, end);
+  if (block.some((line, offset) => lines[at + offset] !== line)) {
+    throw new Error(`PF-9666 lockfile block ${JSON.stringify(marker)} is not the reviewed block.`);
+  }
+  lines.splice(at, block.length);
+};
+// Each block must sit in its own top-level section.
+const section = name => {
+  const start = uniqueLine(`${name}:`);
+  return [start + 1, sectionEnd(start)];
+};
+removeExact("  '@cfworker/json-schema@4.1.6': {}", ["  '@cfworker/json-schema@4.1.6': {}", ''], ...section('snapshots'));
+removeExact("  '@cfworker/json-schema@4.1.6':", [
+  "  '@cfworker/json-schema@4.1.6':",
+  '    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}',
+  '',
+], ...section('packages'));
+const importer = uniqueLine('  packages/schema-compat:');
+const devDependencies = uniqueLine('    devDependencies:', importer + 1, sectionEnd(importer));
+removeExact("      '@cfworker/json-schema':", [
+  "      '@cfworker/json-schema':",
+  '        specifier: ^4.1.6',
+  '        version: 4.1.6',
+], devDependencies + 1, sectionEnd(devDependencies));
+if (lines.join('\n') !== baseLock) {
+  throw new Error('PF-9666 pnpm-lock.yaml may only add the reviewed schema-compat importer entry and the 4.1.6 package.');
+}
+NODE
+}
+
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
@@ -1811,6 +1916,12 @@ classify_install_lane() (
     if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- pnpm-lock.yaml; then
       if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- workflows/inngest/package.json &&
         verify_pf2057_inngest_dependency_cleanup "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"; then
+        emit_validation_lane standard
+        return
+      fi
+      if ! git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- packages/schema-compat/package.json &&
+        verify_pf9666_cfworker_dependency "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"; then
+        echo 'PF-9666 exact schema-compat cfworker devDependency accepted from trusted base policy.'
         emit_validation_lane standard
         return
       fi
@@ -8296,6 +8407,137 @@ NODE
     exit 1
   fi
 
+  # PF-9666: PR 631 adds one reviewed devDependency to schema-compat. The
+  # fixture base gains a schema-compat importer and cfworker 4.1.1 (as MCP pins
+  # it); the head adds only the manifest key, its three importer lines and the
+  # 4.1.6 package and snapshot.
+  pf9666_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    node - <<'NODE'
+const fs = require('node:fs');
+const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8').split('\n');
+const insertAfter = (marker, added) => {
+  const at = lines.indexOf(marker);
+  if (at < 0) throw new Error(`fixture lockfile is missing ${marker}`);
+  lines.splice(at + 1, 0, ...added);
+};
+insertAfter('importers:', ['', '  packages/schema-compat:', '    devDependencies:',
+  '      vitest:', '        specifier: ^4.1.0', '        version: 4.1.0']);
+insertAfter('packages:', ['', "  '@cfworker/json-schema@4.1.1':",
+  '    resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}']);
+insertAfter('  vitest@4.1.0: {}', ["  '@cfworker/json-schema@4.1.1': {}"]);
+fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
+NODE
+    git add pnpm-lock.yaml
+    git commit -q -m 'resolve cfworker through an existing importer'
+    git rev-parse HEAD
+  )"
+  head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' '{"devDependencies":{"@cfworker/json-schema":"^4.1.6"}}' \
+      > packages/schema-compat/package.json
+    node - <<'NODE'
+const fs = require('node:fs');
+const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8').split('\n');
+const importer = lines.indexOf('  packages/schema-compat:');
+lines.splice(importer + 2, 0, "      '@cfworker/json-schema':", '        specifier: ^4.1.6', '        version: 4.1.6');
+lines.splice(lines.indexOf("  '@cfworker/json-schema@4.1.1':") + 3, 0, "  '@cfworker/json-schema@4.1.6':",
+  '    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}', '');
+lines.splice(lines.indexOf("  '@cfworker/json-schema@4.1.1': {}") + 1, 0, "  '@cfworker/json-schema@4.1.6': {}", '');
+fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
+NODE
+    git add packages/schema-compat/package.json pnpm-lock.yaml
+    git commit -q -m 'add the reviewed cfworker devDependency'
+    git rev-parse HEAD
+  )"
+  pf9666_head_sha="$head_sha"
+  pf9666_env=(
+    BASE_SHA="$pf9666_base_sha"
+    PR_NUMBER=631
+    HEAD_REPOSITORY=mbenhamd/mastra
+    HEAD_REF=fix/pf-9666-schema-compat-no-codegen
+    BASE_REF=main
+    PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256="$(cd "$fixture_repo" && git_blob_sha256 "$head_sha" packages/schema-compat/package.json)"
+  )
+  run_pf9666_admission() {
+    local admission_head="$1"
+    local admission_output="$2"
+    shift 2
+    (
+      cd "$fixture_repo"
+      env "${pf9666_env[@]}" HEAD_SHA="$admission_head" GITHUB_OUTPUT= "$@" \
+        bash "$validator_path" --classify-install
+    ) > "$admission_output" 2>&1
+  }
+  output="$test_root/pf9666-admission.log"
+  if ! run_pf9666_admission "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-9666 exact schema-compat cfworker devDependency accepted from trusted base policy.' "$output"
+  assert_contains 'lane=standard' "$output"
+  : > "$command_log"
+  output="$test_root/pf9666-success.log"
+  if ! run_fixture "$head_sha" "$output" "${pf9666_env[@]}"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match build' "$command_log"
+
+  output="$test_root/pf9666-wrong-metadata.log"
+  if run_pf9666_admission "$head_sha" "$output" PR_NUMBER=632; then
+    echo 'PF-9666 admission unexpectedly passed for another pull request.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-9666 cfworker devDependency admission is bound to reviewed PR 631 metadata.' "$output"
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
+
+  output="$test_root/pf9666-manifest-blob.log"
+  if run_pf9666_admission "$head_sha" "$output" PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256=0000; then
+    echo 'PF-9666 admission unexpectedly passed an unreviewed manifest blob.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$pf9666_head_sha"
+    printf '%s\n' '{"devDependencies":{"@cfworker/json-schema":"^4.1.6"},"scripts":{"build":"true"}}' \
+      > packages/schema-compat/package.json
+    git add packages/schema-compat/package.json
+    git commit -q -m 'add an unreviewed schema-compat script'
+    git rev-parse HEAD
+  )"
+  output="$test_root/pf9666-manifest-tamper.log"
+  if run_pf9666_admission "$head_sha" "$output" \
+    PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256="$(cd "$fixture_repo" && git_blob_sha256 "$head_sha" packages/schema-compat/package.json)"; then
+    echo 'PF-9666 admission unexpectedly passed a manifest edit beyond the reviewed key.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-9666 package.json may only add the reviewed @cfworker/json-schema devDependency.' "$output"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$pf9666_head_sha"
+    printf '%s\n' '  left-pad@1.3.0: {}' >> pnpm-lock.yaml
+    git add pnpm-lock.yaml
+    git commit -q -m 'add an unreviewed lockfile package'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/pf9666-lock-tamper.log"
+  if run_pf9666_admission "$head_sha" "$output"; then
+    echo 'PF-9666 admission unexpectedly passed an unreviewed lockfile change.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'PF-9666 pnpm-lock.yaml may only add the reviewed schema-compat importer entry and the 4.1.6 package.' "$output"
+  assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
+
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
@@ -14525,7 +14767,17 @@ if [[ "$inngest_manifest_changed" == true && "$lockfile_changed" == true ]] &&
   inngest_pf2057_dependency_cleanup=true
 fi
 
-if [[ "$lockfile_changed" == true && "$inngest_pf2057_dependency_cleanup" == false ]]; then
+# PF-9666 admits one reviewed schema-compat devDependency, whose lockfile
+# change adds a package and snapshot entry outside the importer sections.
+schema_compat_pf9666_cfworker=false
+if [[ "$lockfile_changed" == true ]] &&
+  grep -Fxq 'packages/schema-compat/package.json' "$changed_files" &&
+  verify_pf9666_cfworker_dependency "$merge_base_sha" "$HEAD_SHA"; then
+  schema_compat_pf9666_cfworker=true
+fi
+
+if [[ "$lockfile_changed" == true && "$inngest_pf2057_dependency_cleanup" == false &&
+  "$schema_compat_pf9666_cfworker" == false ]]; then
   node - "$merge_base_sha" "$HEAD_SHA" > "$changed_lockfile_importers" <<'NODE'
 const { execFileSync } = require('node:child_process');
 
