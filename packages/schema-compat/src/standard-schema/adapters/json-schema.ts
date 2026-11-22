@@ -1,6 +1,6 @@
+import { Validator } from '@cfworker/json-schema';
+import type { OutputUnit, Schema } from '@cfworker/json-schema';
 import type { StandardSchemaV1, StandardJSONSchemaV1 } from '@standard-schema/spec';
-import { Ajv } from 'ajv';
-import Ajv2020 from 'ajv/dist/2020.js';
 import type { JSONSchema7 } from 'json-schema';
 import traverse from 'json-schema-traverse';
 import type { StandardSchemaWithJSON, StandardSchemaWithJSONProps } from '../standard-schema.types';
@@ -18,20 +18,81 @@ export interface JsonSchemaAdapterOptions {
    * Custom name for the schema (used for error messages).
    */
   name?: string;
+}
 
-  /**
-   * Ajv options to customize validation behavior.
-   * @see https://ajv.js.org/options.html
-   */
-  ajvOptions?: ConstructorParameters<typeof Ajv>[0];
+/**
+ * Copies a JSON Schema into the form the validator checks:
+ * - OpenAPI `nullable: true` beside a `type` adds `"null"` to that type, as Ajv's
+ *   built-in `nullable` keyword does; `enum` and `const` still apply.
+ * - `format` is dropped, because validation has never checked formats here.
+ * Only schema positions are visited, so a property named `nullable` or `format`
+ * is left alone.
+ */
+function toValidationSchema(schema: JSONSchema7): Schema {
+  const copy = structuredClone(schema) as Schema;
+  traverse(copy, {
+    cb: (node: traverse.SchemaObject) => {
+      if (node.nullable === true && node.type !== undefined) {
+        const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
+        if (!types.includes('null')) {
+          node.type = [...types, 'null'];
+        }
+      }
+      if (typeof node.format === 'string') {
+        delete node.format;
+      }
+    },
+  });
+  return copy;
+}
+
+/**
+ * Converts a validator instance location (e.g. "#/foo/0/bar") to a Standard Schema path.
+ * Segments are URI-encoded JSON Pointer tokens.
+ */
+function instanceLocationToPath(instanceLocation: string): Array<PropertyKey> {
+  const pointer = instanceLocation.startsWith('#') ? instanceLocation.slice(1) : instanceLocation;
+  if (pointer === '') {
+    return [];
+  }
+  return pointer
+    .slice(1)
+    .split('/')
+    .map(segment => {
+      const part = decodeURIComponent(segment).replace(/~1/g, '/').replace(/~0/g, '~');
+      const num = parseInt(part, 10);
+      return !isNaN(num) && String(num) === part ? num : part;
+    });
+}
+
+/**
+ * Keywords whose error only says that a subschema failed (for example
+ * `Property "x" does not match schema.`). The subschema's own error follows it,
+ * so these add nothing for the reader.
+ */
+const SUMMARY_KEYWORDS = new Set([
+  'properties',
+  'patternProperties',
+  'items',
+  'prefixItems',
+  'additionalItems',
+  'dependentSchemas',
+  'allOf',
+  '$ref',
+  '$recursiveRef',
+]);
+
+function leafErrors(errors: OutputUnit[]): OutputUnit[] {
+  return errors.filter(error => !SUMMARY_KEYWORDS.has(error.keyword));
 }
 
 /**
  * A wrapper class that makes JSON Schema compatible with @standard-schema/spec.
  *
  * This class implements both `StandardSchemaV1` (validation) and `StandardJSONSchemaV1`
- * (JSON Schema conversion) interfaces. Validation is performed using Ajv (Another JSON
- * Schema Validator).
+ * (JSON Schema conversion) interfaces. Validation is performed by
+ * `@cfworker/json-schema`, which interprets the schema and never generates code, so
+ * it also runs where code generation from strings is disallowed.
  *
  * @typeParam T - The TypeScript type that the JSON Schema represents
  *
@@ -59,15 +120,12 @@ export interface JsonSchemaAdapterOptions {
  */
 export class JsonSchemaWrapper<Input = unknown, Output = Input> implements StandardSchemaWithJSON<Input, Output> {
   readonly #schema: JSONSchema7;
-  readonly #options: JsonSchemaAdapterOptions;
-  #ajvValidateCache: ReturnType<Ajv['compile']> | null = null;
-  #ajvInstance: Ajv | null = null;
+  #validator: Validator | null = null;
 
   readonly '~standard': StandardSchemaWithJSONProps<Input, Output>;
 
-  constructor(schema: JSONSchema7, options: JsonSchemaAdapterOptions = {}) {
+  constructor(schema: JSONSchema7, _options: JsonSchemaAdapterOptions = {}) {
     this.#schema = schema;
-    this.#options = options;
 
     // Create the ~standard property
     this['~standard'] = {
@@ -82,38 +140,22 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
   }
 
   /**
-   * Validates a value against the JSON Schema using Ajv.
+   * Validates a value against the JSON Schema.
    *
    * @param value - The value to validate
    * @returns A result object with either the validated value or validation issues
    */
-  #validate(value: unknown): StandardSchemaV1.Result<Output> | Promise<StandardSchemaV1.Result<Output>> {
+  #validate(value: unknown): StandardSchemaV1.Result<Output> {
     try {
-      const validateFn = this.#getAjvValidator();
-      const result = validateFn(value);
+      const result = this.#getValidator().validate(value);
 
-      // Handle async validators (when schema uses $async: true)
-      if ((validateFn as any).$async) {
-        return (result as Promise<void>)
-          .then(() => ({ value: value as Output }))
-          .catch(err => {
-            const errors = (err as any)?.errors ?? [];
-            const issues: StandardSchemaV1.Issue[] = errors.map((e: any) => ({
-              message: e.message ?? 'Validation error',
-              path: this.#ajvPathToStandardPath(e.instancePath),
-            }));
-            return { issues };
-          });
-      }
-
-      if (result) {
+      if (result.valid) {
         return { value: value as Output };
       }
 
-      // Convert Ajv errors to Standard Schema issues
-      const issues: StandardSchemaV1.Issue[] = (validateFn.errors ?? []).map(err => ({
-        message: err.message ?? 'Validation error',
-        path: this.#ajvPathToStandardPath(err.instancePath),
+      const issues: StandardSchemaV1.Issue[] = leafErrors(result.errors).map(error => ({
+        message: error.error,
+        path: instanceLocationToPath(error.instanceLocation),
       }));
 
       return { issues };
@@ -124,31 +166,6 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
         issues: [{ message: `Schema validation error: ${message}` }],
       };
     }
-  }
-
-  /**
-   * Converts an Ajv instance path (e.g., "/foo/0/bar") to a Standard Schema path array.
-   *
-   * @param instancePath - The Ajv instance path
-   * @returns An array of path segments
-   */
-  #ajvPathToStandardPath(instancePath: string): Array<PropertyKey> {
-    if (!instancePath || instancePath === '') {
-      return [];
-    }
-
-    // Remove leading slash and split by '/'
-    const parts = instancePath.slice(1).split('/');
-
-    return parts.map(part => {
-      // Try to parse as number for array indices
-      const num = parseInt(part, 10);
-      if (!isNaN(num) && String(num) === part) {
-        return num;
-      }
-      // Decode JSON Pointer escapes: ~1 -> /, ~0 -> ~
-      return part.replace(/~1/g, '/').replace(/~0/g, '~');
-    });
   }
 
   /**
@@ -201,22 +218,16 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
   }
 
   /**
-   * Gets or creates an Ajv validator for the schema.
-   * The validator is cached for performance.
+   * Gets or creates the validator for the schema. It is created on first use and
+   * reused. Draft 2020-12 applies when `$schema` names it, draft-07 otherwise.
+   * Every error is collected, not only the first.
    */
-  #getAjvValidator(): ReturnType<Ajv['compile']> {
-    if (!this.#ajvValidateCache) {
+  #getValidator(): Validator {
+    if (!this.#validator) {
       const is2020 = typeof this.#schema.$schema === 'string' && this.#schema.$schema.includes('2020-12');
-      const AjvClass = is2020 ? Ajv2020 : Ajv;
-      this.#ajvInstance = new AjvClass({
-        allErrors: true,
-        strict: false,
-        ...this.#options.ajvOptions,
-      });
-
-      this.#ajvValidateCache = this.#ajvInstance.compile(this.#schema);
+      this.#validator = new Validator(toValidationSchema(this.#schema), is2020 ? '2020-12' : '7', false);
     }
-    return this.#ajvValidateCache;
+    return this.#validator;
   }
 
   /**
@@ -225,16 +236,6 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
   getSchema(): JSONSchema7 {
     return this.#schema;
   }
-
-  /**
-   * Returns the Ajv instance used for validation.
-   * Useful for advanced use cases like adding custom formats or keywords.
-   */
-  getAjv(): Ajv {
-    // Ensure the validator is created (which creates the Ajv instance)
-    this.#getAjvValidator();
-    return this.#ajvInstance!;
-  }
 }
 
 /**
@@ -242,7 +243,7 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
  *
  * This function creates a wrapper that implements both `StandardSchemaV1` (validation)
  * and `StandardJSONSchemaV1` (JSON Schema conversion) interfaces. Validation is performed
- * using Ajv (Another JSON Schema Validator).
+ * by `@cfworker/json-schema`, which never generates code.
  *
  * @typeParam T - The TypeScript type that the JSON Schema represents
  * @param schema - The JSON Schema to wrap
