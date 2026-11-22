@@ -1,6 +1,7 @@
 import { parseMemoryRequestContext } from '@mastra/core/memory';
-import { toStandardSchema, jsonSchemaValidatorReady } from '@mastra/core/schema';
+import { toStandardSchema } from '@mastra/core/schema';
 import type { PublicSchema } from '@mastra/core/schema';
+import { jsonSchemaValidatorReady } from '@mastra/schema-compat';
 import { standardSchemaToJSONSchema } from '@mastra/schema-compat/schema';
 import { z } from 'zod';
 

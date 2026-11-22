@@ -1,4 +1,5 @@
 import { MastraError } from '@mastra/core/error';
+import { jsonSchemaValidatorReady } from '@mastra/core/schema';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import type { ApiRoute } from '@mastra/core/server';
 import { registerApiRoute } from '@mastra/core/server';
@@ -254,6 +255,7 @@ export class ProjectRoutes extends Route<ProjectRoutesDeps> {
       else merged[key] = value;
     }
     this.#settingsSchema ??= normalizeFactorySandboxSettings(this.deps.sandbox!);
+    await jsonSchemaValidatorReady();
     const result = await this.#settingsSchema['~standard'].validate(merged);
     if (!result.issues) return { merged: Object.keys(merged).length > 0 ? merged : null };
 

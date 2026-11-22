@@ -15,17 +15,13 @@ import type {
 import { EntityType, SpanType, getOrCreateSpan } from '@mastra/core/observability';
 import type { Span, TracingContext } from '@mastra/core/observability';
 import { RequestContext } from '@mastra/core/request-context';
-import {
-  isStandardSchemaWithJSON,
-  standardSchemaToJSONSchema,
-  toStandardSchema,
-  jsonSchemaValidatorReady,
-} from '@mastra/core/schema';
+import { isStandardSchemaWithJSON, standardSchemaToJSONSchema, toStandardSchema } from '@mastra/core/schema';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
 import { createTool, isValidationError } from '@mastra/core/tools';
 import type { InternalCoreTool, MCPToolExecutionContext, MCPToolType, ToolAction } from '@mastra/core/tools';
 import { makeCoreTool } from '@mastra/core/utils';
 import type { SuspendOptions, Workflow } from '@mastra/core/workflows';
+import { jsonSchemaValidatorReady } from '@mastra/schema-compat';
 import { PromptSchema } from '@modelcontextprotocol/core';
 import { RESOURCE_MIME_TYPE, RESOURCE_URI_META_KEY } from '@modelcontextprotocol/ext-apps';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';

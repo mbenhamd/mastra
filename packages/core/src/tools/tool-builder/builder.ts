@@ -1081,6 +1081,7 @@ export class CoreToolBuilder extends MastraBase {
     };
 
     return async (args: unknown, execOptions?: MastraToolInvocationOptions) => {
+      await jsonSchemaValidatorReady();
       let logger = options.logger || this.logger;
       const actor = execOptions?.actor;
 
@@ -1468,10 +1469,12 @@ export class CoreToolBuilder extends MastraBase {
       // validator separately. The agent loop uses this to keep schema-invalid
       // calls out of a user-facing approval queue; execute() still performs
       // authoritative validation immediately before side effects.
-      validateInput: (params: unknown) =>
-        approvalInputValidationSchema
+      validateInput: async (params: unknown) => {
+        await jsonSchemaValidatorReady();
+        return approvalInputValidationSchema
           ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
-          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name),
+          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name);
+      },
       approvalInputEditing,
       execute: this.originalTool.execute
         ? this.createExecute(

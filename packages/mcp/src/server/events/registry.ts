@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { toStandardSchema, jsonSchemaValidatorReady } from '@mastra/core/schema';
+import { toStandardSchema } from '@mastra/core/schema';
 import type { StandardSchemaWithJSON } from '@mastra/core/schema';
+import { jsonSchemaValidatorReady } from '@mastra/schema-compat';
 import { ProtocolError } from '@modelcontextprotocol/server';
 
 import { EVENTS_ERROR_CODES } from '../../shared/events';
