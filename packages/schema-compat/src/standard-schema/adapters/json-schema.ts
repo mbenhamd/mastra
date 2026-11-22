@@ -1,5 +1,4 @@
-import { Validator } from '@cfworker/json-schema';
-import type { OutputUnit, Schema } from '@cfworker/json-schema';
+import type { OutputUnit, Schema, Validator } from '@cfworker/json-schema';
 import type { StandardSchemaV1, StandardJSONSchemaV1 } from '@standard-schema/spec';
 import type { JSONSchema7 } from 'json-schema';
 import traverse from 'json-schema-traverse';
@@ -9,6 +8,31 @@ import type { StandardSchemaWithJSON, StandardSchemaWithJSONProps } from '../sta
  * Vendor name for JSON Schema wrapped schemas.
  */
 const VENDOR = 'json-schema';
+
+/**
+ * `@cfworker/json-schema` builds a URL from `self.location` while it is imported, which throws in
+ * a browser worker created from a blob URL. It is imported lazily, starting when this module loads,
+ * so importing this package never fails there. Until that import has finished, and if it fails,
+ * validation fails closed with a "JSON Schema validator unavailable" issue; it never reports
+ * success. Callers that can await should await {@link jsonSchemaValidatorReady} first.
+ */
+let ValidatorClass: typeof Validator | undefined;
+let validatorUnavailableReason = 'still loading';
+const validatorLoad: Promise<void> = import('@cfworker/json-schema').then(
+  module => {
+    ValidatorClass = module.Validator;
+  },
+  (error: unknown) => {
+    validatorUnavailableReason = error instanceof Error ? error.message : String(error);
+  },
+);
+
+/**
+ * Resolves once the JSON Schema validator has loaded or failed to load; it never rejects.
+ */
+export function jsonSchemaValidatorReady(): Promise<void> {
+  return validatorLoad;
+}
 
 /**
  * Options for creating a Standard Schema from JSON Schema.
@@ -385,10 +409,13 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    */
   #getValidator(): Validator {
     if (!this.#validator) {
+      if (!ValidatorClass) {
+        throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
+      }
       const is2020 = typeof this.#schema.$schema === 'string' && this.#schema.$schema.includes('2020-12');
       const validationSchema = toValidationSchema(this.#schema);
       refuseDynamicRef(validationSchema);
-      this.#validator = new Validator(validationSchema, is2020 ? '2020-12' : '7', false);
+      this.#validator = new ValidatorClass(validationSchema, is2020 ? '2020-12' : '7', false);
     }
     return this.#validator;
   }

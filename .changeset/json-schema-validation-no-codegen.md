@@ -6,6 +6,8 @@ Fixed JSON Schema tool inputs failing validation in runtimes started with `--dis
 
 A schema that uses `$dynamicRef` anywhere, including where only a `$ref` or `dependencies` reaches it, is now refused: every value gets one issue saying `$dynamicRef is not supported`. The new validator cannot resolve `$dynamicRef`, and refusing the schema is safer than letting such references pass unchecked. `$ref` is unaffected. `$recursiveRef` is now resolved in every draft; Ajv resolved it only for some draft and anchor combinations.
 
+The validator is imported lazily when the package loads, because `@cfworker/json-schema` reads `self.location` on import and throws in a browser worker created from a blob URL. Importing the package therefore never fails there. Until the validator has loaded, which takes a moment after startup, and permanently where it cannot load (such as those blob workers), every JSON Schema validation fails closed with the issue `JSON Schema validator unavailable (<reason>)`; it never reports success. Await the new `jsonSchemaValidatorReady()` before validating if you validate right after startup.
+
 The `ajvOptions` option and the `getAjv()` method are removed, and Ajv customization has no replacement. Drop the option:
 
 ```ts
