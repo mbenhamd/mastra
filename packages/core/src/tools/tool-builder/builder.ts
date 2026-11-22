@@ -1366,8 +1366,10 @@ export class CoreToolBuilder extends MastraBase {
             io: 'input',
           }),
           {
-            // While the JSON Schema validator import is still loading, wait for it so a call right
-            // after startup is not refused; once it has settled, validation stays synchronous.
+            // While the JSON Schema validator import is still loading, return a Promise that waits
+            // for it. AI SDK versions that await the hook validate after the load. AI SDK v4 does
+            // not await it and reads the Promise as a failed result, so it refuses the call (fail
+            // closed). Once the validator has loaded, validation stays synchronous.
             validate: (value: unknown) =>
               jsonSchemaValidatorLoading()
                 ? jsonSchemaValidatorReady().then(() => validateWithSchema(value))

@@ -61,15 +61,16 @@ describe('tool input validation while the JSON Schema validator is loading', () 
       logger: false,
     }).getAgent('finder');
 
+    // Hold the window for the whole call, so the refusal can only come from the loading window.
     release = holdValidatorLoading();
-    expect(jsonSchemaValidatorLoading()).toBe(true);
-    // Settle the window soon after, so a call that got past validation would reach execute.
-    setTimeout(() => release?.(), 50);
-
     await expect(agent.generateLegacy('Find Dero', { maxSteps: 1, toolChoice: 'required' })).rejects.toThrow(
       /Invalid arguments for tool findUser/,
     );
-    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(jsonSchemaValidatorLoading()).toBe(true);
+
+    // Settle the window: a call that got past validation would now reach execute.
+    release();
+    await new Promise(resolve => setTimeout(resolve, 50));
     expect(execute).not.toHaveBeenCalled();
   });
 
