@@ -365,6 +365,18 @@ describe('json-schema standard-schema adapter', () => {
         },
       ],
       [
+        'reached through a $ref to a member named like a name-map keyword',
+        {
+          $schema: 'https://json-schema.org/draft/2020-12/schema',
+          ...dynamicNode,
+          properties: {
+            ...dynamicNode.properties,
+            children: { type: 'array', items: { $ref: '#/components/schemas/dependencies' } },
+          },
+          components: { schemas: { dependencies: { $dynamicRef: '#node' } } },
+        },
+      ],
+      [
         'in a property named like a data keyword',
         {
           $schema: 'https://json-schema.org/draft/2020-12/schema',

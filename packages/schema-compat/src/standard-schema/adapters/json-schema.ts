@@ -67,7 +67,8 @@ const SCHEMA_MAP_KEYWORD_SET = new Set<string>(SCHEMA_MAP_KEYWORDS);
  * `dependencies`, so the walk covers every object rather than mirroring one of
  * those routes. The one exception is the object under a name-map keyword
  * (`properties`, `$defs`, ...): its keys are names, so a property named
- * `$dynamicRef` is not refused, while every value under it is still walked.
+ * `$dynamicRef` with a schema value is not refused (a string value is), while
+ * every value under it is still walked.
  * Data under `const` or `enum` that contains a `$dynamicRef` key is refused
  * too; failing closed there is preferred to telling data from schemas.
  */
@@ -80,7 +81,13 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
     node.forEach(item => refuseDynamicRef(item, false, seen));
     return;
   }
-  if (!isNameMap && Object.hasOwn(node, '$dynamicRef')) {
+  // On a name map a property named `$dynamicRef` holds a schema object; a string
+  // there is never a name-map entry, and a `$ref` can still make the validator
+  // read that object as a schema, so it is refused too.
+  if (
+    Object.hasOwn(node, '$dynamicRef') &&
+    (!isNameMap || typeof (node as Record<string, unknown>).$dynamicRef === 'string')
+  ) {
     throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
   }
   for (const [key, value] of Object.entries(node)) {
