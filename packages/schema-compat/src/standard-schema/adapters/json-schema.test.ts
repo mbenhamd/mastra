@@ -198,6 +198,39 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in invalidResult).toBe(true);
     });
 
+    it('validates an undefined property as absent and returns the value unchanged', async () => {
+      const standardSchema = toStandardSchema<{ ok: boolean; error?: string }>({
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, error: { type: 'string' } },
+        required: ['ok'],
+        additionalProperties: false,
+      });
+      const value = { ok: true, error: undefined };
+
+      const result = await standardSchema['~standard'].validate(value);
+
+      expect(result).toEqual({ value });
+      expect('value' in result && result.value).toBe(value);
+    });
+
+    it('still rejects an own __proto__ key that the schema does not allow', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: { a: { type: 'string' } },
+        additionalProperties: false,
+      });
+
+      // With an undefined property beside it, the value is copied before validation.
+      const withUndefined = JSON.parse('{"a":"x","__proto__":{}}');
+      withUndefined.b = undefined;
+
+      const plain = await standardSchema['~standard'].validate(JSON.parse('{"a":"x","__proto__":{}}'));
+      const copied = await standardSchema['~standard'].validate(withUndefined);
+
+      expect('issues' in plain).toBe(true);
+      expect('issues' in copied).toBe(true);
+    });
+
     it('should preserve recursive $ref schemas when converting output JSON Schema', () => {
       const jsonSchema = {
         type: 'object',

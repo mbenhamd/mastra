@@ -100,29 +100,62 @@ function toValidationSchema(schema: JSONSchema7): Schema {
   return copy;
 }
 
+/** Nesting below which `withoutUndefinedProperties` stops looking. */
+const UNDEFINED_PROPERTY_DEPTH = 256;
+
 /**
- * A property whose value is `undefined` is absent in JSON, and Ajv treated it
- * so. The validator rejects `undefined` anywhere, so such properties are left
- * out of plain objects (recursively) before validation. Arrays are entered but
- * keep their items.
+ * Validates a value as its JSON form would: a plain-object property whose
+ * value is `undefined` is left out, because JSON has no `undefined` and the
+ * validator rejects it anywhere. Ajv ignored such properties only for
+ * `properties`, `required` and `dependencies`; here every keyword sees the
+ * object without them, as it would after a JSON round trip.
+ *
+ * The value is copied only along the paths that hold such a property, so a
+ * value without one is validated as is. Copies keep every other own key,
+ * including `__proto__`, and the object's prototype. Arrays keep their items.
+ * Cycles reuse the copy already made, and nesting past
+ * {@link UNDEFINED_PROPERTY_DEPTH} is left as is.
  */
-function withoutUndefinedProperties(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(withoutUndefinedProperties);
-  }
-  if (typeof value !== 'object' || value === null) {
+function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<object, unknown>()): unknown {
+  if (typeof value !== 'object' || value === null || depth > UNDEFINED_PROPERTY_DEPTH) {
     return value;
+  }
+  if (copies.has(value)) {
+    return copies.get(value);
+  }
+  if (Array.isArray(value)) {
+    copies.set(value, value);
+    let copy: unknown[] | undefined;
+    value.forEach((item, index) => {
+      const next = withoutUndefinedProperties(item, depth + 1, copies);
+      if (next !== item) {
+        copy ??= [...value];
+        copy[index] = next;
+      }
+    });
+    if (copy) copies.set(value, copy);
+    return copy ?? value;
   }
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
     return value;
   }
-  const copy: Record<string, unknown> = {};
-  for (const [key, property] of Object.entries(value)) {
+  copies.set(value, value);
+  const entries = Object.entries(value);
+  const next = entries.map(
+    ([key, property]) => [key, withoutUndefinedProperties(property, depth + 1, copies)] as const,
+  );
+  if (next.every(([, property], index) => property !== undefined && property === entries[index]![1])) {
+    return value;
+  }
+  // defineProperty, not assignment: an own `__proto__` key stays a key.
+  const copy = Object.create(prototype) as object;
+  for (const [key, property] of next) {
     if (property !== undefined) {
-      copy[key] = withoutUndefinedProperties(property);
+      Object.defineProperty(copy, key, { value: property, enumerable: true, writable: true, configurable: true });
     }
   }
+  copies.set(value, copy);
   return copy;
 }
 
