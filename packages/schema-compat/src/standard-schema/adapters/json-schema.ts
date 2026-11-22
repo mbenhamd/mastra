@@ -427,18 +427,22 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
 
   /**
    * Gets or creates the validator for the schema. It is created on first use and
-   * reused. Draft 2020-12 applies when `$schema` names it, draft-07 otherwise.
-   * Every error is collected, not only the first.
+   * reused. Every error is collected, not only the first.
+   *
+   * Every schema, draft-07 included, is validated in the validator's 2020-12 mode.
+   * In its draft-07 mode the validator skips keywords beside `$ref` (for example
+   * `{ $ref, maxLength }`), which Ajv applied, so input Ajv refused would pass. The
+   * validator reads the draft only for that and for draft-04, so draft-07 tuple
+   * `items`, `additionalItems` and `dependencies` behave the same in 2020-12 mode.
    */
   #getValidator(): Validator {
     if (!this.#validator) {
       if (!ValidatorClass) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
-      const is2020 = typeof this.#schema.$schema === 'string' && this.#schema.$schema.includes('2020-12');
       const validationSchema = toValidationSchema(this.#schema);
       refuseDynamicRef(validationSchema);
-      this.#validator = new ValidatorClass(validationSchema, is2020 ? '2020-12' : '7', false);
+      this.#validator = new ValidatorClass(validationSchema, '2020-12', false);
     }
     return this.#validator;
   }

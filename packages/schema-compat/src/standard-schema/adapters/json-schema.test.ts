@@ -324,6 +324,18 @@ describe('json-schema standard-schema adapter', () => {
       }
     });
 
+    it('applies keywords beside $ref in a schema without $schema, as Ajv did', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: { id: { $ref: '#/definitions/Id', maxLength: 3 } },
+        definitions: { Id: { type: 'string' } },
+      } as JSONSchema7);
+
+      const tooLong = await standardSchema['~standard'].validate({ id: 'toolong' });
+      expect('issues' in tooLong && tooLong.issues?.length).toBeGreaterThan(0);
+      expect(await standardSchema['~standard'].validate({ id: 'abc' })).toEqual({ value: { id: 'abc' } });
+    });
+
     it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
       const standardSchema = toStandardSchema({
         $schema: 'https://json-schema.org/draft/2020-12/schema',
