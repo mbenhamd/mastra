@@ -141,6 +141,22 @@ export interface ComposioListConnectionsResult extends ListConnectionsResult {
   items: ComposioExistingConnection[];
 }
 
+/** Options for {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioListOwnedConnectionsOpts {
+  /** The bucket whose own accounts are listed. */
+  userId: string;
+  /** Toolkit slugs to list the bucket's accounts for. */
+  toolkits: readonly string[];
+}
+
+/** One account listed by {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioOwnedConnection extends ExistingConnection {
+  /** The toolkit slug Composio reports for the account. */
+  toolkit: string;
+  /** Composio's sharing model for the account, when Composio reports one. */
+  accountType?: 'PRIVATE' | 'SHARED';
+}
+
 export interface ResolveComposioCatalogToolsOpts {
   /** Composio tool slugs to materialise. */
   toolSlugs: string[];
@@ -834,6 +850,63 @@ export class ComposioToolProvider extends BaseToolProvider {
 
     const hasMore = lists.some(hasNextCursor);
     return { items, pagination: { page, perPage, hasMore } };
+  }
+
+  /**
+   * List every account one bucket owns across several toolkits, in one
+   * owner-filtered listing that follows Composio's cursor to its end.
+   * `listConnections` with `ownedOnly` answers the same question for one
+   * toolkit and its first page only, so a caller checking N toolkits makes N
+   * calls and can miss accounts past that page.
+   *
+   * Another user's SHARED account is never included, whatever its ACL. A
+   * failed or repeated-cursor listing throws rather than returning the
+   * accounts seen so far, so callers never read a partial scan as "not
+   * connected".
+   */
+  async listOwnedConnections(opts: ComposioListOwnedConnectionsOpts): Promise<ComposioOwnedConnection[]> {
+    if (opts.userId.length === 0) {
+      throw new Error('[composio] listOwnedConnections requires a userId');
+    }
+    const toolkitSlugs = Array.from(new Set(opts.toolkits));
+    if (toolkitSlugs.length === 0) return [];
+
+    const composio = this.getRawClient();
+    const items: ComposioOwnedConnection[] = [];
+    const seen = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (;;) {
+      // Composio lists PRIVATE accounts only by default; `'ALL'` with the
+      // owner filter adds the bucket's own SHARED accounts.
+      const page: ConnectedAccountListResponse = await composio.connectedAccounts.list({
+        toolkitSlugs,
+        userIds: [opts.userId],
+        accountType: 'ALL',
+        limit: MAX_LIMIT,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const account of page.items ?? []) {
+        if (seen.has(account.id)) continue;
+        seen.add(account.id);
+        const accountType = account.experimental?.accountType;
+        items.push({
+          connectionId: account.id,
+          toolkit: account.toolkit.slug,
+          status: mapComposioStatus(account.status, account.isDisabled),
+          createdAt: account.createdAt,
+          authorId: opts.userId,
+          ...(accountType ? { accountType } : {}),
+        });
+      }
+      if (!hasNextCursor(page)) return items;
+      const next = (page as { nextCursor: string }).nextCursor;
+      if (cursors.has(next)) {
+        throw new Error('Composio repeated a cursor before the owned connections were listed');
+      }
+      cursors.add(next);
+      cursor = next;
+    }
   }
 
   /**

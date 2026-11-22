@@ -1460,6 +1460,58 @@ describe('ComposioToolProvider — listConnections', () => {
         'Composio repeated a cursor before connection ownership could be resolved',
       );
     });
+
+    it("lists the user's own accounts across toolkits and pages in one owner-filtered listing", async () => {
+      const queries: URLSearchParams[] = [];
+      response = query => {
+        queries.push(query);
+        if (query.get('user_ids') !== 'user_a' || query.get('account_type') !== 'ALL') {
+          return { items: [account('ca_other', 'ACTIVE', 'admin', 'SHARED')], next_cursor: null };
+        }
+        return query.get('cursor') === 'page-2'
+          ? { items: [{ ...account('ca_cal', 'INITIATED', 'user_a', 'PRIVATE'), toolkit: { slug: 'googlecalendar' } }] }
+          : { items: [account('ca_mail', 'ACTIVE', 'user_a', 'SHARED')], next_cursor: 'page-2' };
+      };
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+
+      const result = await integration.listOwnedConnections({
+        userId: 'user_a',
+        toolkits: ['gmail', 'googlecalendar', 'gmail'],
+      });
+
+      expect(result).toEqual([
+        {
+          connectionId: 'ca_mail',
+          toolkit: 'gmail',
+          status: 'active',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          accountType: 'SHARED',
+        },
+        {
+          connectionId: 'ca_cal',
+          toolkit: 'googlecalendar',
+          status: 'pending',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          accountType: 'PRIVATE',
+        },
+      ]);
+      expect(queries).toHaveLength(2);
+      expect(queries.map(query => query.getAll('toolkit_slugs').join(','))).toEqual([
+        'gmail,googlecalendar',
+        'gmail,googlecalendar',
+      ]);
+    });
+
+    it('rejects an owned-connection listing whose cursor repeats instead of returning part of it', async () => {
+      response = () => ({ items: [account('ca_mail', 'ACTIVE', 'user_a', 'PRIVATE')], next_cursor: 'same' });
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+
+      await expect(integration.listOwnedConnections({ userId: 'user_a', toolkits: ['gmail'] })).rejects.toThrow(
+        'Composio repeated a cursor before the owned connections were listed',
+      );
+    });
   });
 });
 

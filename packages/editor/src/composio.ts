@@ -6,6 +6,8 @@ export type {
   ComposioExistingConnection,
   ComposioListConnectionsOpts,
   ComposioListConnectionsResult,
+  ComposioListOwnedConnectionsOpts,
+  ComposioOwnedConnection,
   ComposioRequireToolApproval,
   ResolveComposioCatalogToolsOpts,
   ComposioToolApprovalInput,
