@@ -58,34 +58,33 @@ function isSchemaObject(value: unknown): value is Record<string, unknown> {
 const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
   '$dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely';
 
-/** Keywords whose value is data, never a schema. */
-const DATA_KEYWORDS = new Set(['const', 'default', 'enum', 'examples']);
+const SCHEMA_MAP_KEYWORD_SET = new Set<string>(SCHEMA_MAP_KEYWORDS);
 
 /**
- * Refuses a schema in which any object, at any depth outside data keywords,
- * has a string `$dynamicRef`. The validator can reach a subschema through a
- * keyword, through a `$ref` pointer to any path (for example
- * `#/components/schemas/Node`), and through `dependencies`, so the walk covers
- * every object rather than mirroring one of those routes. A property named
- * `$dynamicRef` holds a schema or an array, not a string, so it is not refused.
+ * Refuses a schema in which any object at any depth has a `$dynamicRef` key.
+ * The validator can reach a subschema through a keyword, through a `$ref`
+ * pointer to any path (for example `#/components/schemas/Node`), and through
+ * `dependencies`, so the walk covers every object rather than mirroring one of
+ * those routes. The one exception is the object under a name-map keyword
+ * (`properties`, `$defs`, ...): its keys are names, so a property named
+ * `$dynamicRef` is not refused, while every value under it is still walked.
+ * Data under `const` or `enum` that contains a `$dynamicRef` key is refused
+ * too; failing closed there is preferred to telling data from schemas.
  */
-function refuseDynamicRef(node: unknown, seen = new Set<object>()): void {
+function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<object>()): void {
   if (typeof node !== 'object' || node === null || seen.has(node)) {
     return;
   }
   seen.add(node);
   if (Array.isArray(node)) {
-    node.forEach(item => refuseDynamicRef(item, seen));
+    node.forEach(item => refuseDynamicRef(item, false, seen));
     return;
   }
-  const record = node as Record<string, unknown>;
-  if (typeof record.$dynamicRef === 'string') {
+  if (!isNameMap && Object.hasOwn(node, '$dynamicRef')) {
     throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
   }
-  for (const [key, value] of Object.entries(record)) {
-    if (!DATA_KEYWORDS.has(key)) {
-      refuseDynamicRef(value, seen);
-    }
+  for (const [key, value] of Object.entries(node)) {
+    refuseDynamicRef(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key), seen);
   }
 }
 
