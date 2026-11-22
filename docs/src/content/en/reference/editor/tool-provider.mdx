@@ -278,7 +278,7 @@ const connections = await composio.listOwnedConnections({
 const connected = new Set(connections.filter(c => c.status === 'active').map(c => c.toolkit))
 ```
 
-Like `listConnections({ ownedOnly: true })`, it relies on Composio's owner filter, so SHARED accounts owned by other users are not included. It throws instead of returning a partial list when Composio fails, returns a page without items, an account without an id or toolkit, a cursor that is not a string, a repeated cursor, or more than 50 pages. A `userId` must be non-empty and contain no commas.
+Like `listConnections({ ownedOnly: true })`, it relies on Composio's owner filter, so it leaves out SHARED accounts owned by other users. It throws instead of returning a partial list when Composio fails, returns a page without items, an account without an id or toolkit, a non-string cursor, a repeated cursor, or more than 50 pages. A `userId` must be non-empty and contain no commas.
 
 ### Map application users to Composio users
 
