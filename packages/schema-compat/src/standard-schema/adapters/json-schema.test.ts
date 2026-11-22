@@ -290,6 +290,21 @@ describe('json-schema standard-schema adapter', () => {
         expect(invalidResult.issues.length).toBeGreaterThan(0);
       }
     });
+
+    it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
+      const standardSchema = toStandardSchema({
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        type: 'array',
+        prefixItems: [
+          { type: 'string', format: 'email' },
+          { type: 'string', nullable: true },
+        ],
+      } as JSONSchema7);
+
+      expect(await standardSchema['~standard'].validate(['not an email', null])).toEqual({
+        value: ['not an email', null],
+      });
+    });
   });
 
   describe('isStandardSchemaWithJSON', () => {
@@ -321,10 +336,12 @@ describe('json-schema standard-schema adapter', () => {
 
   describe('where code generation from strings is disallowed', () => {
     // Composio's GMAIL_FETCH_EMAILS input schema as its API served it on 2026-11-22,
-    // with descriptions and examples left out. Note the OpenAPI `nullable` fields.
+    // with descriptions and examples left out, and `additionalProperties: false` as
+    // applyCompatLayer adds it. Note the OpenAPI `nullable` fields.
     const gmailFetchEmails: JSONSchema7 = {
       type: 'object',
       title: 'FetchEmailsRequest',
+      additionalProperties: false,
       properties: {
         query: { type: 'string', title: 'Query', default: null, nullable: true } as JSONSchema7,
         user_id: { type: 'string', title: 'User Id', default: 'me' },

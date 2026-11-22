@@ -6186,8 +6186,8 @@ importers:
         specifier: ^3.0.130
         version: 3.0.130(zod@4.6.7)
       '@cfworker/json-schema':
-        specifier: ^4.1.1
-        version: 4.1.1
+        specifier: ^4.1.6
+        version: 4.1.6
       '@internal/ai-sdk-v4':
         specifier: workspace:*
         version: link:../_vendored/ai_v4
@@ -12404,6 +12404,9 @@ packages:
 
   '@cfworker/json-schema@4.1.1':
     resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}
+
+  '@cfworker/json-schema@4.1.6':
+    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}
 
   '@changesets/apply-release-plan@7.1.1':
     resolution: {integrity: sha512-9qPCm/rLx/xoOFXIHGB229+4GOL76S4MC+7tyOuTsR6+1jYlfFDQORdvwR5hDA6y4FL2BPt3qpbcQIS+dW85LA==}
@@ -35054,6 +35057,8 @@ snapshots:
     optional: true
 
   '@cfworker/json-schema@4.1.1': {}
+
+  '@cfworker/json-schema@4.1.6': {}
 
   '@changesets/apply-release-plan@7.1.1':
     dependencies:

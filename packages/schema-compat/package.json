@@ -108,7 +108,7 @@
     "@ai-sdk/anthropic": "^3.0.133",
     "@ai-sdk/google": "^3.0.135",
     "@ai-sdk/openai": "^3.0.130",
-    "@cfworker/json-schema": "^4.1.1",
+    "@cfworker/json-schema": "^4.1.6",
     "@internal/ai-sdk-v4": "workspace:*",
     "@internal/ai-sdk-v5": "workspace:*",
     "@internal/ai-v6": "workspace:*",

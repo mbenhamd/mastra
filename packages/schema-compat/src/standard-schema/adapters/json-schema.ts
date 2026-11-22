@@ -20,6 +20,72 @@ export interface JsonSchemaAdapterOptions {
   name?: string;
 }
 
+/** Keywords whose value is one subschema. */
+const SCHEMA_KEYWORDS = [
+  'additionalItems',
+  'additionalProperties',
+  'contains',
+  'else',
+  'if',
+  'items',
+  'not',
+  'propertyNames',
+  'then',
+  'unevaluatedItems',
+  'unevaluatedProperties',
+] as const;
+/** Keywords whose value is an array of subschemas. */
+const SCHEMA_ARRAY_KEYWORDS = ['allOf', 'anyOf', 'items', 'oneOf', 'prefixItems'] as const;
+/** Keywords whose value maps names to subschemas. */
+const SCHEMA_MAP_KEYWORDS = [
+  '$defs',
+  'definitions',
+  'dependencies',
+  'dependentSchemas',
+  'patternProperties',
+  'properties',
+] as const;
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Applies `nullable` and drops `format` on one schema and every subschema, by
+ * keyword (draft-07 and 2020-12). Data keywords such as `const`, `enum`,
+ * `default` and `examples` are never entered.
+ */
+function normalizeSchemaNode(node: unknown): void {
+  if (!isSchemaObject(node)) {
+    return;
+  }
+  if (node.nullable === true && node.type !== undefined) {
+    const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
+    if (!types.includes('null')) {
+      node.type = [...types, 'null'];
+    }
+  }
+  if (typeof node.format === 'string') {
+    delete node.format;
+  }
+  for (const keyword of SCHEMA_KEYWORDS) {
+    normalizeSchemaNode(node[keyword]);
+  }
+  for (const keyword of SCHEMA_ARRAY_KEYWORDS) {
+    const value = node[keyword];
+    if (Array.isArray(value)) {
+      value.forEach(normalizeSchemaNode);
+    }
+  }
+  for (const keyword of SCHEMA_MAP_KEYWORDS) {
+    const value = node[keyword];
+    if (isSchemaObject(value)) {
+      // `dependencies` may also map to a property-name array; those are skipped.
+      Object.values(value).forEach(normalizeSchemaNode);
+    }
+  }
+}
+
 /**
  * Copies a JSON Schema into the form the validator checks:
  * - OpenAPI `nullable: true` beside a `type` adds `"null"` to that type, as Ajv's
@@ -30,19 +96,33 @@ export interface JsonSchemaAdapterOptions {
  */
 function toValidationSchema(schema: JSONSchema7): Schema {
   const copy = structuredClone(schema) as Schema;
-  traverse(copy, {
-    cb: (node: traverse.SchemaObject) => {
-      if (node.nullable === true && node.type !== undefined) {
-        const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
-        if (!types.includes('null')) {
-          node.type = [...types, 'null'];
-        }
-      }
-      if (typeof node.format === 'string') {
-        delete node.format;
-      }
-    },
-  });
+  normalizeSchemaNode(copy);
+  return copy;
+}
+
+/**
+ * A property whose value is `undefined` is absent in JSON, and Ajv treated it
+ * so. The validator rejects `undefined` anywhere, so such properties are left
+ * out of plain objects (recursively) before validation. Arrays are entered but
+ * keep their items.
+ */
+function withoutUndefinedProperties(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(withoutUndefinedProperties);
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return value;
+  }
+  const copy: Record<string, unknown> = {};
+  for (const [key, property] of Object.entries(value)) {
+    if (property !== undefined) {
+      copy[key] = withoutUndefinedProperties(property);
+    }
+  }
   return copy;
 }
 
@@ -147,7 +227,7 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    */
   #validate(value: unknown): StandardSchemaV1.Result<Output> {
     try {
-      const result = this.#getValidator().validate(value);
+      const result = this.#getValidator().validate(withoutUndefinedProperties(value));
 
       if (result.valid) {
         return { value: value as Output };
