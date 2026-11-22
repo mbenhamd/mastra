@@ -266,6 +266,20 @@ Without `sharedConnections`, shared-scope connections are Composio PRIVATE accou
 
 `listConnections()` returns the requested users' PRIVATE and SHARED accounts, plus SHARED accounts owned by other users whose ACL grants access to one of the requested users. You can pin these accounts like any other connected account.
 
+### List a user's own connections across toolkits
+
+`listOwnedConnections()` lists the accounts one user owns across several toolkits in one listing, and reads every page. Each account carries its toolkit slug. Use it to check which apps a user has connected without one request per toolkit.
+
+```typescript
+const connections = await composio.listOwnedConnections({
+  userId: 'workspace:user_42',
+  toolkits: ['gmail', 'googlecalendar'],
+})
+const connected = new Set(connections.filter(c => c.status === 'active').map(c => c.toolkit))
+```
+
+Like `listConnections({ ownedOnly: true })`, it relies on Composio's owner filter, so it leaves out SHARED accounts owned by other users. It throws instead of returning a partial list when Composio fails, returns a page without items, an account without an id or toolkit, a non-string cursor, a repeated cursor, or more than 50 pages. A `userId` must be non-empty and contain no commas.
+
 ### Map application users to Composio users
 
 Use `userIdResolver` when your Composio user IDs differ from the IDs returned by Mastra authentication, or when your application must authorize the stored account pin before execution.

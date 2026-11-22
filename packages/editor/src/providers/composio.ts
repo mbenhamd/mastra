@@ -141,6 +141,22 @@ export interface ComposioListConnectionsResult extends ListConnectionsResult {
   items: ComposioExistingConnection[];
 }
 
+/** Options for {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioListOwnedConnectionsOpts {
+  /** The bucket whose own accounts are listed. */
+  userId: string;
+  /** Toolkit slugs to list the bucket's accounts for. */
+  toolkits: readonly string[];
+}
+
+/** One account listed by {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioOwnedConnection extends ExistingConnection {
+  /** The toolkit slug Composio reports for the account. */
+  toolkit: string;
+  /** Composio's sharing model for the account, when Composio reports one. */
+  accountType?: 'PRIVATE' | 'SHARED';
+}
+
 export interface ResolveComposioCatalogToolsOpts {
   /** Composio tool slugs to materialise. */
   toolSlugs: string[];
@@ -837,6 +853,84 @@ export class ComposioToolProvider extends BaseToolProvider {
   }
 
   /**
+   * List every account one bucket owns across several toolkits, in one
+   * owner-filtered listing that follows Composio's cursor to its end.
+   * `listConnections` with `ownedOnly` answers the same question for one
+   * toolkit and its first page only, so a caller checking N toolkits makes N
+   * calls and can miss accounts past that page.
+   *
+   * Ownership rests on Composio's owner filter, as it does for
+   * `listConnections` with `ownedOnly`: another user's SHARED account is not
+   * requested, whatever its ACL. A failed listing, a page without an `items`
+   * array, an account without an id or toolkit slug, a cursor that is not a
+   * string, a repeated cursor or more than {@link MAX_OWNED_CONNECTION_PAGES}
+   * pages throws rather than returning the accounts seen so far, so callers
+   * never read a partial scan as "not connected".
+   */
+  async listOwnedConnections(opts: ComposioListOwnedConnectionsOpts): Promise<ComposioOwnedConnection[]> {
+    // Composio joins `user_ids` with commas, so a comma would widen the owner filter.
+    if (opts.userId.length === 0 || opts.userId.includes(',')) {
+      throw new Error('[composio] listOwnedConnections requires one userId without commas');
+    }
+    const toolkitSlugs = Array.from(new Set(opts.toolkits));
+    if (toolkitSlugs.length === 0) return [];
+
+    const composio = this.getRawClient();
+    const items: ComposioOwnedConnection[] = [];
+    const seen = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let pages = 0; pages < MAX_OWNED_CONNECTION_PAGES; pages += 1) {
+      // Composio lists PRIVATE accounts only by default; `'ALL'` with the
+      // owner filter adds the bucket's own SHARED accounts.
+      const page: ConnectedAccountListResponse = await composio.connectedAccounts.list({
+        toolkitSlugs,
+        userIds: [opts.userId],
+        accountType: 'ALL',
+        limit: MAX_LIMIT,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!Array.isArray(page.items)) {
+        throw new Error('Composio returned a connected-account page without items');
+      }
+      for (const account of page.items) {
+        const id: unknown = account.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new Error('Composio returned a connected account without an id');
+        }
+        if (seen.has(account.id)) continue;
+        seen.add(account.id);
+        const toolkit: unknown = account.toolkit?.slug;
+        if (typeof toolkit !== 'string' || toolkit.length === 0) {
+          throw new Error(`Composio returned connected account ${account.id} without a toolkit`);
+        }
+        const accountType = account.experimental?.accountType;
+        items.push({
+          connectionId: account.id,
+          toolkit,
+          status: mapComposioStatus(account.status, account.isDisabled),
+          createdAt: account.createdAt,
+          authorId: opts.userId,
+          ...(accountType ? { accountType } : {}),
+        });
+      }
+      const next: unknown = (page as { nextCursor?: unknown }).nextCursor;
+      if (next === null || next === undefined || next === '') return items;
+      if (typeof next !== 'string') {
+        throw new Error('Composio returned a connected-account cursor that is not a string');
+      }
+      if (cursors.has(next)) {
+        throw new Error('Composio repeated a cursor before the owned connections were listed');
+      }
+      cursors.add(next);
+      cursor = next;
+    }
+    throw new Error(
+      `Composio listed more than ${MAX_OWNED_CONNECTION_PAGES} pages of owned connections without finishing`,
+    );
+  }
+
+  /**
    * Revoke a Composio connected account via
    * `DELETE /api/v3/connected_accounts/:nanoid`. Composio performs a soft
    * delete and responds with `{ success: boolean }`.
@@ -1051,6 +1145,8 @@ function hasNextCursor(list: ConnectedAccountListResponse): boolean {
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+/** Pages `listOwnedConnections` reads before it gives up: 10,000 accounts at `MAX_LIMIT`. */
+const MAX_OWNED_CONNECTION_PAGES = 50;
 
 function clampLimit(limit: number | undefined): number {
   if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
