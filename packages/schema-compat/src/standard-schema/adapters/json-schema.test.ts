@@ -357,6 +357,13 @@ describe('json-schema standard-schema adapter', () => {
           components: { schemas: { Node: dynamicNode } },
         },
       ],
+      [
+        'under a dependencies entry named like a keyword',
+        {
+          $schema: 'https://json-schema.org/draft/2020-12/schema',
+          dependencies: { type: { properties: { children: dynamicNode.properties.children } } },
+        },
+      ],
     ])('refuses a schema with $dynamicRef %s instead of letting it pass unchecked', async (_case, schema) => {
       const standardSchema = toStandardSchema(schema as JSONSchema7);
 

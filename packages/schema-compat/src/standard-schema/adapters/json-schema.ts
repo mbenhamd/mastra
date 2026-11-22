@@ -1,4 +1,4 @@
-import { dereference, Validator } from '@cfworker/json-schema';
+import { Validator } from '@cfworker/json-schema';
 import type { OutputUnit, Schema } from '@cfworker/json-schema';
 import type { StandardSchemaV1, StandardJSONSchemaV1 } from '@standard-schema/spec';
 import type { JSONSchema7 } from 'json-schema';
@@ -58,16 +58,33 @@ function isSchemaObject(value: unknown): value is Record<string, unknown> {
 const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
   '$dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely';
 
+/** Keywords whose value is data, never a schema. */
+const DATA_KEYWORDS = new Set(['const', 'default', 'enum', 'examples']);
+
 /**
- * Refuses a schema in which any subschema the validator can reach has
- * `$dynamicRef`. The validator's own `dereference` lists those subschemas,
- * including `$ref` targets outside keyword positions (for example
- * `#/components/schemas/Node`), so the check covers exactly what it evaluates.
+ * Refuses a schema in which any object, at any depth outside data keywords,
+ * has a string `$dynamicRef`. The validator can reach a subschema through a
+ * keyword, through a `$ref` pointer to any path (for example
+ * `#/components/schemas/Node`), and through `dependencies`, so the walk covers
+ * every object rather than mirroring one of those routes. A property named
+ * `$dynamicRef` holds a schema or an array, not a string, so it is not refused.
  */
-function refuseDynamicRef(schema: Schema): void {
-  for (const node of Object.values(dereference(schema))) {
-    if (isSchemaObject(node) && '$dynamicRef' in node) {
-      throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
+function refuseDynamicRef(node: unknown, seen = new Set<object>()): void {
+  if (typeof node !== 'object' || node === null || seen.has(node)) {
+    return;
+  }
+  seen.add(node);
+  if (Array.isArray(node)) {
+    node.forEach(item => refuseDynamicRef(item, seen));
+    return;
+  }
+  const record = node as Record<string, unknown>;
+  if (typeof record.$dynamicRef === 'string') {
+    throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (!DATA_KEYWORDS.has(key)) {
+      refuseDynamicRef(value, seen);
     }
   }
 }
