@@ -356,13 +356,14 @@ export type BaseServerOptions = {
   onToolError?: 'throw' | 'return';
   /**
    * Optional custom JSON Schema validator forwarded to the underlying MCP
-   * client. Use this to opt into a non-default validator implementation.
+   * client and used for tool output schemas. Use this to opt into a
+   * non-default validator implementation.
    *
-   * Pass `CfWorkerJsonSchemaValidator` (from
-   * `@modelcontextprotocol/client/validators/cf-worker`) when running in
-   * Cloudflare Workers / V8 isolates: the default `AjvJsonSchemaValidator`
-   * compiles validators with `new Function(...)`, which workerd refuses to
-   * evaluate when a tool advertises an `outputSchema`.
+   * The default is the SDK's `CfWorkerJsonSchemaValidator`, which needs no
+   * code generation from strings, so output schemas also validate in
+   * Cloudflare Workers and under `--disallow-code-generation-from-strings`.
+   * `AjvJsonSchemaValidator` (from `@modelcontextprotocol/client/validators/ajv`)
+   * compiles validators with `new Function(...)` and fails in those hosts.
    */
   jsonSchemaValidator?: jsonSchemaValidator;
   /**

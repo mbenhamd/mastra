@@ -126,6 +126,35 @@ function withDefaultDialect(schema: JSONSchema7): JSONSchema7 {
   if (SUPPORTED_DIALECTS.has(schema.$schema)) return schema;
   return toJsonSchema2020(schema) ?? schema;
 }
+
+/**
+ * The JSON Schema validator used when the server config names none: the SDK's cf-worker
+ * validator, which interprets schemas instead of compiling them with `new Function`, so tool
+ * output schemas also validate in hosts run with `--disallow-code-generation-from-strings`.
+ * The SDK `Client` takes its validator synchronously, while the module is imported lazily
+ * (see loadInputSchemaMetaValidator), so this delegates once the import has resolved, and
+ * connect() waits for that. If the import fails, compiling a schema throws, which the SDK
+ * reports as an invalid output schema for that tool only.
+ */
+class DefaultJsonSchemaValidator implements jsonSchemaValidator {
+  #validator?: jsonSchemaValidator;
+  #loadError?: unknown;
+  readonly ready: Promise<void> = import('@modelcontextprotocol/client/validators/cf-worker').then(
+    ({ CfWorkerJsonSchemaValidator }) => {
+      this.#validator = new CfWorkerJsonSchemaValidator();
+    },
+    error => {
+      this.#loadError = error;
+    },
+  );
+
+  getValidator<T>(schema: JsonSchemaType) {
+    if (!this.#validator) {
+      throw new Error('The JSON Schema validator is not available', { cause: this.#loadError });
+    }
+    return this.#validator.getValidator<T>(schema);
+  }
+}
 const DEFAULT_INSTRUCTIONS_MAX_LENGTH = 512;
 const DEFAULT_SERVER_LOG_LEVEL: LoggingLevel = 'info';
 
@@ -423,8 +452,9 @@ export class InternalMastraMCPClient extends MastraBase {
   private priorDiscovery?: PriorDiscovery;
   private readonly requireToolApproval: RequireToolApproval | undefined;
   private readonly onToolError: 'throw' | 'return';
-  private jsonSchemaValidator?: jsonSchemaValidator;
-  private jsonSchemaValidatorPromise?: Promise<jsonSchemaValidator>;
+  private readonly jsonSchemaValidator: jsonSchemaValidator;
+  /** Resolves once the default validator has loaded; undefined when the config supplies one. */
+  private readonly jsonSchemaValidatorReady?: Promise<void>;
 
   /** Provides access to resource operations (list, read, notifications) */
   public readonly resources: ResourceClientActions;
@@ -465,7 +495,13 @@ export class InternalMastraMCPClient extends MastraBase {
     this.enableProgressTracking = !!server.enableProgressTracking;
     this.requireToolApproval = server.requireToolApproval;
     this.onToolError = server.onToolError ?? 'throw';
-    this.jsonSchemaValidator = server.jsonSchemaValidator;
+    if (server.jsonSchemaValidator) {
+      this.jsonSchemaValidator = server.jsonSchemaValidator;
+    } else {
+      const defaultValidator = new DefaultJsonSchemaValidator();
+      this.jsonSchemaValidator = defaultValidator;
+      this.jsonSchemaValidatorReady = defaultValidator.ready;
+    }
 
     const configured = server.capabilities ?? {};
     if (configured.elicitation !== undefined && !server.inputRequests) {
@@ -486,7 +522,7 @@ export class InternalMastraMCPClient extends MastraBase {
       { name: clientInfo?.name ?? name, version: clientInfo?.version ?? version },
       {
         capabilities: clientCapabilities,
-        ...(server.jsonSchemaValidator ? { jsonSchemaValidator: server.jsonSchemaValidator } : {}),
+        jsonSchemaValidator: this.jsonSchemaValidator,
         versionNegotiation: { mode: negotiationMode(server.protocolVersion) },
       },
     );
@@ -824,6 +860,8 @@ export class InternalMastraMCPClient extends MastraBase {
 
     this.isConnected = new Promise<boolean>(async (resolve, reject) => {
       try {
+        // The SDK compiles tool output schemas when tools are listed; the default validator must be ready first.
+        await this.jsonSchemaValidatorReady;
         await this.detachStaleClientTransport();
 
         const { command, url } = this.serverConfig;
@@ -1430,12 +1468,7 @@ export class InternalMastraMCPClient extends MastraBase {
   };
 
   private async getJsonSchemaValidator(): Promise<jsonSchemaValidator> {
-    if (this.jsonSchemaValidator) return this.jsonSchemaValidator;
-
-    this.jsonSchemaValidatorPromise ??= import('@modelcontextprotocol/client/validators/ajv').then(
-      ({ AjvJsonSchemaValidator }) => new AjvJsonSchemaValidator(),
-    );
-    this.jsonSchemaValidator = await this.jsonSchemaValidatorPromise;
+    await this.jsonSchemaValidatorReady;
     return this.jsonSchemaValidator;
   }
 
