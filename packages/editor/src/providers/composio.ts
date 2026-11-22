@@ -861,11 +861,11 @@ export class ComposioToolProvider extends BaseToolProvider {
    *
    * Ownership rests on Composio's owner filter, as it does for
    * `listConnections` with `ownedOnly`: another user's SHARED account is not
-   * requested, whatever its ACL. A failed listing, a response outside the
-   * SDK's contract, a repeated cursor or more than
-   * {@link MAX_OWNED_CONNECTION_PAGES} pages throws rather than returning the
-   * accounts seen so far, so callers never read a partial scan as "not
-   * connected".
+   * requested, whatever its ACL. A failed listing, a page without an `items`
+   * array, an account without an id or toolkit slug, a cursor that is not a
+   * string, a repeated cursor or more than {@link MAX_OWNED_CONNECTION_PAGES}
+   * pages throws rather than returning the accounts seen so far, so callers
+   * never read a partial scan as "not connected".
    */
   async listOwnedConnections(opts: ComposioListOwnedConnectionsOpts): Promise<ComposioOwnedConnection[]> {
     // Composio joins `user_ids` with commas, so a comma would widen the owner filter.
@@ -894,6 +894,10 @@ export class ComposioToolProvider extends BaseToolProvider {
         throw new Error('Composio returned a connected-account page without items');
       }
       for (const account of page.items) {
+        const id: unknown = account.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new Error('Composio returned a connected account without an id');
+        }
         if (seen.has(account.id)) continue;
         seen.add(account.id);
         const toolkit: unknown = account.toolkit?.slug;
