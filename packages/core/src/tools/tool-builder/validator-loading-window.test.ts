@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
 import { RequestContext } from '../../request-context';
-import { jsonSchemaValidatorLoading, toStandardSchema } from '../../schema';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady, toStandardSchema } from '../../schema';
 import { createTool } from '../tool';
 import { CoreToolBuilder } from './builder';
 
@@ -65,7 +65,9 @@ describe('tool input validation while the JSON Schema validator is loading', () 
       logger: false,
     }).getAgent('finder');
 
-    // Hold the window for the whole call, so the validator is still loading when AI SDK v4 parses it.
+    // This process's own validator has loaded, so valid input passes schema validation; then hold the
+    // window for the whole call, so the validator is still loading when AI SDK v4 parses it.
+    await jsonSchemaValidatorReady();
     release = holdValidatorLoading();
     await expect(agent.generateLegacy('Find Dero', { maxSteps: 1, toolChoice: 'required' })).rejects.toThrow(
       /Invalid arguments for tool findUser/,
