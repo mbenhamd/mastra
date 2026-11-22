@@ -1,4 +1,4 @@
-import { Validator } from '@cfworker/json-schema';
+import { dereference, Validator } from '@cfworker/json-schema';
 import type { OutputUnit, Schema } from '@cfworker/json-schema';
 import type { StandardSchemaV1, StandardJSONSchemaV1 } from '@standard-schema/spec';
 import type { JSONSchema7 } from 'json-schema';
@@ -59,16 +59,27 @@ const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
   '$dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely';
 
 /**
+ * Refuses a schema in which any subschema the validator can reach has
+ * `$dynamicRef`. The validator's own `dereference` lists those subschemas,
+ * including `$ref` targets outside keyword positions (for example
+ * `#/components/schemas/Node`), so the check covers exactly what it evaluates.
+ */
+function refuseDynamicRef(schema: Schema): void {
+  for (const node of Object.values(dereference(schema))) {
+    if (isSchemaObject(node) && '$dynamicRef' in node) {
+      throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
+    }
+  }
+}
+
+/**
  * Applies `nullable` and drops `format` on one schema and every subschema, by
- * keyword (draft-07 and 2020-12), and refuses `$dynamicRef`. Data keywords such
- * as `const`, `enum`, `default` and `examples` are never entered.
+ * keyword (draft-07 and 2020-12). Data keywords such as `const`, `enum`,
+ * `default` and `examples` are never entered.
  */
 function normalizeSchemaNode(node: unknown): void {
   if (!isSchemaObject(node)) {
     return;
-  }
-  if (node.$dynamicRef !== undefined) {
-    throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
   }
   if (node.nullable === true && node.type !== undefined) {
     const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
@@ -352,7 +363,9 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
   #getValidator(): Validator {
     if (!this.#validator) {
       const is2020 = typeof this.#schema.$schema === 'string' && this.#schema.$schema.includes('2020-12');
-      this.#validator = new Validator(toValidationSchema(this.#schema), is2020 ? '2020-12' : '7', false);
+      const validationSchema = toValidationSchema(this.#schema);
+      refuseDynamicRef(validationSchema);
+      this.#validator = new Validator(validationSchema, is2020 ? '2020-12' : '7', false);
     }
     return this.#validator;
   }

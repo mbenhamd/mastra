@@ -339,16 +339,26 @@ describe('json-schema standard-schema adapter', () => {
       });
     });
 
-    it('refuses a schema with $dynamicRef instead of letting the reference pass unchecked', async () => {
-      const standardSchema = toStandardSchema({
-        $schema: 'https://json-schema.org/draft/2020-12/schema',
-        $dynamicAnchor: 'node',
-        type: 'object',
-        properties: {
-          value: { type: 'string' },
-          children: { type: 'array', items: { $dynamicRef: '#node' } },
+    const dynamicNode = {
+      $dynamicAnchor: 'node',
+      type: 'object',
+      properties: {
+        value: { type: 'string' },
+        children: { type: 'array', items: { $dynamicRef: '#node' } },
+      },
+    };
+    it.each([
+      ['in a keyword position', { $schema: 'https://json-schema.org/draft/2020-12/schema', ...dynamicNode }],
+      [
+        'reached only through a $ref pointer',
+        {
+          $schema: 'https://json-schema.org/draft/2020-12/schema',
+          $ref: '#/components/schemas/Node',
+          components: { schemas: { Node: dynamicNode } },
         },
-      } as JSONSchema7);
+      ],
+    ])('refuses a schema with $dynamicRef %s instead of letting it pass unchecked', async (_case, schema) => {
+      const standardSchema = toStandardSchema(schema as JSONSchema7);
 
       const result = await standardSchema['~standard'].validate({ value: 'root', children: [{ value: 123 }] });
 
