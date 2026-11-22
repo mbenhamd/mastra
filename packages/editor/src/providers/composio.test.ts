@@ -1468,8 +1468,14 @@ describe('ComposioToolProvider — listConnections', () => {
         if (query.get('user_ids') !== 'user_a' || query.get('account_type') !== 'ALL') {
           return { items: [account('ca_other', 'ACTIVE', 'admin', 'SHARED')], next_cursor: null };
         }
+        // Page 2 repeats ca_mail, as a listing that shifts between pages can.
         return query.get('cursor') === 'page-2'
-          ? { items: [{ ...account('ca_cal', 'INITIATED', 'user_a', 'PRIVATE'), toolkit: { slug: 'googlecalendar' } }] }
+          ? {
+              items: [
+                account('ca_mail', 'ACTIVE', 'user_a', 'SHARED'),
+                { ...account('ca_cal', 'INITIATED', 'user_a', 'PRIVATE'), toolkit: { slug: 'googlecalendar' } },
+              ],
+            }
           : { items: [account('ca_mail', 'ACTIVE', 'user_a', 'SHARED')], next_cursor: 'page-2' };
       };
       const integration = new ComposioToolProvider({ apiKey: 'k' });

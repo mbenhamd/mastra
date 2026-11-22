@@ -859,14 +859,18 @@ export class ComposioToolProvider extends BaseToolProvider {
    * toolkit and its first page only, so a caller checking N toolkits makes N
    * calls and can miss accounts past that page.
    *
-   * Another user's SHARED account is never included, whatever its ACL. A
-   * failed or repeated-cursor listing throws rather than returning the
+   * Ownership rests on Composio's owner filter, as it does for
+   * `listConnections` with `ownedOnly`: another user's SHARED account is not
+   * requested, whatever its ACL. A failed listing, a response outside the
+   * SDK's contract, a repeated cursor or more than
+   * {@link MAX_OWNED_CONNECTION_PAGES} pages throws rather than returning the
    * accounts seen so far, so callers never read a partial scan as "not
    * connected".
    */
   async listOwnedConnections(opts: ComposioListOwnedConnectionsOpts): Promise<ComposioOwnedConnection[]> {
-    if (opts.userId.length === 0) {
-      throw new Error('[composio] listOwnedConnections requires a userId');
+    // Composio joins `user_ids` with commas, so a comma would widen the owner filter.
+    if (opts.userId.length === 0 || opts.userId.includes(',')) {
+      throw new Error('[composio] listOwnedConnections requires one userId without commas');
     }
     const toolkitSlugs = Array.from(new Set(opts.toolkits));
     if (toolkitSlugs.length === 0) return [];
@@ -876,7 +880,7 @@ export class ComposioToolProvider extends BaseToolProvider {
     const seen = new Set<string>();
     const cursors = new Set<string>();
     let cursor: string | undefined;
-    for (;;) {
+    for (let pages = 0; pages < MAX_OWNED_CONNECTION_PAGES; pages += 1) {
       // Composio lists PRIVATE accounts only by default; `'ALL'` with the
       // owner filter adds the bucket's own SHARED accounts.
       const page: ConnectedAccountListResponse = await composio.connectedAccounts.list({
@@ -886,27 +890,40 @@ export class ComposioToolProvider extends BaseToolProvider {
         limit: MAX_LIMIT,
         ...(cursor ? { cursor } : {}),
       });
-      for (const account of page.items ?? []) {
+      if (!Array.isArray(page.items)) {
+        throw new Error('Composio returned a connected-account page without items');
+      }
+      for (const account of page.items) {
         if (seen.has(account.id)) continue;
         seen.add(account.id);
+        const toolkit: unknown = account.toolkit?.slug;
+        if (typeof toolkit !== 'string' || toolkit.length === 0) {
+          throw new Error(`Composio returned connected account ${account.id} without a toolkit`);
+        }
         const accountType = account.experimental?.accountType;
         items.push({
           connectionId: account.id,
-          toolkit: account.toolkit.slug,
+          toolkit,
           status: mapComposioStatus(account.status, account.isDisabled),
           createdAt: account.createdAt,
           authorId: opts.userId,
           ...(accountType ? { accountType } : {}),
         });
       }
-      if (!hasNextCursor(page)) return items;
-      const next = (page as { nextCursor: string }).nextCursor;
+      const next: unknown = (page as { nextCursor?: unknown }).nextCursor;
+      if (next === null || next === undefined || next === '') return items;
+      if (typeof next !== 'string') {
+        throw new Error('Composio returned a connected-account cursor that is not a string');
+      }
       if (cursors.has(next)) {
         throw new Error('Composio repeated a cursor before the owned connections were listed');
       }
       cursors.add(next);
       cursor = next;
     }
+    throw new Error(
+      `Composio listed more than ${MAX_OWNED_CONNECTION_PAGES} pages of owned connections without finishing`,
+    );
   }
 
   /**
@@ -1124,6 +1141,8 @@ function hasNextCursor(list: ConnectedAccountListResponse): boolean {
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+/** Pages `listOwnedConnections` reads before it gives up: 10,000 accounts at `MAX_LIMIT`. */
+const MAX_OWNED_CONNECTION_PAGES = 50;
 
 function clampLimit(limit: number | undefined): number {
   if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
