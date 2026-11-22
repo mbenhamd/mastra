@@ -5291,9 +5291,6 @@ importers:
 
   packages/mcp:
     dependencies:
-      '@mastra/schema-compat':
-        specifier: workspace:*
-        version: link:../schema-compat
       '@modelcontextprotocol/client':
         specifier: 2.3.1
         version: 2.3.1
@@ -5349,6 +5346,9 @@ importers:
       '@mastra/observability':
         specifier: workspace:*
         version: link:../../observability/mastra
+      '@mastra/schema-compat':
+        specifier: workspace:*
+        version: link:../schema-compat
       '@mendable/firecrawl-js':
         specifier: ^1.29.3
         version: 1.29.3(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)

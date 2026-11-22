@@ -1,7 +1,7 @@
 import type { JSONSchema7 } from 'json-schema';
 import { describe, it, expect, vi } from 'vitest';
 import { isStandardSchemaWithJSON } from '../standard-schema';
-import { toStandardSchema } from './json-schema';
+import { jsonSchemaValidatorReady, toStandardSchema } from './json-schema';
 
 describe('json-schema standard-schema adapter', () => {
   describe('toStandardSchema', () => {
@@ -467,6 +467,33 @@ describe('json-schema standard-schema adapter', () => {
         });
       } finally {
         vi.unstubAllGlobals();
+      }
+    });
+  });
+  describe('jsonSchemaValidatorReady', () => {
+    it('also waits for the validator load of another adapter copy in the process', async () => {
+      // A bundled or second-version copy of this adapter registers its load in the same global set.
+      const loads = (globalThis as Record<symbol, Set<Promise<void>>>)[
+        Symbol.for('mastra.schemaCompat.jsonSchemaValidatorLoads')
+      ]!;
+      let finishOtherCopy!: () => void;
+      const otherCopyLoad = new Promise<void>(resolve => {
+        finishOtherCopy = resolve;
+      });
+      loads.add(otherCopyLoad);
+      try {
+        let ready = false;
+        const waiting = jsonSchemaValidatorReady().then(() => {
+          ready = true;
+        });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(ready).toBe(false);
+
+        finishOtherCopy();
+        await waiting;
+        expect(ready).toBe(true);
+      } finally {
+        loads.delete(otherCopyLoad);
       }
     });
   });

@@ -28,10 +28,21 @@ const validatorLoad: Promise<void> = import('@cfworker/json-schema').then(
 );
 
 /**
- * Resolves once the JSON Schema validator has loaded or failed to load; it never rejects.
+ * Every copy of this adapter in the process registers its load here: a package can bundle its own copy
+ * (`@mastra/mcp` does), or an install can hold two versions. Awaiting any copy's
+ * {@link jsonSchemaValidatorReady} then also waits for the copy that built the schema being validated.
+ */
+const VALIDATOR_LOADS: unique symbol = Symbol.for('mastra.schemaCompat.jsonSchemaValidatorLoads');
+const validatorLoads: Set<Promise<void>> = ((globalThis as { [VALIDATOR_LOADS]?: Set<Promise<void>> })[
+  VALIDATOR_LOADS
+] ??= new Set());
+validatorLoads.add(validatorLoad);
+
+/**
+ * Resolves once every JSON Schema validator copy loaded so far has loaded or failed to load; it never rejects.
  */
 export function jsonSchemaValidatorReady(): Promise<void> {
-  return validatorLoad;
+  return Promise.all(validatorLoads).then(() => undefined);
 }
 
 /**
