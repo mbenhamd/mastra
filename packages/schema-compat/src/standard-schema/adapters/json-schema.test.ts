@@ -338,6 +338,29 @@ describe('json-schema standard-schema adapter', () => {
         value: ['not an email', null],
       });
     });
+
+    it('refuses a schema with $dynamicRef instead of letting the reference pass unchecked', async () => {
+      const standardSchema = toStandardSchema({
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        $dynamicAnchor: 'node',
+        type: 'object',
+        properties: {
+          value: { type: 'string' },
+          children: { type: 'array', items: { $dynamicRef: '#node' } },
+        },
+      } as JSONSchema7);
+
+      const result = await standardSchema['~standard'].validate({ value: 'root', children: [{ value: 123 }] });
+
+      expect(result).toEqual({
+        issues: [
+          {
+            message:
+              'Schema validation error: $dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely',
+          },
+        ],
+      });
+    });
   });
 
   describe('isStandardSchemaWithJSON', () => {

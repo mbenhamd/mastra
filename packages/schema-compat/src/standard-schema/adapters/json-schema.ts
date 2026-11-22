@@ -51,13 +51,24 @@ function isSchemaObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Thrown for a schema that uses `$dynamicRef`. `@cfworker/json-schema` does not
+ * resolve it, so the reference would add no constraint and values Ajv2020
+ * rejected would pass. Validation refuses such a schema instead.
+ */
+const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
+  '$dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely';
+
+/**
  * Applies `nullable` and drops `format` on one schema and every subschema, by
- * keyword (draft-07 and 2020-12). Data keywords such as `const`, `enum`,
- * `default` and `examples` are never entered.
+ * keyword (draft-07 and 2020-12), and refuses `$dynamicRef`. Data keywords such
+ * as `const`, `enum`, `default` and `examples` are never entered.
  */
 function normalizeSchemaNode(node: unknown): void {
   if (!isSchemaObject(node)) {
     return;
+  }
+  if (node.$dynamicRef !== undefined) {
+    throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
   }
   if (node.nullable === true && node.type !== undefined) {
     const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
