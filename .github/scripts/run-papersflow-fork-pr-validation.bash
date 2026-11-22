@@ -1656,6 +1656,10 @@ verify_pf9666_cfworker_dependency() {
     echo 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' >&2
     return 1
   fi
+  if ! git_regular_file_at_revision "$2" pnpm-lock.yaml; then
+    echo 'PF-9666 pnpm-lock.yaml is not a regular file.' >&2
+    return 1
+  fi
   node - "$1" "$2" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const { isDeepStrictEqual } = require('node:util');
@@ -1706,12 +1710,17 @@ const removeExact = (marker, block, start, end) => {
   }
   lines.splice(at, block.length);
 };
-removeExact("  '@cfworker/json-schema@4.1.6': {}", ["  '@cfworker/json-schema@4.1.6': {}", '']);
+// Each block must sit in its own top-level section.
+const section = name => {
+  const start = uniqueLine(`${name}:`);
+  return [start + 1, sectionEnd(start)];
+};
+removeExact("  '@cfworker/json-schema@4.1.6': {}", ["  '@cfworker/json-schema@4.1.6': {}", ''], ...section('snapshots'));
 removeExact("  '@cfworker/json-schema@4.1.6':", [
   "  '@cfworker/json-schema@4.1.6':",
   '    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}',
   '',
-]);
+], ...section('packages'));
 const importer = uniqueLine('  packages/schema-compat:');
 const devDependencies = uniqueLine('    devDependencies:', importer + 1, sectionEnd(importer));
 removeExact("      '@cfworker/json-schema':", [

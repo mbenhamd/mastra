@@ -208,7 +208,13 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   when every changed importer also changes its own manifest and content outside
   the importer sections remains unchanged; root manifests, workspace
   configuration, unrelated importers, non-importer dependency-graph churn, and
-  unowned lockfile-only changes still fail closed. Supported package checks use
+  unowned lockfile-only changes still fail closed. Two exact exceptions are
+  bound to one reviewed pull request each: PF-2057 admits the Inngest unused
+  dependency removals with their byte-exact lockfile cleanup, and PF-9666 admits
+  the `@cfworker/json-schema@4.1.6` devDependency of `packages/schema-compat`
+  from #631, whose manifest blob is pinned and whose lockfile must equal the
+  merge base plus the importer entry, the package entry and the snapshot, each
+  in its own section. Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation
   plus changed-test execution. Root `harnessv1/sections/**/*.md` specification
