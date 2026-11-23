@@ -73,6 +73,18 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
    * usage analytics. Absent keeps the SDK default.
    */
   allowTracking?: boolean;
+  /**
+   * The dated toolkit version each toolkit's tools are fetched and executed
+   * at, keyed by toolkit slug (for example `{ gmail: '20261120_00' }`).
+   * Forwarded to both Composio clients.
+   *
+   * Without it the SDK reads `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>` from the
+   * environment, and any toolkit still unmapped runs Composio's `latest`
+   * version: provider execution skips the SDK's version check. A host that
+   * must not follow Composio's schema changes unannounced maps every toolkit
+   * it offers.
+   */
+  toolkitVersions?: Readonly<Record<string, string>>;
 }
 
 /** What {@link ComposioToolProviderConfig.requireToolApproval} decides on. */
@@ -261,6 +273,7 @@ export class ComposioToolProvider extends BaseToolProvider {
   private readonly apiKey: string;
   private readonly requireToolApproval?: boolean | ComposioRequireToolApproval;
   private readonly allowTracking?: boolean;
+  private readonly toolkitVersions?: Readonly<Record<string, string>>;
   private readonly sharedConnections?: ComposioSharedConnectionsConfig;
   private rawClient: Composio | null = null;
   private mastraClient: Composio<MastraProvider> | null = null;
@@ -276,17 +289,24 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.sharedConnections = config.sharedConnections;
     this.requireToolApproval = config.requireToolApproval;
     this.allowTracking = config.allowTracking;
+    this.toolkitVersions = config.toolkitVersions;
   }
 
   /**
    * Options shared by both clients. `disableVersionCheck` stops the SDK from
    * asking the npm registry for its latest version whenever a client is
-   * built: a server provider must not depend on npm egress.
+   * built: a server provider must not depend on npm egress. `toolkitVersions`
+   * pins the version both clients fetch and execute tools at.
    */
-  private clientOptions(): { allowTracking?: boolean; disableVersionCheck: true } {
+  private clientOptions(): {
+    allowTracking?: boolean;
+    disableVersionCheck: true;
+    toolkitVersions?: Record<string, string>;
+  } {
     return {
       disableVersionCheck: true,
       ...(this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking }),
+      ...(this.toolkitVersions === undefined ? {} : { toolkitVersions: { ...this.toolkitVersions } }),
     };
   }
 
