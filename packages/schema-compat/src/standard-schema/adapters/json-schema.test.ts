@@ -466,6 +466,30 @@ describe('json-schema standard-schema adapter', () => {
       expect(await standardSchema['~standard'].validate({ id: 'abc' })).toEqual({ value: { id: 'abc' } });
     });
 
+    it('reads an OpenAPI 3.0 boolean exclusive bound as excluding its minimum or maximum', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          above: { type: 'number', minimum: 5, exclusiveMinimum: true },
+          below: { type: 'number', maximum: 0, exclusiveMaximum: true },
+          open: { type: 'number', minimum: 1, exclusiveMinimum: false },
+        },
+      } as unknown as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ above: 5.5, below: -0.5, open: 1 })).toEqual({
+        value: { above: 5.5, below: -0.5, open: 1 },
+      });
+      expect(await standardSchema['~standard'].validate({ above: 5, below: 0, open: 0 })).toEqual({
+        issues: [
+          // cfworker's wording for an exclusive minimum.
+          { message: '5 is less than 5.', path: ['above'] },
+          { message: '0 is greater than or equal to 0.', path: ['below'] },
+          { message: '0 is less than 1.', path: ['open'] },
+        ],
+      });
+    });
+
     it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
       const standardSchema = toStandardSchema({
         $schema: 'https://json-schema.org/draft/2020-12/schema',

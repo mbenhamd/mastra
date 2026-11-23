@@ -126,7 +126,10 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
   }
 }
 
-/** Applies `nullable` and drops `format` and `id` on one schema object. */
+/**
+ * Applies `nullable`, rewrites a boolean `exclusiveMinimum`/`exclusiveMaximum`,
+ * and drops `format` and `id` on one schema object.
+ */
 function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = false): void {
   const types: unknown[] = Array.isArray(record.type) ? record.type : [record.type];
   // A `type` of strings: in a name map reached by `$ref`, `type` is a property's schema.
@@ -135,6 +138,23 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
       record.type = [...types, 'null'];
     }
   }
+  // OpenAPI 3.0 and draft-04 write an exclusive bound as `minimum: 5, exclusiveMinimum: true`.
+  // The validator reads `exclusiveMinimum` as a number only, and compared values with `true`
+  // as if it were 1, so 5 passed. The bound is moved into the keyword, as in later drafts.
+  for (const [bound, exclusive] of [
+    ['minimum', 'exclusiveMinimum'],
+    ['maximum', 'exclusiveMaximum'],
+  ] as const) {
+    if (typeof record[exclusive] === 'boolean') {
+      if (record[exclusive] === true && typeof record[bound] === 'number') {
+        record[exclusive] = record[bound];
+        delete record[bound];
+      } else {
+        delete record[exclusive];
+      }
+    }
+  }
+  // The validator never checks `format` (see the cfworker patch); it is also dropped here.
   if (typeof record.format === 'string') {
     delete record.format;
   }
@@ -201,9 +221,7 @@ function normalizeLocalRefTargets(root: unknown): void {
  * Applies `nullable` and drops `format` and `id` on every
  * object the validator can read as a schema. A `$ref` can point at any path
  * (for example `#/components/schemas/User`), so the walk covers every object
- * rather than only subschemas under schema keywords; a `format` left on a
- * `$ref` target was checked, and the validator's `url` pattern takes seconds on
- * a 30-character string. Values under data keywords (`const`, `enum`,
+ * rather than only subschemas under schema keywords. Values under data keywords (`const`, `enum`,
  * `default`, ...) are never entered. On a name map (`properties`, `$defs`, ...)
  * the keys are names, so the map itself is left alone and only its values are
  * walked as schemas.
@@ -233,7 +251,10 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
  * Copies a JSON Schema into the form the validator checks:
  * - OpenAPI `nullable: true` beside a `type` adds `"null"` to that type, as Ajv's
  *   built-in `nullable` keyword does; `enum` and `const` still apply.
- * - `format` is dropped, because validation has never checked formats here.
+ * - `format` is dropped, because validation has never checked formats here; the
+ *   patched validator does not check it either, also on a target this walk misses.
+ * - A boolean `exclusiveMinimum`/`exclusiveMaximum` (OpenAPI 3.0, draft-04)
+ *   takes the value of `minimum`/`maximum`, or is dropped when `false`.
  * - `id` is dropped: only draft-04 used it, Ajv ignored it, and the validator
  *   read it on objects that are not schemas.
  * Every object is visited except literal data and name maps, so a property
@@ -390,9 +411,11 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
       // wrapped to turn `null` into `undefined` turns an undeclared `null` key
       // into one.
       const result = this.#getValidator().validate(value);
-      const errors = result.valid ? [] : leafErrors(result.errors);
+      const leaves = result.valid ? [] : leafErrors(result.errors);
+      // An invalid value is never returned as valid, even if every error was a summary.
+      const errors = !result.valid && leaves.length === 0 ? result.errors : leaves;
 
-      if (errors.length === 0) {
+      if (result.valid) {
         return { value: value as Output };
       }
 
@@ -401,7 +424,7 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
         path: instanceLocationToPath(error.instanceLocation),
       }));
 
-      return { issues };
+      return { issues: issues.length > 0 ? issues : [{ message: 'Instance does not match the schema.' }] };
     } catch (error) {
       // If validation fails unexpectedly, return a validation error
       const message = error instanceof Error ? error.message : 'Unknown validation error';
