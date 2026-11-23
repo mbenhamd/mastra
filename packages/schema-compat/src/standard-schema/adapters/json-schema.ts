@@ -177,10 +177,8 @@ function normalizeSchemaObject(record: Record<string, unknown>): void {
   if (typeof record.format === 'string') {
     delete record.format;
   }
-  // The validator reads `id` on every object it walks as a schema URI, so two
-  // objects that are not schemas, such as two `example: { id: 1 }` or
-  // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
-  // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected.
+  // Only draft-04 used `id`. Ajv refused a schema holding it, and the patched
+  // validator ignores it (it reads only a string `$id`); `$id` is unaffected.
   delete record.id;
 }
 
@@ -314,45 +312,21 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
   return targets;
 }
 
-/** Walks every object and array once, plain objects and arrays alike. */
-function forEachObject(root: unknown, visit: (node: object) => void): void {
-  const seen = new Set<object>();
-  const stack: unknown[] = [root];
-  while (stack.length > 0) {
-    const node = stack.pop();
-    if (typeof node !== 'object' || node === null || seen.has(node)) {
-      continue;
-    }
-    seen.add(node);
-    visit(node);
-    for (const value of Object.values(node)) {
-      stack.push(value);
-    }
-  }
-}
-
 /**
  * Applies `nullable`, rewrites boolean exclusive bounds, and drops `format` and `id` on every
  * object the validator can read as a schema, leaving name maps and literal data alone. An
  * object the schema reads both as a schema (through a `$ref`) and as a name map or literal
  * data, such as the target of `{ $ref: '#/properties' }`, is left as written for the name map
- * or the data. Left as written, `nullable`, `format` and `id` refuse more values there, and so
+ * or the data. Left as written, `nullable` and `format` refuse more values there, and so
  * let more through under `not`, `oneOf` or `if`; a boolean `exclusiveMinimum` or
  * `exclusiveMaximum` would be compared as the number 1 or 0 and let values pass directly, so
  * such a schema is refused.
  */
 function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => Lookup): void {
-  // References are resolved on a copy without a string or number `id`, which normalisation
-  // drops from every object the validator reads as a schema, so `dereference` sees the `$id`
-  // bases it will see. An object or boolean under the name `id` stays: it can be a property's
-  // schema. Any other difference is caught by the check at the end.
+  // References are resolved on a copy, before normalisation changes the schema. The patched
+  // `dereference` reads only a string `$id`, which normalisation keeps, so the copy sees the
+  // bases the validator will see. Any other difference is caught by the check at the end.
   const copy = structuredClone(root);
-  forEachObject(copy, node => {
-    const id = Array.isArray(node) ? undefined : (node as Record<string, unknown>).id;
-    if (typeof id === 'string' || typeof id === 'number') {
-      delete (node as Record<string, unknown>).id;
-    }
-  });
   const copyLookup = dereference(copy);
   const toCopy = new Map<unknown, unknown>();
   const toRoot = new Map<unknown, unknown>();
@@ -416,8 +390,8 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
  * - A boolean `exclusiveMinimum`/`exclusiveMaximum` (OpenAPI 3.0, draft-04)
  *   takes the value of `minimum`/`maximum` when it is `true` beside a number,
  *   and is dropped otherwise.
- * - `id` is dropped: only draft-04 used it, Ajv ignored it, and the validator
- *   read it on objects that are not schemas.
+ * - `id` is dropped: only draft-04 used it, Ajv refused a schema holding it,
+ *   and the patched validator ignores it.
  * Name maps and literal data are left alone, so a property named `nullable`
  * or `format` keeps its schema, and a `$ref` target is read like any other
  * subschema (see `normalizeSchemaObjects`).

@@ -677,6 +677,31 @@ describe('json-schema standard-schema adapter', () => {
       } as JSONSchema7;
       expect(await valid(boolId, {})).toBe(true);
       expect(await valid(boolId, { a: 1 })).toBe(false);
+      // A boolean, object or array id (or $id) in annotations is not a schema URI.
+      const annotationIds = {
+        type: 'object',
+        properties: {
+          a: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '5f' } } },
+          b: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '60' }, $id: { k: 1 } } },
+          c: { type: 'string', example: { id: [], $id: { k: 1 } } },
+        },
+      } as unknown as JSONSchema7;
+      expect(await valid(annotationIds, { a: 'x' })).toBe(true);
+      expect(await valid(annotationIds, { a: 1 })).toBe(false);
+      // A component named id does not move the base of references between other components.
+      const idComponent = {
+        type: 'object',
+        properties: { u: { $ref: '#/components/schemas/User' } },
+        components: {
+          schemas: {
+            id: { type: 'string' },
+            User: { type: 'object', properties: { n: { $ref: '#/components/schemas/Name' } } },
+            Name: { type: 'string' },
+          },
+        },
+      } as unknown as JSONSchema7;
+      expect(await valid(idComponent, { u: { n: 'x' } })).toBe(true);
+      expect(await valid(idComponent, { u: { n: 1 } })).toBe(false);
     });
 
     it('validates a schema with 40 nested $id resources', { timeout: 60_000 }, async () => {
