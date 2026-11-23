@@ -67,22 +67,6 @@ export interface JsonSchemaAdapterOptions {
   name?: string;
 }
 
-/** Keywords whose value is one subschema. */
-const SCHEMA_KEYWORDS = [
-  'additionalItems',
-  'additionalProperties',
-  'contains',
-  'else',
-  'if',
-  'items',
-  'not',
-  'propertyNames',
-  'then',
-  'unevaluatedItems',
-  'unevaluatedProperties',
-] as const;
-/** Keywords whose value is an array of subschemas. */
-const SCHEMA_ARRAY_KEYWORDS = ['allOf', 'anyOf', 'items', 'oneOf', 'prefixItems'] as const;
 /** Keywords whose value maps names to subschemas. */
 const SCHEMA_MAP_KEYWORDS = [
   '$defs',
@@ -93,9 +77,15 @@ const SCHEMA_MAP_KEYWORDS = [
   'properties',
 ] as const;
 
-function isSchemaObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+/** Keywords whose value is literal data, never a schema. */
+const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum', 'example', 'examples']);
+
+/**
+ * Annotation keywords removed before validation. They never constrain a value,
+ * but the validator reads an object under them as a schema, so two examples
+ * holding `{ id: 1 }` made every call fail with a duplicate schema URI.
+ */
+const DROPPED_ANNOTATION_KEYWORDS = ['example', 'examples'] as const;
 
 /**
  * Thrown for a schema that uses `$dynamicRef`. `@cfworker/json-schema` does not
@@ -143,38 +133,45 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
 }
 
 /**
- * Applies `nullable` and drops `format` on one schema and every subschema, by
- * keyword (draft-07 and 2020-12). Data keywords such as `const`, `enum`,
- * `default` and `examples` are never entered.
+ * Applies `nullable` and drops `format`, `example` and `examples` on every
+ * object the validator can read as a schema. A `$ref` can point at any path
+ * (for example `#/components/schemas/User`), so the walk covers every object
+ * rather than only subschemas under schema keywords; a `format` left on a
+ * `$ref` target was checked, and the validator's `url` pattern takes seconds on
+ * a 30-character string. Values under data keywords (`const`, `enum`,
+ * `default`, ...) are never entered. On a name map (`properties`, `$defs`, ...)
+ * the keys are names, so the map itself is left alone and only its values are
+ * walked as schemas.
  */
-function normalizeSchemaNode(node: unknown): void {
-  if (!isSchemaObject(node)) {
+function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set<object>()): void {
+  if (typeof node !== 'object' || node === null || seen.has(node)) {
     return;
   }
-  if (node.nullable === true && node.type !== undefined) {
-    const types: unknown[] = Array.isArray(node.type) ? node.type : [node.type];
-    if (!types.includes('null')) {
-      node.type = [...types, 'null'];
+  seen.add(node);
+  if (Array.isArray(node)) {
+    node.forEach(item => normalizeSchemaObjects(item, false, seen));
+    return;
+  }
+  const record = node as Record<string, unknown>;
+  if (!isNameMap) {
+    if (record.nullable === true && record.type !== undefined) {
+      const types: unknown[] = Array.isArray(record.type) ? record.type : [record.type];
+      if (!types.includes('null')) {
+        record.type = [...types, 'null'];
+      }
+    }
+    if (typeof record.format === 'string') {
+      delete record.format;
+    }
+    for (const keyword of DROPPED_ANNOTATION_KEYWORDS) {
+      delete record[keyword];
     }
   }
-  if (typeof node.format === 'string') {
-    delete node.format;
-  }
-  for (const keyword of SCHEMA_KEYWORDS) {
-    normalizeSchemaNode(node[keyword]);
-  }
-  for (const keyword of SCHEMA_ARRAY_KEYWORDS) {
-    const value = node[keyword];
-    if (Array.isArray(value)) {
-      value.forEach(normalizeSchemaNode);
+  for (const [key, value] of Object.entries(record)) {
+    if (!isNameMap && DATA_KEYWORDS.has(key)) {
+      continue;
     }
-  }
-  for (const keyword of SCHEMA_MAP_KEYWORDS) {
-    const value = node[keyword];
-    if (isSchemaObject(value)) {
-      // `dependencies` may also map to a property-name array; those are skipped.
-      Object.values(value).forEach(normalizeSchemaNode);
-    }
+    normalizeSchemaObjects(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key), seen);
   }
 }
 
@@ -183,12 +180,14 @@ function normalizeSchemaNode(node: unknown): void {
  * - OpenAPI `nullable: true` beside a `type` adds `"null"` to that type, as Ajv's
  *   built-in `nullable` keyword does; `enum` and `const` still apply.
  * - `format` is dropped, because validation has never checked formats here.
- * Only schema positions are visited, so a property named `nullable` or `format`
- * is left alone.
+ * - `example` and `examples` are dropped; they never constrain a value.
+ * Every object is visited except literal data and name maps, so a property
+ * named `nullable` or `format` is left alone, and a `$ref` target is treated
+ * like any other subschema.
  */
 function toValidationSchema(schema: JSONSchema7): Schema {
   const copy = structuredClone(schema) as Schema;
-  normalizeSchemaNode(copy);
+  normalizeSchemaObjects(copy);
   return copy;
 }
 
@@ -290,8 +289,37 @@ const SUMMARY_KEYWORDS = new Set([
   '$recursiveRef',
 ]);
 
+/** The validator's error for a property refused by `additionalProperties` or `unevaluatedProperties`. */
+const CLOSED_OBJECT_MESSAGES: Record<string, (name: string) => string> = {
+  additionalProperties: name => `Property "${name}" does not match additional properties schema.`,
+  unevaluatedProperties: name => `Property "${name}" does not match unevaluated properties schema.`,
+};
+
+/**
+ * Drops summary errors, and the `False boolean schema.` error that follows a
+ * closed-object error for the same property: one extra property is reported once,
+ * by the error that names it. A `false` error with no such parent is kept.
+ */
 function leafErrors(errors: OutputUnit[]): OutputUnit[] {
-  return errors.filter(error => !SUMMARY_KEYWORDS.has(error.keyword));
+  const closedObjectErrors = new Set(
+    errors
+      .filter(error => error.keyword in CLOSED_OBJECT_MESSAGES)
+      .map(error => `${error.instanceLocation}\n${error.error}`),
+  );
+  return errors.filter(error => {
+    if (SUMMARY_KEYWORDS.has(error.keyword)) {
+      return false;
+    }
+    if (error.keyword !== 'false' || closedObjectErrors.size === 0) {
+      return true;
+    }
+    const slash = error.instanceLocation.lastIndexOf('/');
+    const parent = error.instanceLocation.slice(0, slash);
+    const name = String(instanceLocationToPath(error.instanceLocation).at(-1));
+    return !Object.values(CLOSED_OBJECT_MESSAGES).some(message =>
+      closedObjectErrors.has(`${parent}\n${message(name)}`),
+    );
+  });
 }
 
 /**
@@ -440,8 +468,10 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
       if (!ValidatorClass) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
+      // Checked on the original, before `examples` is dropped, so a `$dynamicRef`
+      // anywhere in it is refused.
+      refuseDynamicRef(this.#schema);
       const validationSchema = toValidationSchema(this.#schema);
-      refuseDynamicRef(validationSchema);
       this.#validator = new ValidatorClass(validationSchema, '2020-12', false);
     }
     return this.#validator;

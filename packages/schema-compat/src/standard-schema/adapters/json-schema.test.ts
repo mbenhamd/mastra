@@ -351,6 +351,34 @@ describe('json-schema standard-schema adapter', () => {
       });
     });
 
+    it('applies nullable and ignores format on a subschema reached only by $ref', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: { site: { $ref: '#/components/schemas/Site' } },
+        components: { schemas: { Site: { type: 'string', format: 'url', nullable: true } } },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      for (const site of [null, 'not a url']) {
+        expect(await standardSchema['~standard'].validate({ site })).toEqual({ value: { site } });
+      }
+      expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);
+    });
+
+    it('ignores examples, so example objects sharing an id leave the schema usable', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          user: { type: 'object', example: { id: 1 } },
+          owner: { type: 'object', examples: [{ id: 1 }] },
+          account: { type: 'object', example: { id: 1 } },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ user: {} })).toEqual({ value: { user: {} } });
+    });
+
     const dynamicNode = {
       $dynamicAnchor: 'node',
       type: 'object',
@@ -411,6 +439,25 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
+  it('reports an extra property once, and still reports a property declared false', async () => {
+    const standardSchema = toStandardSchema({
+      type: 'object',
+      properties: { ok: { type: 'boolean' }, banned: false },
+      additionalProperties: false,
+    } as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate({ ok: true, extra: 1 })).toEqual({
+      issues: [{ message: 'Property "extra" does not match additional properties schema.', path: [] }],
+    });
+    expect(await standardSchema['~standard'].validate({ banned: 1, extra: 1 })).toEqual({
+      issues: [
+        { message: 'False boolean schema.', path: ['banned'] },
+        { message: 'Property "extra" does not match additional properties schema.', path: [] },
+      ],
+    });
+  });
+
   describe('uniqueItems', () => {
     const schema = toStandardSchema({
       type: 'object',
@@ -450,13 +497,23 @@ describe('json-schema standard-schema adapter', () => {
       }
     });
 
-    it('checks a primitive array in time that grows linearly with its length', async () => {
-      // One array of 16,000 strings against 16 arrays of 1,000. A linear check costs
-      // about the same for both; the pairwise check costs 16 times more for the long
-      // one. The fastest of five interleaved rounds keeps a loaded host from deciding.
-      const long = { tags: Array.from({ length: 16_000 }, (_, i) => `t${i}`) };
+    it('finds a duplicate in an array that mixes strings and objects', async () => {
+      expect(await validate({ nested: { ids: ['a', { x: 1 }, 'b', { x: 1 }] } })).toEqual({
+        issues: [{ message: 'Duplicate items at indexes 1 and 3.', path: ['nested', 'ids'] }],
+      });
+      expect(await validate({ nested: { ids: ['a', { x: 1 }, 'a', { x: 1 }] } })).toEqual({
+        issues: [{ message: 'Duplicate items at indexes 0 and 2.', path: ['nested', 'ids'] }],
+      });
+    });
+
+    it('checks strings in time that grows linearly with their count, even beside an object', async () => {
+      // One array of 16,000 strings and an object against 16 arrays of 1,000 and an
+      // object. A linear check costs about the same for both; the pairwise check
+      // costs 16 times more for the long one. The fastest of five interleaved rounds
+      // keeps a loaded host from deciding.
+      const long = { nested: { ids: [...Array.from({ length: 16_000 }, (_, i) => `t${i}`), {}] } };
       const short = Array.from({ length: 16 }, (_, n) => ({
-        tags: Array.from({ length: 1_000 }, (_, i) => `t${n}-${i}`),
+        nested: { ids: [...Array.from({ length: 1_000 }, (_, i) => `t${n}-${i}`), {}] },
       }));
       let longBest = Infinity;
       let shortBest = Infinity;
