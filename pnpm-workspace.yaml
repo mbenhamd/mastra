@@ -70,6 +70,7 @@ patchedDependencies:
   react-docgen-typescript@2.4.0: patches/react-docgen-typescript@2.4.0.patch
   read-yaml-file@1.1.0: patches/read-yaml-file@1.1.0.patch
   zod-to-ts@2.1.0: patches/zod-to-ts@2.1.0.patch
+  '@cfworker/json-schema@4.1.6': patches/@cfworker__json-schema@4.1.6.patch
 
 packageExtensions:
   # server-filesystem imports zod at runtime without declaring it (it relies on

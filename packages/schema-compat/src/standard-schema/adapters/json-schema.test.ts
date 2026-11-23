@@ -411,6 +411,67 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
+  describe('uniqueItems', () => {
+    const schema = toStandardSchema({
+      type: 'object',
+      properties: {
+        tags: { $ref: '#/$defs/Tags' },
+        nested: { type: 'object', properties: { ids: { type: 'array', uniqueItems: true } } },
+      },
+      $defs: { Tags: { type: 'array', items: { type: 'string' }, uniqueItems: true } },
+    } as JSONSchema7);
+    const validate = async (value: unknown) => {
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      return schema['~standard'].validate(value);
+    };
+
+    it('refuses a duplicate behind a $ref, naming the first value that repeats and its next index', async () => {
+      expect(await validate({ tags: ['a', 'b', 'b', 'a'] })).toEqual({
+        issues: [{ message: 'Duplicate items at indexes 0 and 3.', path: ['tags'] }],
+      });
+    });
+
+    it('accepts distinct items, including values that differ only in type', async () => {
+      expect(await validate({ tags: ['a', 'b'] })).toEqual({ value: { tags: ['a', 'b'] } });
+      expect(await validate({ nested: { ids: ['1', 1, true, null] } })).toEqual({
+        value: { nested: { ids: ['1', 1, true, null] } },
+      });
+    });
+
+    it('refuses equal numbers, nulls and objects in a nested array', async () => {
+      for (const ids of [
+        [1, 1.0],
+        [null, null],
+        [{ a: [1] }, { a: [1] }],
+      ]) {
+        expect(await validate({ nested: { ids } })).toEqual({
+          issues: [{ message: 'Duplicate items at indexes 0 and 1.', path: ['nested', 'ids'] }],
+        });
+      }
+    });
+
+    it('checks a primitive array in time that grows linearly with its length', async () => {
+      // One array of 16,000 strings against 16 arrays of 1,000. A linear check costs
+      // about the same for both; the pairwise check costs 16 times more for the long
+      // one. The fastest of five interleaved rounds keeps a loaded host from deciding.
+      const long = { tags: Array.from({ length: 16_000 }, (_, i) => `t${i}`) };
+      const short = Array.from({ length: 16 }, (_, n) => ({
+        tags: Array.from({ length: 1_000 }, (_, i) => `t${n}-${i}`),
+      }));
+      let longBest = Infinity;
+      let shortBest = Infinity;
+      for (let round = 0; round < 5; round++) {
+        let start = performance.now();
+        expect('value' in (await validate(long))).toBe(true);
+        longBest = Math.min(longBest, performance.now() - start);
+        start = performance.now();
+        for (const value of short) expect('value' in (await validate(value))).toBe(true);
+        shortBest = Math.min(shortBest, performance.now() - start);
+      }
+      expect(longBest / shortBest).toBeLessThan(6);
+    }, 120_000);
+  });
+
   describe('isStandardSchemaWithJSON', () => {
     it('should return true for JSON Schema wrapped schemas', () => {
       const jsonSchema: JSONSchema7 = { type: 'string' };

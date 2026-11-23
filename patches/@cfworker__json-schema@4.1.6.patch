@@ -1,0 +1,110 @@
+diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..1c4f365b99ac29a0c498aa48b2e6ea4de9abef57 100644
+--- a/dist/commonjs/validate.js
++++ b/dist/commonjs/validate.js
+@@ -36,6 +36,32 @@ function isMultipleOf(instance, divisor) {
+         (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
+         0n);
+ }
++// mbenhamd/mastra#631 (PF-9666): a linear uniqueness check for arrays of JSON
++// primitives. The pairwise loop below compares every pair of items, which takes
++// seconds for tens of thousands of strings. Returns undefined when an item is an
++// object, an array, undefined or NaN (the pairwise loop handles those), null when
++// every item is distinct, or the pair the pairwise loop reports: the lowest index
++// whose value occurs again, and that value's next index. Items compare as the loop
++// compares primitives, with ===, so "1" and 1 differ, and 1 and 1.0 are equal.
++function findPrimitiveDuplicate(instance) {
++    const firstIndex = new Map();
++    let pair = null;
++    for (let i = 0; i < instance.length; i++) {
++        const item = instance[i];
++        const type = typeof item;
++        if (!(item === null || type === 'string' || type === 'boolean' || (type === 'number' && item === item))) {
++            return undefined;
++        }
++        const first = firstIndex.get(item);
++        if (first === undefined) {
++            firstIndex.set(item, i);
++        }
++        else if (pair === null || first < pair[0]) {
++            pair = [first, i];
++        }
++    }
++    return pair;
++}
+ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_js_1.dereference)(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
+     if (schema === true) {
+         return { valid: true, errors: [] };
+@@ -697,7 +723,16 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+                 }
+             }
+         }
+-        if ($uniqueItems) {
++        const primitiveDuplicate = $uniqueItems ? findPrimitiveDuplicate(instance) : undefined;
++        if (primitiveDuplicate) {
++            errors.push({
++                instanceLocation,
++                keyword: 'uniqueItems',
++                keywordLocation: `${schemaLocation}/uniqueItems`,
++                error: `Duplicate items at indexes ${primitiveDuplicate[0]} and ${primitiveDuplicate[1]}.`
++            });
++        }
++        else if ($uniqueItems && primitiveDuplicate === undefined) {
+             for (let j = 0; j < length; j++) {
+                 const a = instance[j];
+                 const ao = typeof a === 'object' && a !== null;
+diff --git a/dist/esm/validate.js b/dist/esm/validate.js
+index 78c71b00e321ff99db657484d299c1684a4ef07e..d4d2b5d49f9c167aba4740d5417d71a0bad52347 100644
+--- a/dist/esm/validate.js
++++ b/dist/esm/validate.js
+@@ -33,6 +33,32 @@ function isMultipleOf(instance, divisor) {
+         (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
+         0n);
+ }
++// mbenhamd/mastra#631 (PF-9666): a linear uniqueness check for arrays of JSON
++// primitives. The pairwise loop below compares every pair of items, which takes
++// seconds for tens of thousands of strings. Returns undefined when an item is an
++// object, an array, undefined or NaN (the pairwise loop handles those), null when
++// every item is distinct, or the pair the pairwise loop reports: the lowest index
++// whose value occurs again, and that value's next index. Items compare as the loop
++// compares primitives, with ===, so "1" and 1 differ, and 1 and 1.0 are equal.
++function findPrimitiveDuplicate(instance) {
++    const firstIndex = new Map();
++    let pair = null;
++    for (let i = 0; i < instance.length; i++) {
++        const item = instance[i];
++        const type = typeof item;
++        if (!(item === null || type === 'string' || type === 'boolean' || (type === 'number' && item === item))) {
++            return undefined;
++        }
++        const first = firstIndex.get(item);
++        if (first === undefined) {
++            firstIndex.set(item, i);
++        }
++        else if (pair === null || first < pair[0]) {
++            pair = [first, i];
++        }
++    }
++    return pair;
++}
+ export function validate(instance, schema, draft = '2019-09', lookup = dereference(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
+     if (schema === true) {
+         return { valid: true, errors: [] };
+@@ -694,7 +720,16 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+                 }
+             }
+         }
+-        if ($uniqueItems) {
++        const primitiveDuplicate = $uniqueItems ? findPrimitiveDuplicate(instance) : undefined;
++        if (primitiveDuplicate) {
++            errors.push({
++                instanceLocation,
++                keyword: 'uniqueItems',
++                keywordLocation: `${schemaLocation}/uniqueItems`,
++                error: `Duplicate items at indexes ${primitiveDuplicate[0]} and ${primitiveDuplicate[1]}.`
++            });
++        }
++        else if ($uniqueItems && primitiveDuplicate === undefined) {
+             for (let j = 0; j < length; j++) {
+                 const a = instance[j];
+                 const ao = typeof a === 'object' && a !== null;

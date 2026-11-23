@@ -8,6 +8,8 @@ A schema with a `$dynamicRef` key anywhere is now refused, including where only 
 
 A value is validated in its JSON form: an object property whose value is `undefined` counts as absent for every keyword. Ajv counted it as absent only for `properties`, `required` and `dependencies`, so `{ extra: undefined }` against `additionalProperties: false` was refused and is now accepted.
 
+`uniqueItems` checks an array of strings, numbers, booleans and `null` in one pass wherever the keyword appears, including behind a `$ref`, so its cost grows linearly with the array, as with Ajv. Values compare by JSON equality: `"1"` and `1` differ, `1` and `1.0` are equal. An array that contains an object or an array is still compared pair by pair, so its cost grows with the square of its length.
+
 The validator is imported lazily when the package loads, because `@cfworker/json-schema` reads `self.location` on import and throws in a browser worker created from a blob URL. Importing the package therefore never fails there. Until the validator has loaded, which happens shortly after startup, and permanently where it cannot load (such as those blob workers), every JSON Schema validation fails closed with the issue `JSON Schema validator unavailable (<reason>)`; it never reports success. During that window a schema with `$dynamicRef` gets this issue too, not the `$dynamicRef` one. The new `jsonSchemaValidatorReady()` resolves once the import has settled, in every copy of the adapter loaded in the process, including copies bundled into other packages. `jsonSchemaValidatorLoading()` reports whether any copy is still loading. Before a synchronous `validate` call made right after startup, await `jsonSchemaValidatorReady()` while `jsonSchemaValidatorLoading()` is true.
 
 ```ts
