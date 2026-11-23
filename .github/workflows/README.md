@@ -221,6 +221,14 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   `agent-sdks/openai` manifests, each pinned to its sha256 at the reviewed head,
   with the lockfile `patch_hash` and workspace patch path naming the pinned
   patch; any later change to those files needs a new owner-reviewed exception.
+  The validation plan admits the patch, `pnpm-workspace.yaml` and the
+  re-keyed lockfile importers for #631 only through that same verifier, so a
+  failing pin refuses both install and plan. `agent-sdks/claude`,
+  `agent-sdks/openai` and `mastracode/factory` are owned workspaces: the SDKs
+  run build, `tsc --noEmit`, lint and their Vitest suites with provider keys
+  cleared; Factory runs build, check, `build:lib` and lint; and
+  `mastracode/factory/src/routes/projects.ts` is paired with
+  `projects.test.ts`.
   Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation

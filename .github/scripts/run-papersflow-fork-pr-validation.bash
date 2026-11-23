@@ -1881,6 +1881,16 @@ NODE
   verify_pf9666_schema_compat_manifest_delta "$base_sha" "$head_sha" || return 1
 )
 
+# The install classifier's watched dependency-graph paths, also recomputed by
+# the main validator for the PF-9666 planning admission.
+list_watched_dependency_graph_changes() {
+  git diff --no-renames --name-only "${1}...${2}" -- \
+    .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
+    patches packages/server/package.json server-adapters/fastify/package.json \
+    packages/_types-builder/package.json packages/agent-builder/package.json |
+    sort -u
+}
+
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
   : "${HEAD_SHA:?HEAD_SHA is required}"
@@ -1888,11 +1898,7 @@ classify_install_lane() (
   local manifest_changes
   manifest_changes="$(mktemp)"
   trap 'rm -f "$manifest_changes"' EXIT
-  git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
-    .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
-    patches packages/server/package.json server-adapters/fastify/package.json \
-    packages/_types-builder/package.json packages/agent-builder/package.json |
-    sort -u > "$manifest_changes"
+  list_watched_dependency_graph_changes "$BASE_SHA" "$HEAD_SHA" > "$manifest_changes"
 
   # PF-6640 is frozen to one reviewed merge commit, tree, branch, repository,
   # and parent pair. The policy PR advances protected main after that merge was
@@ -5409,7 +5415,7 @@ run_validator_self_tests() {
 
   # Keep the dedicated manifest/dependency admission suite in the aggregate
   # validator self-test as well as exposing it through its focused entrypoint.
-  if [[ "${1:-}" != '--package-contracts-only' ]]; then
+  if [[ "${1:-}" != '--package-contracts-only' && "${1:-}" != '--pf9666-owned-targets-only' ]]; then
     run_pf3553_admission_self_tests
     run_pf9666_patched_cfworker_admission_self_tests
   fi
@@ -6051,6 +6057,196 @@ run_validator_self_tests() {
       exit 1
     fi
   }
+
+  # Adds the two Agent SDK workspaces and the Factory projects route pair on
+  # top of $1 and prints the new commit.
+  commit_pf9666_owned_workspaces() (
+    cd "$fixture_repo"
+    git reset -q --hard "$1"
+    mkdir -p agent-sdks/claude/src agent-sdks/openai/src mastracode/factory/src/routes
+    local sdk
+    for sdk in claude openai; do
+      printf '{"name":"@mastra/%s"}\n' "$sdk" > "agent-sdks/$sdk/package.json"
+      printf '%s\n' 'export default {};' > "agent-sdks/$sdk/vitest.config.ts"
+      printf '%s\n' 'export const utils = 1;' > "agent-sdks/$sdk/src/utils.ts"
+    done
+    printf '%s\n' '{"name":"@mastra/factory"}' > mastracode/factory/package.json
+    printf '%s\n' 'export default {};' > mastracode/factory/vitest.config.ts
+    printf '%s\n' 'export const projects = 1;' > mastracode/factory/src/routes/projects.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('project settings', () => {});" \
+      > mastracode/factory/src/routes/projects.test.ts
+    git add .
+    git commit -q -m 'add agent SDK and factory workspaces'
+    git rev-parse HEAD
+  )
+
+  # Changes one source file under each workspace on top of $1.
+  commit_pf9666_owned_workspace_sources() (
+    cd "$fixture_repo"
+    printf '%s\n' 'export const utils = 2;' > agent-sdks/claude/src/utils.ts
+    printf '%s\n' 'export const utils = 2;' > agent-sdks/openai/src/utils.ts
+    printf '%s\n' 'export const projects = 2;' > mastracode/factory/src/routes/projects.ts
+    git add .
+    git commit -q -m 'change owned workspace sources'
+    git rev-parse HEAD
+  )
+
+  assert_pf9666_owned_workspace_targets() {
+    local sdk
+    for sdk in claude openai; do
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match build" "$command_log"
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match exec tsc --noEmit" "$command_log"
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match lint" "$command_log"
+      assert_line_count 1 "--dir agent-sdks/$sdk exec vitest run --reporter=dot" "$command_log"
+    done
+    assert_line_count 1 'turbo build --filter ./mastracode/factory' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match check' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match build:lib' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match lint' "$command_log"
+    assert_line_matches '^--dir mastracode/factory exec vitest run .* src/routes/projects\.test\.ts$' "$command_log"
+  }
+
+  # Permanent owned targets: an ordinary PR changing a source file under each
+  # workspace plans that workspace's build, typecheck, lint and suites.
+  run_pf9666_owned_agent_sdk_and_factory_target_fixtures() {
+    local owned_base owned_head
+    owned_base="$(commit_pf9666_owned_workspaces "$base_sha")"
+    owned_head="$(commit_pf9666_owned_workspace_sources)"
+    : > "$command_log"
+    output="$test_root/pf9666-owned-targets.log"
+    if ! run_fixture "$owned_head" "$output" BASE_SHA="$owned_base"; then
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_pf9666_owned_workspace_targets
+    assert_not_contains 'PF-9666 exact patched cfworker dependency graph' "$output"
+    git -C "$fixture_repo" reset -q --hard "$base_sha"
+    echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
+  }
+
+  # PF-9666 planning admission at PR 631's shape: the patch, workspace line,
+  # patched lockfile (with a peer-variant re-key in an importer whose manifest
+  # does not change), the three manifests and source edits in each workspace.
+  run_pf9666_patched_cfworker_planning_fixtures() {
+    local graph_base graph_head patch_hash patch_path='patches/@cfworker__json-schema@4.1.6.patch'
+    local -a graph_env
+    graph_base="$(
+      commit_pf9666_owned_workspaces "$pf9666_base_sha" > /dev/null
+      cd "$fixture_repo"
+      printf '%s\n' 'packages:' "  - '*'" > pnpm-workspace.yaml
+      node - <<'NODE'
+const fs = require('node:fs');
+const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8').split('\n');
+lines.splice(lines.indexOf('importers:') + 1, 0, '', '  packages/mcp-registry-registry:', '    dependencies:',
+  "      '@modelcontextprotocol/sdk':", '        specifier: ^1.0.0', '        version: 1.0.0(@cfworker/json-schema@4.1.1)');
+fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
+NODE
+      git add .
+      git commit -q -m 'add the workspace file and an MCP SDK consumer'
+      git rev-parse HEAD
+    )"
+    graph_head="$(
+      cd "$fixture_repo"
+      mkdir -p patches
+      printf '%s\n' 'reviewed cfworker patch' > "$patch_path"
+      printf '%s\n' '' 'patchedDependencies:' "  '@cfworker/json-schema@4.1.6': $patch_path" >> pnpm-workspace.yaml
+      node - "$(sha256sum "$patch_path" | awk '{print $1}')" <<'NODE'
+const fs = require('node:fs');
+const hash = process.argv[2];
+const patched = `4.1.6(patch_hash=${hash})`;
+const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8')
+  .replace('(@cfworker/json-schema@4.1.1)', `(@cfworker/json-schema@${patched})`)
+  .split('\n');
+lines.splice(lines.indexOf('importers:'), 0, 'patchedDependencies:', `  '@cfworker/json-schema@4.1.6': ${hash}`, '');
+const importer = lines.indexOf('  packages/schema-compat:');
+lines.splice(importer + 2, 0, "      '@cfworker/json-schema':", '        specifier: ^4.1.6', `        version: ${patched}`);
+lines.splice(lines.indexOf('importers:') + 1, 0, '', '  agent-sdks/claude:', '    dependencies:',
+  "      '@mastra/schema-compat':", '        specifier: workspace:*', '        version: link:../../packages/schema-compat',
+  '', '  agent-sdks/openai:', '    dependencies:',
+  "      '@mastra/schema-compat':", '        specifier: workspace:*', '        version: link:../../packages/schema-compat');
+lines.splice(lines.indexOf("  '@cfworker/json-schema@4.1.1':") + 3, 0, "  '@cfworker/json-schema@4.1.6':",
+  '    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}', '');
+lines.splice(lines.indexOf("  '@cfworker/json-schema@4.1.1': {}") + 1, 0, `  '@cfworker/json-schema@${patched}': {}`, '');
+fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
+
+const manifestPath = 'packages/schema-compat/package.json';
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+manifest.devDependencies = { ...manifest.devDependencies, '@cfworker/json-schema': '^4.1.6' };
+fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+for (const sdk of ['claude', 'openai']) {
+  fs.writeFileSync(`agent-sdks/${sdk}/package.json`,
+    `${JSON.stringify({ name: `@mastra/${sdk}`, dependencies: { '@mastra/schema-compat': 'workspace:*' } })}\n`);
+}
+NODE
+      git add .
+      git commit -q -m 'add the patched cfworker graph'
+      commit_pf9666_owned_workspace_sources
+    )"
+    pf9666_graph_pin() {
+      (cd "$fixture_repo" && git_blob_sha256 "$graph_head" "$1")
+    }
+    graph_env=(
+      BASE_SHA="$graph_base"
+      PR_NUMBER=631
+      HEAD_REPOSITORY=mbenhamd/mastra
+      HEAD_REF=fix/pf-9666-schema-compat-no-codegen
+      BASE_REF=main
+      PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256="$(pf9666_graph_pin packages/schema-compat/package.json)"
+      PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256="$(pf9666_graph_pin agent-sdks/claude/package.json)"
+      PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256="$(pf9666_graph_pin agent-sdks/openai/package.json)"
+      PAPERSFLOW_PF9666_WORKSPACE_SHA256="$(pf9666_graph_pin pnpm-workspace.yaml)"
+      PAPERSFLOW_PF9666_LOCKFILE_SHA256="$(pf9666_graph_pin pnpm-lock.yaml)"
+      PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256="$(pf9666_graph_pin "$patch_path")"
+    )
+
+    : > "$command_log"
+    output="$test_root/pf9666-graph-planning.log"
+    if ! run_fixture "$graph_head" "$output" "${graph_env[@]}"; then
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'PF-9666 exact patched cfworker dependency graph admitted to planning from trusted base policy.' "$output"
+    assert_pf9666_owned_workspace_targets
+
+    # One zeroed pin exercises the shared install/planning verifier.
+    : > "$command_log"
+    output="$test_root/pf9666-graph-zeroed-pin.log"
+    if run_fixture "$graph_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256=0000000000000000000000000000000000000000000000000000000000000000; then
+      echo 'PF-9666 planning unexpectedly admitted a graph with a zeroed patch pin.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains "PF-9666 reviewed dependency file hash changed: $patch_path" "$output"
+    assert_contains 'These non-workspace or root dependency-graph changes require dedicated validation:' "$output"
+    if [[ -s "$command_log" ]]; then
+      echo 'PF-9666 refused planning executed validation commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    : > "$command_log"
+    output="$test_root/pf9666-graph-wrong-metadata.log"
+    if run_fixture "$graph_head" "$output" "${graph_env[@]}" PR_NUMBER=632; then
+      echo 'PF-9666 planning unexpectedly admitted the graph for another pull request.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_not_contains 'PF-9666 exact patched cfworker dependency graph admitted to planning' "$output"
+    assert_contains 'These non-workspace or root dependency-graph changes require dedicated validation:' "$output"
+    if [[ -s "$command_log" ]]; then
+      echo 'PF-9666 refused planning executed validation commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+    git -C "$fixture_repo" reset -q --hard "$base_sha"
+    echo 'PF-9666 patched cfworker planning admission fixtures passed.'
+  }
+
+  if [[ "${1:-}" == '--pf9666-owned-targets-only' ]]; then
+    run_pf9666_owned_agent_sdk_and_factory_target_fixtures
+    return
+  fi
 
   package_contract_dependency_base_sha="$(
     cd "$fixture_repo"
@@ -8846,6 +9042,9 @@ NODE
   fi
   assert_contains 'PF-9666 pnpm-lock.yaml may only add the reviewed schema-compat importer entry and the 4.1.6 package.' "$output"
   assert_contains 'Lockfile-only changes require a reviewed dependency-graph lane.' "$output"
+
+  run_pf9666_owned_agent_sdk_and_factory_target_fixtures
+  run_pf9666_patched_cfworker_planning_fixtures
 
   head_sha="$(
     cd "$fixture_repo"
@@ -12025,6 +12224,11 @@ if [[ "${1:-}" == "--self-test-package-contracts" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--self-test-pf9666-owned-targets" ]]; then
+  run_validator_self_tests --pf9666-owned-targets-only
+  exit 0
+fi
+
 
 run_stagehand_validation_self_test() {
   local script_path test_root test_repo stub_bin command_log base_sha head_sha deleted_test_sha deletion_log
@@ -13457,6 +13661,24 @@ if grep -Eq \
     verify_pf3553_reviewed_surface "$BASE_SHA" "$HEAD_SHA"; then
     pf3553_selected_route_exports=true
   fi
+fi
+
+# PF-9666 patched cfworker graph: recompute the install admission here rather
+# than trusting the classifier's lane. Only PR 631's exact metadata reaches the
+# shared verifier; any mismatch leaves the patch, pnpm-workspace.yaml and the
+# lockfile on the fail-closed paths below.
+pf9666_config
+pf9666_patched_cfworker_graph=false
+if pf9666_metadata_matches; then
+  pf9666_watched_changes="$(mktemp)"
+  if list_watched_dependency_graph_changes "$BASE_SHA" "$HEAD_SHA" > "$pf9666_watched_changes" &&
+    verify_pf9666_patched_cfworker_graph "$merge_base_sha" "$HEAD_SHA" "$pf9666_watched_changes"; then
+    pf9666_patched_cfworker_graph=true
+    echo 'PF-9666 exact patched cfworker dependency graph admitted to planning from trusted base policy.'
+  else
+    echo 'PF-9666 patched cfworker dependency graph is not the exact reviewed graph.' >&2
+  fi
+  rm -f "$pf9666_watched_changes"
 fi
 
 git_regular_file_at_head() {
@@ -14988,7 +15210,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | code-mode/quickjs | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    agent-sdks/claude | agent-sdks/openai | auth/okta | browser/stagehand | code-mode/quickjs | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/factory | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     packages/memory/integration-tests)
       # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
       # separately locked package. Its manifest, lockfile, Vitest config,
@@ -15041,12 +15263,21 @@ while IFS= read -r file; do
       git_regular_file_at_head "$file" ||
         printf '%s\n' "$file" >> "$unsupported_inputs"
       ;;
+    pnpm-workspace.yaml | patches/@cfworker__json-schema@4.1.6.patch)
+      # Admitted only by the exact PF-9666 patched cfworker graph above.
+      [[ "$pf9666_patched_cfworker_graph" == true ]] ||
+        printf '%s\n' "$file" >> "$unsupported_inputs"
+      ;;
     *) printf '%s\n' "$file" >> "$unsupported_inputs" ;;
   esac
 done < "$unowned_files"
 
-grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" \
-  >> "$unsupported_inputs" || true
+grep -E '^(package\.json|pnpm-workspace\.yaml|patches/)' "$changed_files" |
+  if [[ "$pf9666_patched_cfworker_graph" == true ]]; then
+    grep -Fvx -e pnpm-workspace.yaml -e patches/@cfworker__json-schema@4.1.6.patch
+  else
+    cat
+  fi >> "$unsupported_inputs" || true
 # Server and Fastify validation invoke package-owned scripts. Admit their two
 # manifests only after the exact PF-3553 semantic predicate above succeeds;
 # every other edit fails before PR-controlled package commands can run.
@@ -15085,8 +15316,10 @@ if [[ "$lockfile_changed" == true ]] &&
   schema_compat_pf9666_cfworker=true
 fi
 
+# The PF-9666 patched cfworker graph pins the whole lockfile blob, including its
+# peer-variant re-keys in importers whose manifests did not change.
 if [[ "$lockfile_changed" == true && "$inngest_pf2057_dependency_cleanup" == false &&
-  "$schema_compat_pf9666_cfworker" == false ]]; then
+  "$schema_compat_pf9666_cfworker" == false && "$pf9666_patched_cfworker_graph" == false ]]; then
   node - "$merge_base_sha" "$HEAD_SHA" > "$changed_lockfile_importers" <<'NODE'
 const { execFileSync } = require('node:child_process');
 
@@ -15357,7 +15590,8 @@ while IFS= read -r file; do
             mastracode/tui/src/tui/__tests__/goal-manager.test.ts | \
             mastracode/sdk/src/headless/run-mc.test.ts | \
             mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts | \
-            mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts) ;;
+            mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts | \
+            mastracode/factory/src/routes/projects.test.ts) ;;
           *) printf '%s\n' "$file" >> "$unsupported_mastracode_tests" ;;
         esac
       fi
@@ -15391,6 +15625,12 @@ while IFS= read -r file; do
         ;;
       mastracode/sdk/src/utils/signals-pubsub.ts)
         required_test="mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts"
+        ;;
+      mastracode/factory/src/routes/projects.ts)
+        # The in-process route suite covers project settings validation; the
+        # sibling concurrency suite needs FACTORY_TEST_POSTGRES_URL for its
+        # PostgreSQL case and stays outside this pair.
+        required_test="mastracode/factory/src/routes/projects.test.ts"
         ;;
       mastracode/sdk/src/index.ts | mastracode/tui/src/main.ts)
         # Composition roots: no single unit suite owns them; build:mastracode
@@ -16306,6 +16546,20 @@ if [[ -z "${MOCK_PNPM_LOG:-}" ]]; then
   run_vitest_selection_regressions
 fi
 
+# Agent SDK packages resolve @mastra/core and @mastra/schema-compat through the
+# dist outputs build:core produced above. Their Vitest suites are in-process
+# with mocked provider SDKs; provider credentials are cleared regardless.
+for agent_sdk in agent-sdks/claude agent-sdks/openai; do
+  if workspace_changed "$agent_sdk"; then
+    run_with_validation_budget 900 pnpm --filter "./$agent_sdk" --fail-if-no-match build
+    run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match exec tsc --noEmit
+    run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match lint
+    run_with_validation_budget 900 \
+      env OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY= \
+      pnpm --dir "$agent_sdk" exec vitest run --reporter=dot
+  fi
+done
+
 if workspace_changed auth/okta; then
   run_with_validation_budget 900 pnpm --filter ./auth/okta --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter ./auth/okta --fail-if-no-match lint
@@ -16738,7 +16992,8 @@ ensure_mastracode_prerequisites() {
   mastracode_prerequisites_built=true
 }
 
-if workspace_changed mastracode || workspace_changed mastracode/sdk || workspace_changed mastracode/tui; then
+if workspace_changed mastracode || workspace_changed mastracode/sdk || workspace_changed mastracode/tui ||
+  workspace_changed mastracode/factory; then
   ensure_mastracode_prerequisites
   mapfile -t mastracode_lint_files < <(
     while IFS= read -r file; do
@@ -16777,6 +17032,17 @@ if workspace_changed mastracode/tui; then
   run_with_validation_budget 600 pnpm --filter ./mastracode/tui --fail-if-no-match check
   run_with_validation_budget 900 pnpm --filter ./mastracode/tui --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter ./mastracode/tui --fail-if-no-match lint
+fi
+
+if workspace_changed mastracode/factory; then
+  # Factory imports Code SDK, MCP, Slack, auth and storage packages through
+  # their dist exports, and declares no `build` script of its own, so the turbo
+  # build here builds exactly its workspace dependency graph. Its owned suites
+  # run through the MastraCode source-and-test pairs above.
+  run_with_validation_budget 900 pnpm turbo build --filter ./mastracode/factory
+  run_with_validation_budget 600 pnpm --filter ./mastracode/factory --fail-if-no-match check
+  run_with_validation_budget 900 pnpm --filter ./mastracode/factory --fail-if-no-match build:lib
+  run_with_validation_budget 600 pnpm --filter ./mastracode/factory --fail-if-no-match lint
 fi
 
 is_explicit_fork_safe_test() {
@@ -17746,7 +18012,8 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != mastracode/tui/src/tui/__tests__/goal-manager.test.ts && \
       "$file" != mastracode/sdk/src/headless/run-mc.test.ts && \
       "$file" != mastracode/sdk/src/utils/__tests__/observation-index-input.test.ts && \
-      "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts ]]; then
+      "$file" != mastracode/sdk/src/utils/__tests__/signals-pubsub.test.ts && \
+      "$file" != mastracode/factory/src/routes/projects.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
     elif [[ "$file" =~ integration\.(test|spec)\. && \
       "$file" != packages/cli/src/services/service.deps.integration.test.ts && \
