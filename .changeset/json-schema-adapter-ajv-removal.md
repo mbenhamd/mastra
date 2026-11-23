@@ -11,4 +11,6 @@ const schema = toStandardSchema(jsonSchema, { ajvOptions: { strict: false } });
 const schema = toStandardSchema(jsonSchema);
 ```
 
+Ajv options that changed the value, such as `coerceTypes`, `useDefaults` and `removeAdditional`, are gone too: the validated value is now returned exactly as passed. Convert strings to numbers, fill defaults or strip extra properties before calling `validate`, for example with a Zod schema's `z.coerce` and `.default()`, or by hand.
+
 Code that called `getAjv()` to add keywords or formats should express the rule with a keyword the adapter checks, such as `pattern`, `enum` or `minimum`, or validate the value separately. Do not move a custom format to the `format` keyword: the adapter never checks `format`, on any subschema.
