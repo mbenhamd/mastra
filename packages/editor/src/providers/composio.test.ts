@@ -1889,4 +1889,114 @@ describe('ComposioToolProvider — shared catalog tools', () => {
       integration.resolveCatalogTools({ toolSlugs: ['COMPOSIO_MANAGE_CONNECTIONS'], resolveIdentity: () => undefined }),
     ).rejects.toThrow('caller-scoped session');
   });
+
+  // PF-9975: a Gmail search with the schema defaults returns each message's
+  // whole base64 MIME payload (1.67 MB for ten messages). The host fixes
+  // `include_payload: false`; the model must not be offered the argument and
+  // cannot turn it back on. The real `MastraProvider.wrapTool` builds the
+  // model-facing tool from the modified schema, as `tools.get` does; the call
+  // then runs `beforeExecute` on the SDK's execute body.
+  const gmailSearchSchema = {
+    slug: 'GMAIL_FETCH_EMAILS',
+    name: 'Fetch emails',
+    description: 'Fetch emails',
+    toolkit: { slug: 'gmail', name: 'Gmail' },
+    tags: ['readOnlyHint'],
+    inputParameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        include_payload: { type: 'boolean', default: true },
+        verbose: { type: 'boolean', default: true },
+      },
+      required: ['query', 'include_payload'],
+    },
+    outputParameters: { type: 'object', properties: {} },
+  };
+
+  async function realWrapperCatalog(fixedArguments: Record<string, Record<string, unknown>>) {
+    const { MastraProvider } = await vi.importActual<typeof import('@composio/mastra')>('@composio/mastra');
+    const integration = new ComposioToolProvider({ apiKey: 'k' });
+    await integration
+      .resolveToolsVNext({ toolSlugs: ['warm'], toolMeta: {}, connectionId: 'ca_0' })
+      .catch(() => undefined);
+    const mastra = getMastraInstance();
+    mastra.tools.get.mockReset();
+    const sentArguments: Array<Record<string, unknown> | undefined> = [];
+    mastra.tools.get.mockImplementation(
+      async (
+        fetchedAs: string,
+        _filters: unknown,
+        modifiers: {
+          beforeExecute: (input: { toolSlug: string; toolkitSlug: string; params: Record<string, unknown> }) => unknown;
+          modifySchema: (input: { toolSlug: string; toolkitSlug: string; schema: unknown }) => unknown;
+        },
+      ) => {
+        const schema = await modifiers.modifySchema({
+          toolSlug: gmailSearchSchema.slug,
+          toolkitSlug: 'gmail',
+          schema: gmailSearchSchema,
+        });
+        const wrapped = (
+          new MastraProvider() as unknown as {
+            wrapTool: (
+              tool: unknown,
+              exec: (slug: string, args: Record<string, unknown>) => Promise<unknown>,
+            ) => unknown;
+          }
+        ).wrapTool(schema, async (toolSlug, args) => {
+          const params = (await modifiers.beforeExecute({
+            toolSlug,
+            toolkitSlug: 'gmail',
+            params: { userId: fetchedAs, arguments: args },
+          })) as { arguments?: Record<string, unknown> };
+          sentArguments.push(params.arguments);
+          return { data: {}, error: null, successful: true };
+        });
+        return { [gmailSearchSchema.slug]: wrapped };
+      },
+    );
+    const tools = await integration.resolveCatalogTools({
+      toolSlugs: [gmailSearchSchema.slug],
+      fixedArguments,
+      resolveIdentity: () => ({ userId: 'pf:alice' }),
+    });
+    return { tools, sentArguments };
+  }
+
+  it('hides a fixed argument from the model, sends its value, and refuses a call that sets it', async () => {
+    const { standardSchemaToJSONSchema } = await import('@mastra/schema-compat');
+    const { tools, sentArguments } = await realWrapperCatalog({
+      GMAIL_FETCH_EMAILS: { include_payload: false },
+    });
+    const search = tools.GMAIL_FETCH_EMAILS!;
+    const modelSchema = standardSchemaToJSONSchema(search.inputSchema as never, { io: 'input' }) as {
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+    expect(Object.keys(modelSchema.properties ?? {}).sort()).toEqual(['query', 'verbose']);
+    expect(modelSchema.required).toEqual(['query']);
+
+    const context = { requestContext: createRequestContext({}) } as never;
+    await search.execute!({ query: 'from:me' } as never, context);
+    expect(sentArguments).toEqual([{ query: 'from:me', include_payload: false }]);
+
+    // A model that sends the hidden argument anyway fails input validation;
+    // nothing reaches Composio with its value.
+    const refused = (await search.execute!({ query: 'from:me', include_payload: true } as never, context)) as {
+      error?: boolean;
+      message?: string;
+    };
+    expect(refused.error).toBe(true);
+    expect(refused.message).toContain('Tool input validation failed');
+    expect(sentArguments).toHaveLength(1);
+    // The SDK keeps the raw schema for execution; it is not edited in place.
+    expect(Object.keys(gmailSearchSchema.inputParameters.properties)).toContain('include_payload');
+  });
+
+  it('refuses to resolve when a fixed argument is not one of the tool parameters', async () => {
+    await expect(realWrapperCatalog({ GMAIL_FETCH_EMAILS: { includePayload: false } })).rejects.toThrow(
+      'GMAIL_FETCH_EMAILS has no input parameter includePayload',
+    );
+  });
 });
