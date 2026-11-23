@@ -434,7 +434,7 @@ export const composioTools = await composio.resolveCatalogTools({
     name: 'fixedArguments',
     type: 'Record<string, Record<string, unknown>>',
     description:
-      "Arguments set on every call, keyed by tool slug. The model isn't offered them, and the fixed value replaces whatever a call sends. When the tool's schema doesn't allow additional properties, a call that sends a fixed argument is refused before it reaches Composio.",
+      "Arguments set on every call, keyed by tool slug and matched case-insensitively. The model isn't offered them, and the fixed value replaces whatever a call sends. When the tool's schema doesn't allow additional properties, a call that sends a fixed argument is refused before it reaches Composio.",
     isOptional: true,
   },
   {

@@ -562,9 +562,13 @@ export class ComposioToolProvider extends BaseToolProvider {
       throw new Error('[composio] connection-management tools need a caller-scoped session, not a shared catalog');
     }
     // Keyed upper-case: the SDK reports `tool.slug` as Composio returns it.
-    const fixedArguments = new Map(
-      Object.entries(opts.fixedArguments ?? {}).map(([slug, fixed]) => [slug.toUpperCase(), fixed]),
-    );
+    const fixedArguments = new Map<string, Record<string, unknown>>();
+    for (const [slug, fixed] of Object.entries(opts.fixedArguments ?? {})) {
+      if (fixedArguments.has(slug.toUpperCase())) {
+        throw new Error(`[composio] fixed arguments name ${slug} more than once`);
+      }
+      fixedArguments.set(slug.toUpperCase(), fixed);
+    }
     const callIdentity = new AsyncLocalStorage<ComposioCallIdentity>();
     const rawToolFacts: ToolFactsBySlug = new Map();
     const captureFacts = captureToolFacts(rawToolFacts);
