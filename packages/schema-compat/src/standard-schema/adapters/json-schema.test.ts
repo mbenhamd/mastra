@@ -301,19 +301,11 @@ describe('json-schema standard-schema adapter', () => {
           { type: 'object', required: ['label'], properties: { child } },
         ],
       };
-      // The same union reached through $recursiveRef instead of $ref.
-      const byRecursiveRef = {
-        oneOf: [
-          { type: 'object', required: ['text'], properties: { child: { $recursiveRef: '#' } } },
-          { type: 'object', required: ['label'], properties: { child: { $recursiveRef: '#' } } },
-        ],
-      };
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       // Checking each branch's child again at every level took 2^depth steps: 13-25 s at depth 20.
       for (const [node, leaf] of [
         [byConst, { kind: 'b' }],
         [byRequired, { label: 'x' }],
-        [byRecursiveRef, { label: 'x' }],
       ] as const) {
         const standardSchema = toStandardSchema({ $defs: { node }, $ref: '#/$defs/node' } as JSONSchema7);
         let valid: Record<string, unknown> = leaf;
@@ -588,12 +580,11 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ other: 5 }))).toBe(true);
     });
 
-    it('ignores format behind an absolute $ref, and accepts a schema holding a large literal array', async () => {
+    it('ignores format behind a $ref, and accepts a schema holding a large literal array', async () => {
       const standardSchema = toStandardSchema({
-        $id: 'https://example.com/tool',
         type: 'object',
         properties: {
-          site: { $ref: 'https://example.com/tool#/components/schemas/properties' },
+          site: { $ref: '#/components/schemas/properties' },
           code: { enum: Array.from({ length: 200_000 }, (_, i) => `c${i}`) },
         },
         components: { schemas: { properties: { type: 'string', format: 'url' } } },
@@ -608,56 +599,12 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ site, code: 'd' }))).toBe(true);
     });
 
-    it('reads a target reached by an absolute, relative or anchor $ref with the role the validator gives it', async () => {
+    it('keeps examples and a schema named id from changing what a $ref reaches', async () => {
       const valid = async (schema: JSONSchema7, value: unknown) => {
         const standardSchema = toStandardSchema(schema);
         if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
         return !('issues' in (await standardSchema['~standard'].validate(value)));
       };
-      // A name map read as a schema keeps the literal data under it as written.
-      for (const $ref of ['http://x.test/root#/definitions', 'root#/definitions']) {
-        const schema = {
-          $id: 'http://x.test/root',
-          type: 'object',
-          properties: { v: { $ref } },
-          required: ['v'],
-          definitions: { const: { type: 'string', nullable: true, format: 'email' } },
-        } as JSONSchema7;
-        expect(await valid(schema, { v: { type: 'string', nullable: true, format: 'email' } })).toBe(true);
-        expect(await valid(schema, { v: { type: ['string', 'null'], nullable: true } })).toBe(false);
-      }
-      // A component named like a keyword reached by an absolute URI excludes its bound.
-      const bounded = {
-        $id: 'http://x.test/root',
-        type: 'object',
-        properties: { n: { $ref: 'http://x.test/root#/components/schemas/properties' } },
-        components: { schemas: { properties: { type: 'number', minimum: 5, exclusiveMinimum: true } } },
-      } as JSONSchema7;
-      expect(await valid(bounded, { n: 6 })).toBe(true);
-      expect(await valid(bounded, { n: 5 })).toBe(false);
-      // An anchor on literal data that holds a boolean bound is refused.
-      const anchored = {
-        type: 'object',
-        properties: { n: { $ref: '#lim' } },
-        examples: { a: { $anchor: 'lim', minimum: 5, exclusiveMinimum: true } },
-      } as JSONSchema7;
-      expect(await valid(anchored, { n: 6 })).toBe(false);
-    });
-
-    it('keeps $id, examples and a schema named id from changing what a $ref reaches', async () => {
-      const valid = async (schema: JSONSchema7, value: unknown) => {
-        const standardSchema = toStandardSchema(schema);
-        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-        return !('issues' in (await standardSchema['~standard'].validate(value)));
-      };
-      // A $id whose fragment is a JSON Pointer does not replace the schema at that location.
-      const pointerId = {
-        type: 'object',
-        properties: { a: { type: 'string' }, c: { $ref: '#/properties/a' } },
-        definitions: { z: { $id: '#/properties/a' } },
-      } as JSONSchema7;
-      expect(await valid(pointerId, { c: 's' })).toBe(true);
-      expect(await valid(pointerId, { c: 1 })).toBe(false);
       // Two OpenAPI examples with the same id are literal values, not schemas.
       const examples = {
         type: 'object',
@@ -677,13 +624,13 @@ describe('json-schema standard-schema adapter', () => {
       } as JSONSchema7;
       expect(await valid(boolId, {})).toBe(true);
       expect(await valid(boolId, { a: 1 })).toBe(false);
-      // A boolean, object or array id (or $id) in annotations is not a schema URI.
+      // A boolean, object or array id in annotations is not a schema URI.
       const annotationIds = {
         type: 'object',
         properties: {
           a: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '5f' } } },
-          b: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '60' }, $id: { k: 1 } } },
-          c: { type: 'string', example: { id: [], $id: { k: 1 } } },
+          b: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '60' } } },
+          c: { type: 'string', example: { id: [] } },
         },
       } as unknown as JSONSchema7;
       expect(await valid(annotationIds, { a: 'x' })).toBe(true);
@@ -702,17 +649,6 @@ describe('json-schema standard-schema adapter', () => {
       } as unknown as JSONSchema7;
       expect(await valid(idComponent, { u: { n: 'x' } })).toBe(true);
       expect(await valid(idComponent, { u: { n: 1 } })).toBe(false);
-    });
-
-    it('validates a schema with 40 nested $id resources', { timeout: 60_000 }, async () => {
-      // Walking each $id resource once per enclosing base would take 2^40 steps.
-      let schema: Record<string, unknown> = { type: 'string' };
-      for (let i = 0; i < 40; i++) {
-        schema = { $id: `http://e.x/l${i}`, type: 'object', properties: { a: schema } };
-      }
-      const standardSchema = toStandardSchema(schema as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-      expect('issues' in (await standardSchema['~standard'].validate({}))).toBe(false);
     });
 
     it('leaves literal data alone when an annotation $ref points into it', async () => {
@@ -776,6 +712,25 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ sample: 5 }))).toBe(true);
     });
 
+    it('keeps a property named $id or $ref, and resolves # and #/... references', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          $id: { type: 'string' },
+          $ref: { type: 'integer' },
+          self: { $ref: '#' },
+          id: { $ref: '#/properties/$id' },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      const valid = { $id: 'a', $ref: 1, self: { $ref: 2 }, id: 'b' };
+      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
+      expect('issues' in (await standardSchema['~standard'].validate({ $id: 1 }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ self: { $ref: 'x' } }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ id: 1 }))).toBe(true);
+    });
+
     const dynamicNode = {
       $dynamicAnchor: 'node',
       type: 'object',
@@ -784,55 +739,87 @@ describe('json-schema standard-schema adapter', () => {
         children: { type: 'array', items: { $dynamicRef: '#node' } },
       },
     };
+    const draft2020 = 'https://json-schema.org/draft/2020-12/schema';
     it.each([
-      ['in a keyword position', { $schema: 'https://json-schema.org/draft/2020-12/schema', ...dynamicNode }],
       [
-        'reached only through a $ref pointer',
+        '$dynamicAnchor in a keyword position',
+        { $schema: draft2020, ...dynamicNode },
+        '$dynamicAnchor at "/$dynamicAnchor"',
+      ],
+      [
+        '$dynamicRef reached only through a $ref pointer',
         {
-          $schema: 'https://json-schema.org/draft/2020-12/schema',
+          $schema: draft2020,
           $ref: '#/components/schemas/Node',
-          components: { schemas: { Node: dynamicNode } },
+          components: { schemas: { Node: dynamicNode.properties } },
         },
+        '$dynamicRef at "/components/schemas/Node/children/items/$dynamicRef"',
       ],
       [
-        'under a dependencies entry named like a keyword',
-        {
-          $schema: 'https://json-schema.org/draft/2020-12/schema',
-          dependencies: { type: { properties: { children: dynamicNode.properties.children } } },
-        },
+        '$dynamicRef under a dependencies entry named like a keyword',
+        { $schema: draft2020, dependencies: { type: { properties: { children: dynamicNode.properties.children } } } },
+        '$dynamicRef at "/dependencies/type/properties/children/items/$dynamicRef"',
       ],
       [
-        'reached through a $ref to a member named like a name-map keyword',
-        {
-          $schema: 'https://json-schema.org/draft/2020-12/schema',
-          ...dynamicNode,
-          properties: {
-            ...dynamicNode.properties,
-            children: { type: 'array', items: { $ref: '#/components/schemas/dependencies' } },
-          },
-          components: { schemas: { dependencies: { $dynamicRef: '#node' } } },
-        },
+        '$dynamicRef in a property named like a data keyword',
+        { $schema: draft2020, properties: { default: dynamicNode.properties.children.items } },
+        '$dynamicRef at "/properties/default/$dynamicRef"',
+      ],
+      ['$id at the root', { $id: 'http://x.test/root', type: 'object' }, '$id at "/$id"'],
+      [
+        '$id with a JSON Pointer fragment',
+        { type: 'object', definitions: { z: { $id: '#/properties/a' } } },
+        '$id at "/definitions/z/$id"',
+      ],
+      ['$anchor', { $defs: { lim: { $anchor: 'lim', minimum: 5 } } }, '$anchor at "/$defs/lim/$anchor"'],
+      ['$recursiveAnchor', { $recursiveAnchor: true, type: 'object' }, '$recursiveAnchor at "/$recursiveAnchor"'],
+      [
+        '$recursiveRef',
+        { type: 'object', properties: { child: { $recursiveRef: '#' } } },
+        '$recursiveRef at "/properties/child/$recursiveRef"',
       ],
       [
-        'in a property named like a data keyword',
-        {
-          $schema: 'https://json-schema.org/draft/2020-12/schema',
-          properties: { default: dynamicNode.properties.children.items },
-        },
+        'an absolute $ref',
+        { properties: { v: { $ref: 'http://x.test/root#/definitions' } } },
+        '$ref "http://x.test/root#/definitions" at "/properties/v/$ref"',
       ],
-    ])('refuses a schema with $dynamicRef %s instead of letting it pass unchecked', async (_case, schema) => {
+      [
+        'a relative $ref',
+        { properties: { v: { $ref: 'root#/definitions' } } },
+        '$ref "root#/definitions" at "/properties/v/$ref"',
+      ],
+      [
+        'an anchor $ref',
+        { properties: { n: { $ref: '#lim' } }, examples: { a: { minimum: 5 } } },
+        '$ref "#lim" at "/properties/n/$ref"',
+      ],
+      ['a string $id under properties', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
+      ['$id inside const', { const: { $id: 'k' } }, '$id at "/const/$id"'],
+      ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, '$anchor at "/enum/1/$anchor"'],
+      [
+        'a non-local $ref inside examples',
+        { examples: [{ $ref: 'http://x.test/a~b' }] },
+        '$ref "http://x.test/a~b" at "/examples/0/$ref"',
+      ],
+      [
+        '$recursiveRef inside default, under a key with / and ~',
+        { properties: { 'a/b~': { default: { $recursiveRef: '#' } } } },
+        '$recursiveRef at "/properties/a~1b~0/default/$recursiveRef"',
+      ],
+      ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
+    ])('refuses a schema with %s instead of resolving it', async (_case, schema, refused) => {
       const standardSchema = toStandardSchema(schema as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
-      const result = await standardSchema['~standard'].validate({ value: 'root', children: [{ value: 123 }] });
-
-      expect(result).toEqual({
-        issues: [
-          {
-            message:
-              'Schema validation error: $dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely',
-          },
-        ],
-      });
+      for (const value of [{ value: 'root', children: [{ value: 123 }] }, 'x']) {
+        expect(await standardSchema['~standard'].validate(value)).toEqual({
+          issues: [
+            {
+              message: `Schema validation error: ${refused} is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+            },
+          ],
+        });
+      }
     });
   });
 

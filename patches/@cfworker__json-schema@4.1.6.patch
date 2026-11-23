@@ -1,5 +1,5 @@
 diff --git a/dist/commonjs/dereference.js b/dist/commonjs/dereference.js
-index 1614c8339a4a376e682f09115218c09f9c5ef4f7..8e0bdd0b2fbdac3461b5d8343dc38a2b1da13aeb 100644
+index 1614c8339a4a376e682f09115218c09f9c5ef4f7..45588773b533a9d7d410469ad9ae2e8d3fe20c01 100644
 --- a/dist/commonjs/dereference.js
 +++ b/dist/commonjs/dereference.js
 @@ -57,7 +57,10 @@ exports.schemaMapKeyword = {
@@ -25,63 +25,20 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..8e0bdd0b2fbdac3461b5d8343dc38a2b
      enum: true,
      const: true,
      required: true,
-@@ -96,11 +103,22 @@ exports.initialBaseURI = typeof self !== 'undefined' &&
+@@ -96,7 +103,12 @@ exports.initialBaseURI = typeof self !== 'undefined' &&
      : new URL('https://github.com/cfworker');
  function dereference(schema, lookup = Object.create(null), baseURI = exports.initialBaseURI, basePointer = '') {
      if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
 -        const id = schema.$id || schema['id'];
-+        // mbenhamd/mastra#631 (PF-9666): only a string `$id` names a schema.
-+        // The draft-04 `id` is ignored, as the adapter validates in 2020-12
-+        // mode; read as a URI, a boolean, object or array `id` (or `$id`)
-+        // in an annotation such as `example` collided with another and
-+        // refused every value with a duplicate schema URI.
++        // mbenhamd/mastra#631 (PF-9666): the draft-04 `id` is ignored, as
++        // the adapter validates in 2020-12 mode; read as a URI, a boolean,
++        // object or array `id` in an annotation such as `example` collided
++        // with another and refused every value with a duplicate schema URI.
++        // The adapter refuses a schema using `$id`; only a string is read.
 +        const id = typeof schema.$id === 'string' ? schema.$id : undefined;
          if (id) {
              const url = resolveURI(id, baseURI);
              if (url.hash.length > 1) {
--                lookup[url.href] = schema;
-+                // mbenhamd/mastra#631 (PF-9666): a fragment that is a JSON
-+                // Pointer names a location, not this schema. Registered, it
-+                // replaced the schema a `#/...` reference to that location
-+                // reaches, so values passed that the real target refuses.
-+                if (url.hash[1] !== '/') {
-+                    lookup[url.href] = schema;
-+                }
-             }
-             else {
-                 url.hash = '';
-@@ -108,7 +126,19 @@ function dereference(schema, lookup = Object.create(null), baseURI = exports.ini
-                     baseURI = url;
-                 }
-                 else {
-+                    // mbenhamd/mastra#631 (PF-9666): a schema with its own `$id`
-+                    // is walked once, under that `$id`, and registered under the
-+                    // outer pointer only by itself. Walking its subschemas again
-+                    // under the outer base doubled the work at every nested
-+                    // `$id`. A pointer from the outer document into it still
-+                    // resolves through the pointer fallback in validate.js.
-                     dereference(schema, lookup, baseURI);
-+                    const outerURI = baseURI.href + '#' + basePointer;
-+                    if (lookup[outerURI] !== undefined && lookup[outerURI] !== schema) {
-+                        throw new Error(`Duplicate schema URI "${outerURI}".`);
-+                    }
-+                    lookup[outerURI] = schema;
-+                    return lookup;
-                 }
-             }
-         }
-@@ -144,7 +174,10 @@ function dereference(schema, lookup = Object.create(null), baseURI = exports.ini
-             value: url.href
-         });
-     }
--    if (schema.$anchor) {
-+    // mbenhamd/mastra#631 (PF-9666): an anchor starting with "/" is not a valid
-+    // anchor name; registered, it would replace the schema a `#/...` reference
-+    // to that JSON Pointer reaches, as a pointer-shaped `$id` fragment would.
-+    if (schema.$anchor && !String(schema.$anchor).startsWith('/')) {
-         const url = resolveURI('#' + schema.$anchor, baseURI);
-         lookup[url.href] = schema;
-     }
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
 index 1abb284311bf653d9a9d67c52d79c99a7db29c68..6099ce16955d318eca905b310c67e9c37d1954bc 100644
 --- a/dist/commonjs/validate.js
@@ -745,7 +702,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..6099ce16955d318eca905b310c67e9c3
      }
      return { valid: errors.length === 0, errors };
 diff --git a/dist/esm/dereference.js b/dist/esm/dereference.js
-index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..21334e487114ba35a4791efd17ea21db3d289dc5 100644
+index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..4e080f68c734c7c9bea13dcc9395cc71ceab7196 100644
 --- a/dist/esm/dereference.js
 +++ b/dist/esm/dereference.js
 @@ -53,7 +53,10 @@ export const schemaMapKeyword = {
@@ -771,63 +728,20 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..21334e487114ba35a4791efd17ea21db
      enum: true,
      const: true,
      required: true,
-@@ -92,11 +99,22 @@ export let initialBaseURI = typeof self !== 'undefined' &&
+@@ -92,7 +99,12 @@ export let initialBaseURI = typeof self !== 'undefined' &&
      : new URL('https://github.com/cfworker');
  export function dereference(schema, lookup = Object.create(null), baseURI = initialBaseURI, basePointer = '') {
      if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
 -        const id = schema.$id || schema['id'];
-+        // mbenhamd/mastra#631 (PF-9666): only a string `$id` names a schema.
-+        // The draft-04 `id` is ignored, as the adapter validates in 2020-12
-+        // mode; read as a URI, a boolean, object or array `id` (or `$id`)
-+        // in an annotation such as `example` collided with another and
-+        // refused every value with a duplicate schema URI.
++        // mbenhamd/mastra#631 (PF-9666): the draft-04 `id` is ignored, as
++        // the adapter validates in 2020-12 mode; read as a URI, a boolean,
++        // object or array `id` in an annotation such as `example` collided
++        // with another and refused every value with a duplicate schema URI.
++        // The adapter refuses a schema using `$id`; only a string is read.
 +        const id = typeof schema.$id === 'string' ? schema.$id : undefined;
          if (id) {
              const url = resolveURI(id, baseURI);
              if (url.hash.length > 1) {
--                lookup[url.href] = schema;
-+                // mbenhamd/mastra#631 (PF-9666): a fragment that is a JSON
-+                // Pointer names a location, not this schema. Registered, it
-+                // replaced the schema a `#/...` reference to that location
-+                // reaches, so values passed that the real target refuses.
-+                if (url.hash[1] !== '/') {
-+                    lookup[url.href] = schema;
-+                }
-             }
-             else {
-                 url.hash = '';
-@@ -104,7 +122,19 @@ export function dereference(schema, lookup = Object.create(null), baseURI = init
-                     baseURI = url;
-                 }
-                 else {
-+                    // mbenhamd/mastra#631 (PF-9666): a schema with its own `$id`
-+                    // is walked once, under that `$id`, and registered under the
-+                    // outer pointer only by itself. Walking its subschemas again
-+                    // under the outer base doubled the work at every nested
-+                    // `$id`. A pointer from the outer document into it still
-+                    // resolves through the pointer fallback in validate.js.
-                     dereference(schema, lookup, baseURI);
-+                    const outerURI = baseURI.href + '#' + basePointer;
-+                    if (lookup[outerURI] !== undefined && lookup[outerURI] !== schema) {
-+                        throw new Error(`Duplicate schema URI "${outerURI}".`);
-+                    }
-+                    lookup[outerURI] = schema;
-+                    return lookup;
-                 }
-             }
-         }
-@@ -140,7 +170,10 @@ export function dereference(schema, lookup = Object.create(null), baseURI = init
-             value: url.href
-         });
-     }
--    if (schema.$anchor) {
-+    // mbenhamd/mastra#631 (PF-9666): an anchor starting with "/" is not a valid
-+    // anchor name; registered, it would replace the schema a `#/...` reference
-+    // to that JSON Pointer reaches, as a pointer-shaped `$id` fragment would.
-+    if (schema.$anchor && !String(schema.$anchor).startsWith('/')) {
-         const url = resolveURI('#' + schema.$anchor, baseURI);
-         lookup[url.href] = schema;
-     }
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
 index 78c71b00e321ff99db657484d299c1684a4ef07e..9524de3a65528af19a96beae95078b21e2ed6afb 100644
 --- a/dist/esm/validate.js

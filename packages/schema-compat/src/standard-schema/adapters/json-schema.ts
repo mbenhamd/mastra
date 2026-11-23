@@ -83,14 +83,6 @@ const SCHEMA_MAP_KEYWORDS = [
 /** Keywords whose value is literal data the validator compares or skips, never a schema. */
 const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum', 'examples']);
 
-/**
- * Thrown for a schema that uses `$dynamicRef`. `@cfworker/json-schema` does not
- * resolve it, so the reference would add no constraint and values Ajv2020
- * rejected would pass. Validation refuses such a schema instead.
- */
-const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
-  '$dynamicRef is not supported: this validator cannot resolve it, so the schema is refused rather than checked loosely';
-
 const SCHEMA_MAP_KEYWORD_SET = new Set<string>(SCHEMA_MAP_KEYWORDS);
 
 /** Keywords whose value is one subschema. */
@@ -112,37 +104,77 @@ const SUBSCHEMA_KEYWORDS = new Set<string>([
 const SUBSCHEMA_ARRAY_KEYWORDS = new Set<string>(['allOf', 'anyOf', 'items', 'oneOf', 'prefixItems']);
 
 /**
- * Refuses a schema in which any object at any depth has a `$dynamicRef` key.
- * The validator can reach a subschema through a keyword, through a `$ref`
- * pointer to any path (for example `#/components/schemas/Node`), and through
- * `dependencies`, so the walk covers every object rather than mirroring one of
- * those routes. The one exception is the object under a name-map keyword
- * (`properties`, `$defs`, ...): its keys are names, so a property named
- * `$dynamicRef` with a schema value is not refused (a string value is), while
- * every value under it is still walked.
- * Data under `const` or `enum` that contains a `$dynamicRef` key is refused
- * too; failing closed there is preferred to telling data from schemas.
+ * Keywords that name or reach a schema by URI or anchor. `@cfworker/json-schema` resolves only
+ * some of them as Ajv did (`$dynamicRef` not at all), and the code that resolved the rest kept
+ * producing schemas that were checked against the wrong target. Real tool schemas do not use
+ * them, so a schema that does is refused.
  */
-function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<object>()): void {
+const UNSUPPORTED_KEYWORDS = new Set<string>([
+  '$anchor',
+  '$dynamicAnchor',
+  '$dynamicRef',
+  '$id',
+  '$recursiveAnchor',
+  '$recursiveRef',
+]);
+
+/** A `$ref` the adapter resolves: the whole schema (`#`) or a JSON Pointer into it (`#/...`). */
+function isLocalPointerRef(ref: string): boolean {
+  return ref === '#' || ref.startsWith('#/');
+}
+
+function pointerToken(key: string): string {
+  return key.replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+/**
+ * Refuses a schema that uses `$id`, `$anchor`, `$dynamicAnchor`, `$dynamicRef`,
+ * `$recursiveAnchor` or `$recursiveRef`, or a `$ref` other than `#` or `#/...`.
+ * The error names the keyword and its JSON Pointer in the schema.
+ *
+ * The scan covers every object at any depth, including literal data under
+ * `const`, `enum`, `default` or `examples` and annotations such as `example`:
+ * a `$ref` pointer can make the validator read any of them as a schema, and
+ * failing closed there is preferred to telling data from schemas. The one
+ * exception is a name map (`properties`, `$defs`, ...): its keys are names, so a
+ * property named `$id` or `$ref` whose value is an object (its schema) is kept,
+ * while a string value there is refused, because a `$ref` to the map would make
+ * the validator read it as that keyword.
+ */
+function refuseUnsupportedKeywords(node: unknown, pointer = '', isNameMap = false, seen = new Set<object>()): void {
   if (typeof node !== 'object' || node === null || seen.has(node)) {
     return;
   }
   seen.add(node);
   if (Array.isArray(node)) {
-    node.forEach(item => refuseDynamicRef(item, false, seen));
+    node.forEach((item, index) => refuseUnsupportedKeywords(item, `${pointer}/${index}`, false, seen));
     return;
   }
-  // On a name map a property named `$dynamicRef` holds a schema object; a string
-  // there is never a name-map entry, and a `$ref` can still make the validator
-  // read that object as a schema, so it is refused too.
-  if (
-    Object.hasOwn(node, '$dynamicRef') &&
-    (!isNameMap || typeof (node as Record<string, unknown>).$dynamicRef === 'string')
-  ) {
-    throw new Error(UNSUPPORTED_DYNAMIC_REF_MESSAGE);
+  const record = node as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const value = record[key];
+    if (isNameMap && typeof value !== 'string') {
+      continue;
+    }
+    const at = `${pointer}/${pointerToken(key)}`;
+    if (UNSUPPORTED_KEYWORDS.has(key)) {
+      throw new Error(
+        `${key} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+      );
+    }
+    if (key === '$ref' && typeof value === 'string' && !isLocalPointerRef(value)) {
+      throw new Error(
+        `$ref "${value}" at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+      );
+    }
   }
-  for (const [key, value] of Object.entries(node)) {
-    refuseDynamicRef(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key), seen);
+  for (const [key, value] of Object.entries(record)) {
+    refuseUnsupportedKeywords(
+      value,
+      `${pointer}/${pointerToken(key)}`,
+      !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key),
+      seen,
+    );
   }
 }
 
@@ -195,8 +227,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * What an object is to the validator. `schema`, `names` (a name map's own keys) and `data`
  * (literal data under `const`, `enum`, `default` or `examples`) come from reading the schema
- * from its root and from every `$ref` and `$recursiveRef` at a schema position, resolved as the
- * validator resolves them: against `$id` bases and `$anchor`s, then by JSON Pointer. The `weak`
+ * from its root and from every `$ref` at a schema position, resolved by JSON Pointer as the
+ * validator resolves them. The `weak`
  * roles cover objects that reading never reaches, such as an unused `components` or `x-meta`:
  * there an object is normalised as a schema unless it sits under a name-map or data keyword.
  */
@@ -296,20 +328,15 @@ function resolveByPointer(lookup: Lookup, uri: string): unknown {
 }
 
 /**
- * What the `$ref` and `$recursiveRef` on `node` resolve to, as the validator resolves them after
- * `dereference` recorded their absolute URIs on the object. A `$recursiveRef` can also land on
- * an outer `$recursiveAnchor` schema, which is read as a schema anyway.
+ * What the `$ref` on `node` resolves to, as the validator resolves it after `dereference`
+ * recorded its absolute URI on the object.
  */
 function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknown[] {
-  const targets: unknown[] = [];
-  if (typeof node.$ref === 'string') {
-    const uri = typeof node.__absolute_ref__ === 'string' ? node.__absolute_ref__ : node.$ref;
-    targets.push(lookup[uri] ?? resolveByPointer(lookup, uri));
+  if (typeof node.$ref !== 'string') {
+    return [];
   }
-  if (typeof node.__absolute_recursive_ref__ === 'string') {
-    targets.push(lookup[node.__absolute_recursive_ref__]);
-  }
-  return targets;
+  const uri = typeof node.__absolute_ref__ === 'string' ? node.__absolute_ref__ : node.$ref;
+  return [lookup[uri] ?? resolveByPointer(lookup, uri)];
 }
 
 /**
@@ -323,31 +350,12 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
  * such a schema is refused.
  */
 function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => Lookup): void {
-  // References are resolved on a copy, before normalisation changes the schema. The patched
-  // `dereference` reads only a string `$id`, which normalisation keeps, so the copy sees the
-  // bases the validator will see. Any other difference is caught by the check at the end.
-  const copy = structuredClone(root);
-  const copyLookup = dereference(copy);
-  const toCopy = new Map<unknown, unknown>();
-  const toRoot = new Map<unknown, unknown>();
-  const pairs: Array<[unknown, unknown]> = [[root, copy]];
-  while (pairs.length > 0) {
-    const [node, twin] = pairs.pop()!;
-    if (typeof node !== 'object' || node === null || toCopy.has(node)) {
-      continue;
-    }
-    toCopy.set(node, twin);
-    toRoot.set(twin, node);
-    for (const [key, value] of Object.entries(node)) {
-      pairs.push([value, (twin as Record<string, unknown>)[key]]);
-    }
-  }
+  // Every `$ref` is `#` or `#/...` (see `refuseUnsupportedKeywords`), so its target is predicted
+  // by walking the JSON Pointer from the root, before normalisation changes the schema.
   const predicted = new Map<object, unknown[]>();
   const targetsOf = (node: Record<string, unknown>): unknown[] => {
-    const twin = toCopy.get(node);
-    const targets = isPlainObject(twin)
-      ? referenceTargets(twin, copyLookup).map(target => (toRoot.has(target) ? toRoot.get(target) : target))
-      : [];
+    const targets =
+      typeof node.$ref === 'string' ? [node.$ref === '#' ? root : resolveByPointer({ '': root }, node.$ref)] : [];
     predicted.set(node, targets);
     return targets;
   };
@@ -370,8 +378,8 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
     normalizeSchemaObject(record);
   }
   // The validator resolves references on the normalised schema. A reference that lands
-  // anywhere else than where the roles were read from, for example because a dropped `id`
-  // held a base URI, is refused rather than read with the wrong roles.
+  // anywhere else than where the roles were read from, for example on a key that
+  // normalisation removed, is refused rather than read with the wrong roles.
   const lookup = dereference(root);
   for (const [node, targets] of predicted) {
     const actual = referenceTargets(node as Record<string, unknown>, lookup);
@@ -632,9 +640,8 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
       if (!ValidatorClass || !dereferenceSchema) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
-      // Checked on the original, before the copy is normalised, so a `$dynamicRef`
-      // anywhere in it is refused.
-      refuseDynamicRef(this.#schema);
+      // Checked on the original, before the copy is normalised.
+      refuseUnsupportedKeywords(this.#schema);
       const validationSchema = toValidationSchema(this.#schema, dereferenceSchema);
       this.#validator = new ValidatorClass(validationSchema, '2020-12', false);
     }
