@@ -540,6 +540,26 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ other: 5 }))).toBe(true);
     });
 
+    it('ignores format behind an absolute $ref, and accepts a schema holding a large literal array', async () => {
+      const standardSchema = toStandardSchema({
+        $id: 'https://example.com/tool',
+        type: 'object',
+        properties: {
+          site: { $ref: 'https://example.com/tool#/components/schemas/properties' },
+          code: { enum: Array.from({ length: 200_000 }, (_, i) => `c${i}`) },
+        },
+        components: { schemas: { properties: { type: 'string', format: 'url' } } },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      // cfworker's url pattern backtracks exponentially on this string.
+      const site = 'http://' + 'a'.repeat(40) + '!';
+      expect(await standardSchema['~standard'].validate({ site, code: 'c199999' })).toEqual({
+        value: { site, code: 'c199999' },
+      });
+      expect('issues' in (await standardSchema['~standard'].validate({ site, code: 'd' }))).toBe(true);
+    });
+
     it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
