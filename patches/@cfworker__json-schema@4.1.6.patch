@@ -1,8 +1,67 @@
+diff --git a/dist/commonjs/dereference.js b/dist/commonjs/dereference.js
+index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c17195383e1fb7ca 100644
+--- a/dist/commonjs/dereference.js
++++ b/dist/commonjs/dereference.js
+@@ -57,7 +57,10 @@ exports.schemaMapKeyword = {
+     definitions: true,
+     properties: true,
+     patternProperties: true,
+-    dependentSchemas: true
++    dependentSchemas: true,
++    // mbenhamd/mastra#631 (PF-9666): draft-07 dependencies holds schemas by
++    // property name; arrays there are skipped by dereference.
++    dependencies: true
+ };
+ exports.ignoredKeyword = {
+     id: true,
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
-index 1abb284311bf653d9a9d67c52d79c99a7db29c68..c06b3b0fac1b32c5d3d50b841006e0443d32a35d 100644
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..7b6fdba199ad357d3b1eb2fe74a278187130bb37 100644
 --- a/dist/commonjs/validate.js
 +++ b/dist/commonjs/validate.js
-@@ -36,6 +36,106 @@ function isMultipleOf(instance, divisor) {
+@@ -9,6 +9,42 @@ const ucs2_length_js_1 = require("./ucs2-length.js");
+ function hasOwnProperty(instance, key) {
+     return Object.prototype.hasOwnProperty.call(instance, key);
+ }
++// mbenhamd/mastra#631 (PF-9666): an own property whose value is undefined counts
++// as absent for required, dependentRequired, dependentSchemas, dependencies and
++// properties, and as present for additionalProperties, patternProperties,
++// unevaluatedProperties, propertyNames and the property counts, as with Ajv.
++function isPresent(instance, key) {
++    return hasOwnProperty(instance, key) && instance[key] !== undefined;
++}
++// mbenhamd/mastra#631 (PF-9666): whether any schema object reachable from the
++// lookup has an unevaluatedProperties or unevaluatedItems keyword. Only then
++// does anyOf need every valid branch for its annotations; otherwise it stops at
++// the first valid one, as Ajv did.
++const unevaluatedUse = new WeakMap();
++function usesUnevaluated(lookup) {
++    let uses = unevaluatedUse.get(lookup);
++    if (uses === undefined) {
++        uses = false;
++        const seen = new Set();
++        const stack = Object.values(lookup);
++        while (stack.length > 0 && !uses) {
++            const node = stack.pop();
++            if (typeof node !== 'object' || node === null || seen.has(node)) {
++                continue;
++            }
++            seen.add(node);
++            if (!Array.isArray(node) &&
++                (hasOwnProperty(node, 'unevaluatedProperties') || hasOwnProperty(node, 'unevaluatedItems'))) {
++                uses = true;
++            }
++            for (const value of Object.values(node)) {
++                stack.push(value);
++            }
++        }
++        unevaluatedUse.set(lookup, uses);
++    }
++    return uses;
++}
+ function decimalInteger(value) {
+     const coefficientAndExponent = Math.abs(value).toString().split('e');
+     const coefficient = coefficientAndExponent[0];
+@@ -36,6 +72,109 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -59,6 +118,9 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..c06b3b0fac1b32c5d3d50b841006e044
 +}
 +function findDuplicateItems(instance) {
 +    const length = instance.length;
++    if (length < 2) {
++        return null;
++    }
 +    const firstValueIndex = new Map();
 +    const firstObjectIndex = new Map();
 +    const unkeyed = [];
@@ -109,7 +171,195 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..c06b3b0fac1b32c5d3d50b841006e044
  function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_js_1.dereference)(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
      if (schema === true) {
          return { valid: true, errors: [] };
-@@ -698,26 +798,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -72,6 +211,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+                 instanceType = 'object';
+             }
+             break;
++        case 'undefined':
++            // mbenhamd/mastra#631 (PF-9666): an undefined value matches no type,
++            // as with Ajv.
++            instanceType = 'undefined';
++            break;
+         default:
+             throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
+     }
+@@ -202,7 +346,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+     }
+     if ($not !== undefined) {
+         const keywordLocation = `${schemaLocation}/not`;
+-        const result = validate(instance, $not, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation);
++        const result = validate(instance, $not, draft, lookup, true, recursiveAnchor, instanceLocation, keywordLocation);
+         if (result.valid) {
+             errors.push({
+                 instanceLocation,
+@@ -214,28 +358,40 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+     }
+     let subEvaluateds = [];
+     if ($anyOf !== undefined) {
++        // mbenhamd/mastra#631 (PF-9666): branches are checked with shortCircuit,
++        // which gives the same validity and, for a valid branch, the same
++        // annotations, and the keyword stops at the first valid branch unless an
++        // unevaluated keyword needs every branch's annotations, as with Ajv. A
++        // recursive anyOf took time exponential in the nesting depth. The full
++        // errors are collected only when no branch is valid.
+         const keywordLocation = `${schemaLocation}/anyOf`;
+-        const errorsLength = errors.length;
++        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
++        const needsAnnotations = usesUnevaluated(lookup);
+         let anyValid = false;
+         for (const [i, subSchema] of $anyOf.entries()) {
+             const subEvaluated = Object.create(evaluated);
+-            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+-            errors.push(...result.errors);
+-            anyValid = anyValid || result.valid;
++            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             if (result.valid) {
++                anyValid = true;
+                 subEvaluateds.push(subEvaluated);
++                if (!needsAnnotations) {
++                    break;
++                }
+             }
+         }
+-        if (anyValid) {
+-            errors.length = errorsLength;
+-        }
+-        else {
+-            errors.splice(errorsLength, 0, {
++        if (!anyValid) {
++            errors.push({
+                 instanceLocation,
+                 keyword: 'anyOf',
+                 keywordLocation,
+                 error: 'Instance does not match any subschemas.'
+             });
++            for (const [i, subSchema] of $anyOf.entries()) {
++                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                for (const error of result.errors) {
++                    errors.push(error);
++                }
++            }
+         }
+     }
+     if ($allOf !== undefined) {
+@@ -264,27 +420,31 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+         }
+     }
+     if ($oneOf !== undefined) {
++        // mbenhamd/mastra#631 (PF-9666): branches are checked with shortCircuit,
++        // as for anyOf; the full errors are collected only when the keyword fails.
+         const keywordLocation = `${schemaLocation}/oneOf`;
+-        const errorsLength = errors.length;
++        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
+         const matches = $oneOf.filter((subSchema, i) => {
+             const subEvaluated = Object.create(evaluated);
+-            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+-            errors.push(...result.errors);
++            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             if (result.valid) {
+                 subEvaluateds.push(subEvaluated);
+             }
+             return result.valid;
+         }).length;
+-        if (matches === 1) {
+-            errors.length = errorsLength;
+-        }
+-        else {
+-            errors.splice(errorsLength, 0, {
++        if (matches !== 1) {
++            errors.push({
+                 instanceLocation,
+                 keyword: 'oneOf',
+                 keywordLocation,
+                 error: `Instance does not match exactly one subschema (${matches} matches).`
+             });
++            for (const [i, subSchema] of $oneOf.entries()) {
++                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                for (const error of result.errors) {
++                    errors.push(error);
++                }
++            }
+         }
+     }
+     if (instanceType === 'object' || instanceType === 'array') {
+@@ -293,7 +453,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+     if ($if !== undefined) {
+         const keywordLocation = `${schemaLocation}/if`;
+         const ifEvaluated = Object.create(null);
+-        const conditionResult = validate(instance, $if, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, ifEvaluated).valid;
++        const conditionResult = validate(instance, $if, draft, lookup, true, recursiveAnchor, instanceLocation, keywordLocation, ifEvaluated).valid;
+         if (conditionResult) {
+             Object.assign(evaluated, ifEvaluated);
+             if ($then !== undefined) {
+@@ -323,7 +483,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+     if (instanceType === 'object') {
+         if ($required !== undefined) {
+             for (const key of $required) {
+-                if (!hasOwnProperty(instance, key)) {
++                if (!isPresent(instance, key)) {
+                     errors.push({
+                         instanceLocation,
+                         keyword: 'required',
+@@ -347,7 +507,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+                 instanceLocation,
+                 keyword: 'maxProperties',
+                 keywordLocation: `${schemaLocation}/maxProperties`,
+-                error: `Instance does not have at least ${$maxProperties} properties.`
++                error: `Instance has more than ${$maxProperties} properties.`
+             });
+         }
+         if ($propertyNames !== undefined) {
+@@ -368,10 +528,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+         if ($dependentRequired !== undefined) {
+             const keywordLocation = `${schemaLocation}/dependantRequired`;
+             for (const key in $dependentRequired) {
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const required = $dependentRequired[key];
+                     for (const dependantKey of required) {
+-                        if (!hasOwnProperty(instance, dependantKey)) {
++                        if (!isPresent(instance, dependantKey)) {
+                             errors.push({
+                                 instanceLocation,
+                                 keyword: 'dependentRequired',
+@@ -386,7 +546,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+         if ($dependentSchemas !== undefined) {
+             for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
+                 const keywordLocation = `${schemaLocation}/dependentSchemas`;
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`, evaluated);
+                     if (!result.valid) {
+                         errors.push({
+@@ -402,11 +562,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+         if ($dependencies !== undefined) {
+             const keywordLocation = `${schemaLocation}/dependencies`;
+             for (const key in $dependencies) {
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const propsOrSchema = $dependencies[key];
+                     if (Array.isArray(propsOrSchema)) {
+                         for (const dependantKey of propsOrSchema) {
+-                            if (!hasOwnProperty(instance, dependantKey)) {
++                            if (!isPresent(instance, dependantKey)) {
+                                 errors.push({
+                                     instanceLocation,
+                                     keyword: 'dependencies',
+@@ -438,6 +598,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+                 if (!hasOwnProperty(instance, key)) {
+                     continue;
+                 }
++                if (instance[key] === undefined) {
++                    // mbenhamd/mastra#631 (PF-9666): declared, so not an
++                    // additional property, and absent, so not checked.
++                    thisEvaluated[key] = true;
++                    evaluated[key] = true;
++                    continue;
++                }
+                 const subInstancePointer = `${instanceLocation}/${(0, pointer_js_1.encodePointer)(key)}`;
+                 const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`);
+                 thisEvaluated[key] = true;
+@@ -698,26 +865,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          if ($uniqueItems) {
@@ -144,11 +394,70 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..c06b3b0fac1b32c5d3d50b841006e044
              }
          }
      }
+diff --git a/dist/esm/dereference.js b/dist/esm/dereference.js
+index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa46322456 100644
+--- a/dist/esm/dereference.js
++++ b/dist/esm/dereference.js
+@@ -53,7 +53,10 @@ export const schemaMapKeyword = {
+     definitions: true,
+     properties: true,
+     patternProperties: true,
+-    dependentSchemas: true
++    dependentSchemas: true,
++    // mbenhamd/mastra#631 (PF-9666): draft-07 dependencies holds schemas by
++    // property name; arrays there are skipped by dereference.
++    dependencies: true
+ };
+ export const ignoredKeyword = {
+     id: true,
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
-index 78c71b00e321ff99db657484d299c1684a4ef07e..36306f36b00f6feedd3f86e7dbe757fe2982dca4 100644
+index 78c71b00e321ff99db657484d299c1684a4ef07e..657c3e4adc35006f913fd5801378a4915f87d916 100644
 --- a/dist/esm/validate.js
 +++ b/dist/esm/validate.js
-@@ -33,6 +33,106 @@ function isMultipleOf(instance, divisor) {
+@@ -6,6 +6,42 @@ import { ucs2length } from './ucs2-length.js';
+ function hasOwnProperty(instance, key) {
+     return Object.prototype.hasOwnProperty.call(instance, key);
+ }
++// mbenhamd/mastra#631 (PF-9666): an own property whose value is undefined counts
++// as absent for required, dependentRequired, dependentSchemas, dependencies and
++// properties, and as present for additionalProperties, patternProperties,
++// unevaluatedProperties, propertyNames and the property counts, as with Ajv.
++function isPresent(instance, key) {
++    return hasOwnProperty(instance, key) && instance[key] !== undefined;
++}
++// mbenhamd/mastra#631 (PF-9666): whether any schema object reachable from the
++// lookup has an unevaluatedProperties or unevaluatedItems keyword. Only then
++// does anyOf need every valid branch for its annotations; otherwise it stops at
++// the first valid one, as Ajv did.
++const unevaluatedUse = new WeakMap();
++function usesUnevaluated(lookup) {
++    let uses = unevaluatedUse.get(lookup);
++    if (uses === undefined) {
++        uses = false;
++        const seen = new Set();
++        const stack = Object.values(lookup);
++        while (stack.length > 0 && !uses) {
++            const node = stack.pop();
++            if (typeof node !== 'object' || node === null || seen.has(node)) {
++                continue;
++            }
++            seen.add(node);
++            if (!Array.isArray(node) &&
++                (hasOwnProperty(node, 'unevaluatedProperties') || hasOwnProperty(node, 'unevaluatedItems'))) {
++                uses = true;
++            }
++            for (const value of Object.values(node)) {
++                stack.push(value);
++            }
++        }
++        unevaluatedUse.set(lookup, uses);
++    }
++    return uses;
++}
+ function decimalInteger(value) {
+     const coefficientAndExponent = Math.abs(value).toString().split('e');
+     const coefficient = coefficientAndExponent[0];
+@@ -33,6 +69,109 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -205,6 +514,9 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..36306f36b00f6feedd3f86e7dbe757fe
 +}
 +function findDuplicateItems(instance) {
 +    const length = instance.length;
++    if (length < 2) {
++        return null;
++    }
 +    const firstValueIndex = new Map();
 +    const firstObjectIndex = new Map();
 +    const unkeyed = [];
@@ -255,7 +567,195 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..36306f36b00f6feedd3f86e7dbe757fe
  export function validate(instance, schema, draft = '2019-09', lookup = dereference(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
      if (schema === true) {
          return { valid: true, errors: [] };
-@@ -695,26 +795,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -69,6 +208,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+                 instanceType = 'object';
+             }
+             break;
++        case 'undefined':
++            // mbenhamd/mastra#631 (PF-9666): an undefined value matches no type,
++            // as with Ajv.
++            instanceType = 'undefined';
++            break;
+         default:
+             throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
+     }
+@@ -199,7 +343,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+     }
+     if ($not !== undefined) {
+         const keywordLocation = `${schemaLocation}/not`;
+-        const result = validate(instance, $not, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation);
++        const result = validate(instance, $not, draft, lookup, true, recursiveAnchor, instanceLocation, keywordLocation);
+         if (result.valid) {
+             errors.push({
+                 instanceLocation,
+@@ -211,28 +355,40 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+     }
+     let subEvaluateds = [];
+     if ($anyOf !== undefined) {
++        // mbenhamd/mastra#631 (PF-9666): branches are checked with shortCircuit,
++        // which gives the same validity and, for a valid branch, the same
++        // annotations, and the keyword stops at the first valid branch unless an
++        // unevaluated keyword needs every branch's annotations, as with Ajv. A
++        // recursive anyOf took time exponential in the nesting depth. The full
++        // errors are collected only when no branch is valid.
+         const keywordLocation = `${schemaLocation}/anyOf`;
+-        const errorsLength = errors.length;
++        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
++        const needsAnnotations = usesUnevaluated(lookup);
+         let anyValid = false;
+         for (const [i, subSchema] of $anyOf.entries()) {
+             const subEvaluated = Object.create(evaluated);
+-            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+-            errors.push(...result.errors);
+-            anyValid = anyValid || result.valid;
++            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             if (result.valid) {
++                anyValid = true;
+                 subEvaluateds.push(subEvaluated);
++                if (!needsAnnotations) {
++                    break;
++                }
+             }
+         }
+-        if (anyValid) {
+-            errors.length = errorsLength;
+-        }
+-        else {
+-            errors.splice(errorsLength, 0, {
++        if (!anyValid) {
++            errors.push({
+                 instanceLocation,
+                 keyword: 'anyOf',
+                 keywordLocation,
+                 error: 'Instance does not match any subschemas.'
+             });
++            for (const [i, subSchema] of $anyOf.entries()) {
++                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                for (const error of result.errors) {
++                    errors.push(error);
++                }
++            }
+         }
+     }
+     if ($allOf !== undefined) {
+@@ -261,27 +417,31 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+         }
+     }
+     if ($oneOf !== undefined) {
++        // mbenhamd/mastra#631 (PF-9666): branches are checked with shortCircuit,
++        // as for anyOf; the full errors are collected only when the keyword fails.
+         const keywordLocation = `${schemaLocation}/oneOf`;
+-        const errorsLength = errors.length;
++        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
+         const matches = $oneOf.filter((subSchema, i) => {
+             const subEvaluated = Object.create(evaluated);
+-            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+-            errors.push(...result.errors);
++            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             if (result.valid) {
+                 subEvaluateds.push(subEvaluated);
+             }
+             return result.valid;
+         }).length;
+-        if (matches === 1) {
+-            errors.length = errorsLength;
+-        }
+-        else {
+-            errors.splice(errorsLength, 0, {
++        if (matches !== 1) {
++            errors.push({
+                 instanceLocation,
+                 keyword: 'oneOf',
+                 keywordLocation,
+                 error: `Instance does not match exactly one subschema (${matches} matches).`
+             });
++            for (const [i, subSchema] of $oneOf.entries()) {
++                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                for (const error of result.errors) {
++                    errors.push(error);
++                }
++            }
+         }
+     }
+     if (instanceType === 'object' || instanceType === 'array') {
+@@ -290,7 +450,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+     if ($if !== undefined) {
+         const keywordLocation = `${schemaLocation}/if`;
+         const ifEvaluated = Object.create(null);
+-        const conditionResult = validate(instance, $if, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, ifEvaluated).valid;
++        const conditionResult = validate(instance, $if, draft, lookup, true, recursiveAnchor, instanceLocation, keywordLocation, ifEvaluated).valid;
+         if (conditionResult) {
+             Object.assign(evaluated, ifEvaluated);
+             if ($then !== undefined) {
+@@ -320,7 +480,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+     if (instanceType === 'object') {
+         if ($required !== undefined) {
+             for (const key of $required) {
+-                if (!hasOwnProperty(instance, key)) {
++                if (!isPresent(instance, key)) {
+                     errors.push({
+                         instanceLocation,
+                         keyword: 'required',
+@@ -344,7 +504,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+                 instanceLocation,
+                 keyword: 'maxProperties',
+                 keywordLocation: `${schemaLocation}/maxProperties`,
+-                error: `Instance does not have at least ${$maxProperties} properties.`
++                error: `Instance has more than ${$maxProperties} properties.`
+             });
+         }
+         if ($propertyNames !== undefined) {
+@@ -365,10 +525,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+         if ($dependentRequired !== undefined) {
+             const keywordLocation = `${schemaLocation}/dependantRequired`;
+             for (const key in $dependentRequired) {
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const required = $dependentRequired[key];
+                     for (const dependantKey of required) {
+-                        if (!hasOwnProperty(instance, dependantKey)) {
++                        if (!isPresent(instance, dependantKey)) {
+                             errors.push({
+                                 instanceLocation,
+                                 keyword: 'dependentRequired',
+@@ -383,7 +543,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+         if ($dependentSchemas !== undefined) {
+             for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
+                 const keywordLocation = `${schemaLocation}/dependentSchemas`;
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${encodePointer(key)}`, evaluated);
+                     if (!result.valid) {
+                         errors.push({
+@@ -399,11 +559,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+         if ($dependencies !== undefined) {
+             const keywordLocation = `${schemaLocation}/dependencies`;
+             for (const key in $dependencies) {
+-                if (hasOwnProperty(instance, key)) {
++                if (isPresent(instance, key)) {
+                     const propsOrSchema = $dependencies[key];
+                     if (Array.isArray(propsOrSchema)) {
+                         for (const dependantKey of propsOrSchema) {
+-                            if (!hasOwnProperty(instance, dependantKey)) {
++                            if (!isPresent(instance, dependantKey)) {
+                                 errors.push({
+                                     instanceLocation,
+                                     keyword: 'dependencies',
+@@ -435,6 +595,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+                 if (!hasOwnProperty(instance, key)) {
+                     continue;
+                 }
++                if (instance[key] === undefined) {
++                    // mbenhamd/mastra#631 (PF-9666): declared, so not an
++                    // additional property, and absent, so not checked.
++                    thisEvaluated[key] = true;
++                    evaluated[key] = true;
++                    continue;
++                }
+                 const subInstancePointer = `${instanceLocation}/${encodePointer(key)}`;
+                 const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${encodePointer(key)}`);
+                 thisEvaluated[key] = true;
+@@ -695,26 +862,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          if ($uniqueItems) {

@@ -235,6 +235,57 @@ describe('json-schema standard-schema adapter', () => {
       expect(await standardSchema['~standard'].validate(declared)).toEqual({ value: declared });
     });
 
+    it('takes the branch Ajv took for an undefined property, and keeps a null beside it', async () => {
+      // The key is absent for `required` in `if`, so the closed `else` applies.
+      const conditional = toStandardSchema({
+        if: { required: ['extra'] },
+        then: {},
+        else: { additionalProperties: false },
+      } as JSONSchema7);
+      // The second branch declares `x`, so `x: undefined` is absent there.
+      const union = toStandardSchema({
+        anyOf: [{ properties: { a: {} }, additionalProperties: false }, { properties: { x: { type: 'number' } } }],
+      } as JSONSchema7);
+      const nullable = toStandardSchema({
+        type: 'object',
+        properties: { site: { type: ['string', 'null'] }, note: { type: 'string' } },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await conditional['~standard'].validate({ extra: undefined })).toEqual({
+        issues: [
+          { message: 'Instance does not match "else" schema.', path: [] },
+          { message: 'Property "extra" does not match additional properties schema.', path: [] },
+        ],
+      });
+      expect(await conditional['~standard'].validate({ extra: 1 })).toEqual({ value: { extra: 1 } });
+      const unionValue = { a: 1, x: undefined };
+      expect(await union['~standard'].validate(unionValue)).toEqual({ value: unionValue });
+      const nullableValue = { site: null, note: undefined };
+      expect(await nullable['~standard'].validate(nullableValue)).toEqual({ value: nullableValue });
+    });
+
+    it('validates a recursive anyOf in time that does not double with each level', async () => {
+      const standardSchema = toStandardSchema({
+        $defs: {
+          node: {
+            anyOf: [
+              { type: 'object', properties: { kind: { const: 'a' }, child: { $ref: '#/$defs/node' } } },
+              { type: 'object', properties: { kind: { const: 'b' }, child: { $ref: '#/$defs/node' } } },
+            ],
+          },
+        },
+        $ref: '#/$defs/node',
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      // Checking every branch to the bottom took 2^depth steps: 24 s at depth 20.
+      let tree: Record<string, unknown> = { kind: 'a' };
+      for (let depth = 0; depth < 40; depth++) tree = { kind: 'a', child: tree };
+
+      expect(await standardSchema['~standard'].validate(tree)).toEqual({ value: tree });
+      expect('issues' in (await standardSchema['~standard'].validate({ kind: 'a', child: { kind: 'c' } }))).toBe(true);
+    });
+
     it('still rejects an own __proto__ key that the schema does not allow', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
@@ -242,15 +293,9 @@ describe('json-schema standard-schema adapter', () => {
         additionalProperties: false,
       });
 
-      // With an undefined property beside it, the value is copied before validation.
-      const withUndefined = JSON.parse('{"a":"x","__proto__":{}}');
-      withUndefined.b = undefined;
+      const result = await standardSchema['~standard'].validate(JSON.parse('{"a":"x","__proto__":{}}'));
 
-      const plain = await standardSchema['~standard'].validate(JSON.parse('{"a":"x","__proto__":{}}'));
-      const copied = await standardSchema['~standard'].validate(withUndefined);
-
-      expect('issues' in plain).toBe(true);
-      expect('issues' in copied).toBe(true);
+      expect('issues' in result).toBe(true);
     });
 
     it('should preserve recursive $ref schemas when converting output JSON Schema', () => {
@@ -376,14 +421,22 @@ describe('json-schema standard-schema adapter', () => {
     it('resolves a $ref in a draft-07 dependency named like a keyword, and keeps property dependencies', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
-        properties: { type: { type: 'string' }, detail: { type: 'string' }, a: {}, b: {} },
+        properties: {
+          type: { type: 'string' },
+          detail: { type: 'string' },
+          a: {},
+          b: {},
+          // A pointer into `dependencies` still resolves.
+          linked: { $ref: '#/dependencies/type' },
+        },
         dependencies: { type: { $ref: '#/definitions/Details' }, a: ['b'], example: ['b'] },
         definitions: { Details: { required: ['detail'] } },
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
-      const valid = { type: 'note', detail: 'text', a: 1, b: 2 };
+      const valid = { type: 'note', detail: 'text', a: 1, b: 2, linked: { detail: 'x' } };
       expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
+      expect('issues' in (await standardSchema['~standard'].validate({ linked: {} }))).toBe(true);
       expect(await standardSchema['~standard'].validate({ type: 'note' })).toEqual({
         issues: [{ message: 'Instance does not have required property "detail".', path: [] }],
       });
