@@ -91,6 +91,24 @@ const UNSUPPORTED_DYNAMIC_REF_MESSAGE =
 
 const SCHEMA_MAP_KEYWORD_SET = new Set<string>(SCHEMA_MAP_KEYWORDS);
 
+/** Keywords whose value is one subschema. */
+const SUBSCHEMA_KEYWORDS = new Set<string>([
+  'additionalItems',
+  'additionalProperties',
+  'contains',
+  'else',
+  'if',
+  'items',
+  'not',
+  'propertyNames',
+  'then',
+  'unevaluatedItems',
+  'unevaluatedProperties',
+]);
+
+/** Keywords whose value is an array of subschemas (`items` in draft-07 too). */
+const SUBSCHEMA_ARRAY_KEYWORDS = new Set<string>(['allOf', 'anyOf', 'items', 'oneOf', 'prefixItems']);
+
 /**
  * Refuses a schema in which any object at any depth has a `$dynamicRef` key.
  * The validator can reach a subschema through a keyword, through a `$ref`
@@ -149,7 +167,8 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
       if (record[exclusive] === true && typeof record[bound] === 'number') {
         record[exclusive] = record[bound];
         delete record[bound];
-      } else {
+      } else if (!isRefTarget) {
+        // On a `$ref` target that is a name map, a boolean is a property's schema.
         delete record[exclusive];
       }
     }
@@ -172,7 +191,8 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
  * Normalises the target of every local `$ref` (`#/...`) as a schema. The walk
  * leaves a name map's own keys alone, so a target named like a name-map
  * keyword, such as `#/components/schemas/properties`, was not normalised.
- * Literal data under `const`, `enum` and `default` is not searched for `$ref`.
+ * Literal data under `const`, `enum`, `default` and `examples` is not searched
+ * for `$ref`, and a pointer into a schema's literal data is not normalised.
  */
 function normalizeLocalRefTargets(root: unknown): void {
   const seen = new Set<object>();
@@ -195,8 +215,10 @@ function normalizeLocalRefTargets(root: unknown): void {
     const ref = isNameMap ? undefined : record.$ref;
     if (typeof ref === 'string' && ref.startsWith('#/')) {
       let target: unknown = root;
-      // Whether the previous token named a name map, so this one is a name, not a keyword.
-      let inNameMap = false;
+      // What the pointer has reached: a known schema position (from the root through schema
+      // keywords), a name map or applicator array under one, or an unknown container such as
+      // `components`, whose keys are names.
+      let position: 'schema' | 'names' | 'unknown' = 'schema';
       for (const token of ref.slice(2).split('/')) {
         let decoded: string;
         try {
@@ -206,17 +228,26 @@ function normalizeLocalRefTargets(root: unknown): void {
           break;
         }
         const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
-        // A pointer into literal data (`const`, `enum`, ...) names a value, not a schema:
-        // normalising it would change the value compared, such as dropping its `id`.
-        if (!inNameMap && DATA_KEYWORDS.has(name)) {
+        // A pointer into a schema's literal data (`const`, `enum`, ...) names a value, not a
+        // schema: normalising it would change the value compared, such as dropping its `id`.
+        if (position === 'schema' && DATA_KEYWORDS.has(name)) {
           target = undefined;
           break;
         }
-        inNameMap = !inNameMap && SCHEMA_MAP_KEYWORD_SET.has(name);
         target =
           typeof target === 'object' && target !== null && Object.hasOwn(target, name)
             ? (target as Record<string, unknown>)[name]
             : undefined;
+        if (position === 'names') {
+          position = 'schema';
+        } else if (position === 'schema') {
+          position =
+            SCHEMA_MAP_KEYWORD_SET.has(name) || (SUBSCHEMA_ARRAY_KEYWORDS.has(name) && Array.isArray(target))
+              ? 'names'
+              : SUBSCHEMA_KEYWORDS.has(name)
+                ? 'schema'
+                : 'unknown';
+        }
       }
       if (typeof target === 'object' && target !== null && !Array.isArray(target)) {
         normalizeSchemaObject(target as Record<string, unknown>, true);
@@ -227,8 +258,8 @@ function normalizeLocalRefTargets(root: unknown): void {
 }
 
 /**
- * Applies `nullable` and drops `format` and `id` on every
- * object the validator can read as a schema. A `$ref` can point at any path
+ * Applies `nullable`, rewrites boolean exclusive bounds, and drops `format` and
+ * `id` on every object the validator can read as a schema. A `$ref` can point at any path
  * (for example `#/components/schemas/User`), so the walk covers every object
  * rather than only subschemas under schema keywords. Values under data keywords (`const`, `enum`,
  * `default`, ...) are never entered. On a name map (`properties`, `$defs`, ...)

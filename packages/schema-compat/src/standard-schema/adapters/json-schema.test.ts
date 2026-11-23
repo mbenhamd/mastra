@@ -589,17 +589,20 @@ describe('json-schema standard-schema adapter', () => {
         type: 'object',
         properties: {
           tag: { const: { id: 'expected' }, 'x-meta': { $ref: '#/properties/tag/const' } },
-          // A property named like a data keyword is still a schema.
+          // A property, or a component, named like a data keyword is still a schema.
           default: { type: 'string', nullable: true },
           other: { $ref: '#/properties/default' },
+          qty: { $ref: '#/components/schemas/default' },
         },
+        components: { schemas: { default: { type: 'number', minimum: 5, exclusiveMinimum: true } } },
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
-      expect(await standardSchema['~standard'].validate({ tag: { id: 'expected' }, other: null })).toEqual({
-        value: { tag: { id: 'expected' }, other: null },
+      expect(await standardSchema['~standard'].validate({ tag: { id: 'expected' }, other: null, qty: 6 })).toEqual({
+        value: { tag: { id: 'expected' }, other: null, qty: 6 },
       });
       expect('issues' in (await standardSchema['~standard'].validate({ tag: {} }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ qty: 5 }))).toBe(true);
     });
 
     it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
