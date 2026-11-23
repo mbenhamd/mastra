@@ -1642,24 +1642,24 @@ pf9666_config() {
   PF9666_HEAD_REF="${PAPERSFLOW_PF9666_HEAD_REF:-fix/pf-9666-schema-compat-no-codegen}"
   PF9666_BASE_REF="${PAPERSFLOW_PF9666_BASE_REF:-main}"
   PF9666_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256:-1edadeb05c30dcfa2f97814bdd41d90518ae2a5f7867f04bc5f4f5899a920a66}"
+  # Head blobs of PR 631's patched-cfworker dependency graph (see
+  # verify_pf9666_patched_cfworker_graph). The schema-compat manifest pin above
+  # is shared by both PF-9666 paths.
+  PF9666_LOCKFILE_SHA256="${PAPERSFLOW_PF9666_LOCKFILE_SHA256:-5a9b587d7ec84048f16e62032ba8dde3349afb883857b87ce5ae160a962b167c}"
+  PF9666_WORKSPACE_SHA256="${PAPERSFLOW_PF9666_WORKSPACE_SHA256:-d12157a9ec78427d4f624713a33a636a7429f7586cd681ca70d90382e92fc545}"
+  PF9666_CFWORKER_PATCH_SHA256="${PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256:-589ef99fb1f202232af277a479b493e3d38fdcc5818dee2563db959dcc970059}"
+  PF9666_CLAUDE_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256:-e90382bf1195648c4dcb9e450b02ce59c40cb7c2d7868cc7a0d4a91bfff44492}"
+  PF9666_OPENAI_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256:-e02ccfb96bcb3fe17ebfd76899a0c9ac7cb976fe0389629d3a4a84527f03c097}"
 }
 
-verify_pf9666_cfworker_dependency() {
-  pf9666_config
-  if [[ "${PR_NUMBER:-}" != "$PF9666_PR_NUMBER" || "${HEAD_REPOSITORY:-}" != "$PF9666_HEAD_REPOSITORY" || \
-    "${HEAD_REF:-}" != "$PF9666_HEAD_REF" || "${BASE_REF:-}" != "$PF9666_BASE_REF" ]]; then
-    echo 'PF-9666 cfworker devDependency admission is bound to reviewed PR 631 metadata.' >&2
-    return 1
-  fi
-  if ! git_regular_file_at_revision "$2" packages/schema-compat/package.json || \
-    [[ "$(git_blob_sha256 "$2" packages/schema-compat/package.json)" != "$PF9666_PACKAGE_JSON_SHA256" ]]; then
-    echo 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' >&2
-    return 1
-  fi
-  if ! git_regular_file_at_revision "$2" pnpm-lock.yaml; then
-    echo 'PF-9666 pnpm-lock.yaml is not a regular file.' >&2
-    return 1
-  fi
+pf9666_metadata_matches() {
+  [[ "${PR_NUMBER:-}" == "$PF9666_PR_NUMBER" && "${HEAD_REPOSITORY:-}" == "$PF9666_HEAD_REPOSITORY" && \
+    "${HEAD_REF:-}" == "$PF9666_HEAD_REF" && "${BASE_REF:-}" == "$PF9666_BASE_REF" ]]
+}
+
+# The schema-compat manifest may differ from its base only by the reviewed
+# @cfworker/json-schema ^4.1.6 devDependency key.
+verify_pf9666_schema_compat_manifest_delta() {
   node - "$1" "$2" <<'NODE'
 const { execFileSync } = require('node:child_process');
 const { isDeepStrictEqual } = require('node:util');
@@ -1681,6 +1681,31 @@ expectedManifest.devDependencies = { ...expectedManifest.devDependencies, [depen
 if (!isDeepStrictEqual(JSON.parse(readAt(headSha, manifestPath)), expectedManifest)) {
   throw new Error('PF-9666 package.json may only add the reviewed @cfworker/json-schema devDependency.');
 }
+NODE
+}
+
+verify_pf9666_cfworker_dependency() {
+  pf9666_config
+  if ! pf9666_metadata_matches; then
+    echo 'PF-9666 cfworker devDependency admission is bound to reviewed PR 631 metadata.' >&2
+    return 1
+  fi
+  if ! git_regular_file_at_revision "$2" packages/schema-compat/package.json || \
+    [[ "$(git_blob_sha256 "$2" packages/schema-compat/package.json)" != "$PF9666_PACKAGE_JSON_SHA256" ]]; then
+    echo 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' >&2
+    return 1
+  fi
+  if ! git_regular_file_at_revision "$2" pnpm-lock.yaml; then
+    echo 'PF-9666 pnpm-lock.yaml is not a regular file.' >&2
+    return 1
+  fi
+  verify_pf9666_schema_compat_manifest_delta "$1" "$2" || return 1
+  node - "$1" "$2" <<'NODE'
+const { execFileSync } = require('node:child_process');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const readAt = (sha, path) =>
+  execFileSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 
 const baseLock = readAt(baseSha, 'pnpm-lock.yaml');
 if (baseLock.split('\n').some(line => line.startsWith("  '@cfworker/json-schema@4.1.6'"))) {
@@ -1733,6 +1758,128 @@ if (lines.join('\n') !== baseLock) {
 }
 NODE
 }
+
+# PF-9666 (patched cfworker graph) admits PR 631 after it grew past the
+# devDependency-only delta above. It admits exactly:
+#   - packages/schema-compat/package.json: the @cfworker/json-schema ^4.1.6
+#     devDependency key only (structural check above);
+#   - agent-sdks/claude/package.json and agent-sdks/openai/package.json: a
+#     workspace:* dependency on @mastra/schema-compat;
+#   - pnpm-workspace.yaml: one patchedDependencies line pointing
+#     @cfworker/json-schema@4.1.6 at patches/@cfworker__json-schema@4.1.6.patch;
+#   - that new patch file;
+#   - pnpm-lock.yaml: the resulting 4.1.6 package/snapshot blocks, importer
+#     entries, the patchedDependencies entry, peer-variant re-keys from 4.1.1 to
+#     4.1.6(patch_hash=...), and registry deprecation-text refreshes.
+# Admission binds to the exact sha256 of each of those six head blobs at PR
+# 631's final reviewed head, so the lockfile content is reviewed by hash, not
+# by a structural rule. Any later change to the patch, the lockfile, the
+# workspace file or any of those manifests invalidates admission and needs a
+# new owner-reviewed exception. No other dependency-graph path may change.
+verify_pf9666_patched_cfworker_graph() (
+  local base_sha="$1" head_sha="$2" manifest_changes="$3"
+  local expected_paths actual_paths path expected_hash actual_hash
+  local patch_path='patches/@cfworker__json-schema@4.1.6.patch'
+  pf9666_config
+  if ! pf9666_metadata_matches; then
+    echo 'PF-9666 patched cfworker graph admission is bound to reviewed PR 631 metadata.' >&2
+    return 1
+  fi
+
+  expected_paths="$(mktemp)"
+  actual_paths="$(mktemp)"
+  trap 'rm -f "$expected_paths" "$actual_paths"' EXIT
+
+  printf '%s\n' "$patch_path" pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
+  LC_ALL=C sort -u "$manifest_changes" > "$actual_paths"
+  if ! cmp -s "$expected_paths" "$actual_paths"; then
+    echo 'PF-9666 watched dependency-graph paths are outside the exact reviewed set:' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    return 1
+  fi
+
+  printf '%s\n' \
+    "$patch_path" \
+    agent-sdks/claude/package.json \
+    agent-sdks/openai/package.json \
+    packages/schema-compat/package.json \
+    pnpm-lock.yaml \
+    pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
+  if ! git diff --no-renames --name-only "$base_sha" "$head_sha" > "$actual_paths"; then
+    echo 'PF-9666 could not list the changed paths.' >&2
+    return 1
+  fi
+  grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
+    "$actual_paths" | LC_ALL=C sort -u > "$actual_paths.graph" || true
+  mv "$actual_paths.graph" "$actual_paths"
+  if ! cmp -s "$expected_paths" "$actual_paths"; then
+    echo 'PF-9666 changed dependency-graph files are outside the exact reviewed set:' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    return 1
+  fi
+
+  while IFS=$'\t' read -r path expected_hash; do
+    if ! git_regular_file_at_revision "$head_sha" "$path"; then
+      echo "PF-9666 reviewed dependency file is not a regular blob: $path" >&2
+      return 1
+    fi
+    actual_hash="$(git_blob_sha256 "$head_sha" "$path")"
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+      echo "PF-9666 reviewed dependency file hash changed: $path" >&2
+      echo "expected: $expected_hash" >&2
+      echo "actual:   $actual_hash" >&2
+      return 1
+    fi
+  done <<EOF
+packages/schema-compat/package.json	$PF9666_PACKAGE_JSON_SHA256
+agent-sdks/claude/package.json	$PF9666_CLAUDE_PACKAGE_JSON_SHA256
+agent-sdks/openai/package.json	$PF9666_OPENAI_PACKAGE_JSON_SHA256
+pnpm-workspace.yaml	$PF9666_WORKSPACE_SHA256
+pnpm-lock.yaml	$PF9666_LOCKFILE_SHA256
+$patch_path	$PF9666_CFWORKER_PATCH_SHA256
+EOF
+
+  # The lockfile's patch_hash and the workspace patch path must name the
+  # pinned patch blob, so the hashes above describe one coherent graph.
+  if ! node - "$head_sha" "$patch_path" "$PF9666_CFWORKER_PATCH_SHA256" <<'NODE'
+const { execFileSync } = require('node:child_process');
+
+const [headSha, patchPath, patchSha] = process.argv.slice(2);
+const readAt = path =>
+  execFileSync('git', ['show', `${headSha}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+const sectionLines = (text, name) => {
+  const lines = text.split('\n');
+  const starts = lines.flatMap((line, index) => (line === `${name}:` ? [index] : []));
+  if (starts.length !== 1) throw new Error(`PF-9666 expected one top-level ${name} section, found ${starts.length}.`);
+  const body = [];
+  for (let index = starts[0] + 1; index < lines.length && (lines[index] === '' || lines[index].startsWith(' ')); index += 1) {
+    body.push(lines[index]);
+  }
+  return body;
+};
+const key = "  '@cfworker/json-schema@4.1.6':";
+const exactlyOne = (body, expected, file) => {
+  const entries = body.filter(line => line.startsWith(key));
+  if (entries.length !== 1 || entries[0] !== expected) {
+    throw new Error(`PF-9666 ${file} patchedDependencies entry for @cfworker/json-schema@4.1.6 does not name the pinned patch.`);
+  }
+};
+
+exactlyOne(sectionLines(readAt('pnpm-workspace.yaml'), 'patchedDependencies'), `${key} ${patchPath}`, 'pnpm-workspace.yaml');
+const lock = readAt('pnpm-lock.yaml');
+exactlyOne(sectionLines(lock, 'patchedDependencies'), `${key} ${patchSha}`, 'pnpm-lock.yaml');
+// Covers snapshot keys, peer-variant references and the importer version line.
+const patchHashes = [...lock.matchAll(/\b4\.1\.6\(patch_hash=([^)]*)\)/g)].map(match => match[1]);
+if (patchHashes.length === 0 || patchHashes.some(hash => hash !== patchSha)) {
+  throw new Error('PF-9666 pnpm-lock.yaml patch_hash for @cfworker/json-schema@4.1.6 does not equal the pinned patch sha256.');
+}
+NODE
+  then
+    return 1
+  fi
+
+  verify_pf9666_schema_compat_manifest_delta "$base_sha" "$head_sha" || return 1
+)
 
 classify_install_lane() (
   : "${BASE_SHA:?BASE_SHA is required}"
@@ -1942,6 +2089,20 @@ classify_install_lane() (
   : "${HEAD_REPOSITORY:?HEAD_REPOSITORY is required for a dependency-graph exception}"
   : "${HEAD_REF:?HEAD_REF is required for a dependency-graph exception}"
   : "${BASE_REF:?BASE_REF is required for a dependency-graph exception}"
+
+  # PF-9666 patched cfworker graph: PR 631 only, bound to exact head blobs.
+  # Any mismatch fails closed here instead of falling through to other lanes.
+  pf9666_config
+  if pf9666_metadata_matches; then
+    if ! verify_pf9666_patched_cfworker_graph \
+      "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA" "$manifest_changes"; then
+      echo 'PF-9666 patched cfworker dependency graph is not the exact reviewed graph.' >&2
+      return 1
+    fi
+    echo 'PF-9666 exact patched cfworker dependency graph accepted from trusted base policy.'
+    emit_validation_lane standard
+    return
+  fi
 
   pf2009_config
   if [[ "$PR_NUMBER" == "$PF2009_PR_NUMBER" && \
@@ -2741,6 +2902,149 @@ run_pf558_admission_self_tests() (
   grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
 
   echo 'PF-558 upstream-sync admission fixtures passed.'
+)
+
+run_pf9666_patched_cfworker_admission_self_tests() (
+  local script_path test_root fixture_repo base_sha head_sha reviewed_head output
+  local patch_path='patches/@cfworker__json-schema@4.1.6.patch'
+  local patch_hash
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  test_root="$(mktemp -d)"
+  fixture_repo="$test_root/repo"
+  pf9666_fixture_cleanup() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+      echo 'PF-9666 patched cfworker admission fixture failed; captured classifier output follows:' >&2
+      find "$test_root" -maxdepth 1 -type f -name '*.log' -print -exec sed -n '1,240p' {} \; >&2 || true
+    fi
+    rm -rf -- "$test_root"
+    exit "$status"
+  }
+  trap pf9666_fixture_cleanup EXIT
+  mkdir -p "$fixture_repo/packages/schema-compat" "$fixture_repo/agent-sdks/claude" \
+    "$fixture_repo/agent-sdks/openai" "$fixture_repo/patches"
+
+  # Writes the fixture lockfile; $1 is the cfworker patch_hash (empty: base).
+  write_fixture_lockfile() {
+    {
+      printf '%s\n' "lockfileVersion: '9.0'" '' 'patchedDependencies:' \
+        '  body-parser@2.3.0: 0000000000000000000000000000000000000000000000000000000000000001'
+      [[ -z "$1" ]] || printf '%s\n' "  '@cfworker/json-schema@4.1.6': $1"
+      printf '%s\n' '' 'importers:' '' '  packages/schema-compat:' '    devDependencies:'
+      [[ -z "$1" ]] || printf '%s\n' "      '@cfworker/json-schema':" '        specifier: ^4.1.6' \
+        "        version: 4.1.6(patch_hash=$1)"
+      printf '%s\n' '      vitest:' '        specifier: ^4.1.0' '        version: 4.1.0' '' 'snapshots:' '' \
+        "  '@cfworker/json-schema@4.1.1': {}"
+      [[ -z "$1" ]] || printf '%s\n' '' "  '@cfworker/json-schema@4.1.6(patch_hash=$1)': {}"
+    } > "$fixture_repo/pnpm-lock.yaml"
+  }
+
+  git -C "$fixture_repo" init -q -b main
+  git -C "$fixture_repo" config user.email validator@example.invalid
+  git -C "$fixture_repo" config user.name 'PF-9666 admission fixture'
+  printf '{"name":"fixture"}\n' > "$fixture_repo/package.json"
+  printf '{"name":"@mastra/schema-compat","devDependencies":{"vitest":"^4.1.0"}}\n' \
+    > "$fixture_repo/packages/schema-compat/package.json"
+  printf '{"name":"@mastra/claude"}\n' > "$fixture_repo/agent-sdks/claude/package.json"
+  printf '{"name":"@mastra/openai"}\n' > "$fixture_repo/agent-sdks/openai/package.json"
+  printf 'body-parser patch\n' > "$fixture_repo/patches/body-parser@2.3.0.patch"
+  printf '%s\n' 'packages:' '  - packages/*' '' 'patchedDependencies:' \
+    '  body-parser@2.3.0: patches/body-parser@2.3.0.patch' > "$fixture_repo/pnpm-workspace.yaml"
+  write_fixture_lockfile ''
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m base
+  base_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+
+  printf 'reviewed cfworker patch\n' > "$fixture_repo/$patch_path"
+  patch_hash="$(sha256sum "$fixture_repo/$patch_path" | awk '{print $1}')"
+  printf '%s\n' "  '@cfworker/json-schema@4.1.6': $patch_path" >> "$fixture_repo/pnpm-workspace.yaml"
+  write_fixture_lockfile "$patch_hash"
+  printf '{"name":"@mastra/schema-compat","devDependencies":{"vitest":"^4.1.0","@cfworker/json-schema":"^4.1.6"}}\n' \
+    > "$fixture_repo/packages/schema-compat/package.json"
+  printf '{"name":"@mastra/claude","dependencies":{"@mastra/schema-compat":"workspace:*"}}\n' \
+    > "$fixture_repo/agent-sdks/claude/package.json"
+  printf '{"name":"@mastra/openai","dependencies":{"@mastra/schema-compat":"workspace:*"}}\n' \
+    > "$fixture_repo/agent-sdks/openai/package.json"
+  git -C "$fixture_repo" add .
+  git -C "$fixture_repo" commit -q -m reviewed
+  reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
+  head_sha="$reviewed_head"
+
+  fixture_pin() {
+    sha256sum "$fixture_repo/$1" | awk '{print $1}'
+  }
+  local -a pins=(
+    PAPERSFLOW_PF9666_PACKAGE_JSON_SHA256="$(fixture_pin packages/schema-compat/package.json)"
+    PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256="$(fixture_pin agent-sdks/claude/package.json)"
+    PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256="$(fixture_pin agent-sdks/openai/package.json)"
+    PAPERSFLOW_PF9666_WORKSPACE_SHA256="$(fixture_pin pnpm-workspace.yaml)"
+    PAPERSFLOW_PF9666_LOCKFILE_SHA256="$(fixture_pin pnpm-lock.yaml)"
+    PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256="$patch_hash"
+  )
+
+  run_fixture_admission() {
+    local fixture_output="$1"
+    shift
+    (
+      cd "$fixture_repo"
+      env \
+        GITHUB_OUTPUT= \
+        BASE_SHA="$base_sha" HEAD_SHA="$head_sha" PR_NUMBER=631 \
+        HEAD_REPOSITORY=mbenhamd/mastra HEAD_REF=fix/pf-9666-schema-compat-no-codegen BASE_REF=main \
+        "${pins[@]}" "$@" bash "$script_path" --classify-install
+    ) > "$fixture_output" 2>&1
+  }
+
+  output="$test_root/approved.log"
+  run_fixture_admission "$output"
+  grep -Fxq 'PF-9666 exact patched cfworker dependency graph accepted from trusted base policy.' "$output"
+  grep -Fxq 'lane=standard' "$output"
+
+  printf 'reviewed cfworker patch!\n' > "$fixture_repo/$patch_path"
+  git -C "$fixture_repo" commit -q -am 'tamper reviewed patch'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/tampered-patch.log"
+  if run_fixture_admission "$output"; then
+    echo 'Tampered PF-9666 patch unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq "PF-9666 reviewed dependency file hash changed: $patch_path" "$output"
+
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  printf 'unreviewed\n' > "$fixture_repo/patches/unreviewed.patch"
+  git -C "$fixture_repo" add patches/unreviewed.patch
+  git -C "$fixture_repo" commit -q -m 'add unreviewed patch'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/unreviewed-patch.log"
+  if run_fixture_admission "$output"; then
+    echo 'Unreviewed PF-9666 patch file unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 watched dependency-graph paths are outside the exact reviewed set' "$output"
+
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  head_sha="$reviewed_head"
+  output="$test_root/wrong-pr.log"
+  if run_fixture_admission "$output" PR_NUMBER=632; then
+    echo 'Wrong PR metadata unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'do not match a reviewed upstream-sync lane' "$output"
+
+  # Pin the tampered lockfile blob so only the patch_hash coherence check
+  # stands between it and admission.
+  write_fixture_lockfile "$(printf 'another patch\n' | sha256sum | awk '{print $1}')"
+  git -C "$fixture_repo" commit -q -am 'lockfile with another patch_hash'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/other-patch-hash.log"
+  if run_fixture_admission "$output" PAPERSFLOW_PF9666_LOCKFILE_SHA256="$(fixture_pin pnpm-lock.yaml)"; then
+    echo 'PF-9666 lockfile with another patch_hash unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 pnpm-lock.yaml patchedDependencies entry for @cfworker/json-schema@4.1.6 does not name the pinned patch.' "$output"
+
+  echo 'PF-9666 patched cfworker admission fixtures passed.'
 )
 
 run_pf2009_admission_self_tests() (
@@ -5021,6 +5325,10 @@ case "${1:-}" in
     run_pf558_admission_self_tests
     exit
     ;;
+  --self-test-pf9666-patched-cfworker)
+    run_pf9666_patched_cfworker_admission_self_tests
+    exit
+    ;;
   --self-test-pf2009-upstream-sync)
     run_pf2009_admission_self_tests
     exit
@@ -5103,6 +5411,7 @@ run_validator_self_tests() {
   # validator self-test as well as exposing it through its focused entrypoint.
   if [[ "${1:-}" != '--package-contracts-only' ]]; then
     run_pf3553_admission_self_tests
+    run_pf9666_patched_cfworker_admission_self_tests
   fi
 
   validator_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"

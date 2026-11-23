@@ -214,7 +214,14 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   the `@cfworker/json-schema@4.1.6` devDependency of `packages/schema-compat`
   from #631, whose manifest blob is pinned and whose lockfile must equal the
   merge base plus the importer entry, the package entry and the snapshot, each
-  in its own section. Supported package checks use
+  in its own section. A second PF-9666 install admission covers #631 after it
+  added `patches/@cfworker__json-schema@4.1.6.patch`: the changed
+  dependency-graph files must be exactly that patch, `pnpm-workspace.yaml`,
+  `pnpm-lock.yaml` and the `schema-compat`, `agent-sdks/claude` and
+  `agent-sdks/openai` manifests, each pinned to its sha256 at the reviewed head,
+  with the lockfile `patch_hash` and workspace patch path naming the pinned
+  patch; any later change to those files needs a new owner-reviewed exception.
+  Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation
   plus changed-test execution. Root `harnessv1/sections/**/*.md` specification
