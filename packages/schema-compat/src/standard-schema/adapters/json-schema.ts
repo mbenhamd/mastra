@@ -148,9 +148,8 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
  * Applies `nullable`, rewrites a boolean `exclusiveMinimum`/`exclusiveMaximum`,
  * and drops `format` and `id` on one schema object.
  */
-function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = false): void {
+function normalizeSchemaObject(record: Record<string, unknown>): void {
   const types: unknown[] = Array.isArray(record.type) ? record.type : [record.type];
-  // A `type` of strings: in a name map reached by `$ref`, `type` is a property's schema.
   if (record.nullable === true && record.type !== undefined && types.every(type => typeof type === 'string')) {
     if (!types.includes('null')) {
       record.type = [...types, 'null'];
@@ -167,16 +166,8 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
       if (record[exclusive] === true && typeof record[bound] === 'number') {
         record[exclusive] = record[bound];
         delete record[bound];
-      } else if (!isRefTarget) {
-        delete record[exclusive];
       } else {
-        // A target the first walk skipped may be a name map, where a boolean is a property's
-        // schema: dropping a `false` there would let the property pass, and keeping it as a
-        // bound compares values with `true` or `false` as if they were numbers. Neither is
-        // safe, so the schema is refused.
-        throw new Error(
-          `${exclusive}: ${String(record[exclusive])} without a numeric ${bound} on a $ref target is not supported, so the schema is refused`,
-        );
+        delete record[exclusive];
       }
     }
   }
@@ -187,147 +178,140 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
   // The validator reads `id` on every object it walks as a schema URI, so two
   // objects that are not schemas, such as two `example: { id: 1 }` or
   // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
-  // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected. On a
-  // `$ref` target that is a name map, `id` is a property's schema (an object or
-  // a boolean), so there only a string `id` is dropped.
-  if (!isRefTarget || typeof record.id === 'string') {
-    delete record.id;
-  }
+  // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected.
+  delete record.id;
 }
+
+const REF_ROLE_CONFLICT_MESSAGE =
+  'a $ref target that the schema also uses as a name map or as literal data holds a boolean exclusiveMinimum or exclusiveMaximum, which cannot be read both ways, so the schema is refused';
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**
- * Normalises the target of every local `$ref` (`#/...`), and every subschema
- * under it, as a schema. The first walk leaves a name map's own keys and
- * literal data alone, so a target named like a keyword, such as
- * `#/components/schemas/properties` or `#/components/schemas/default`, was
- * not normalised. A pointer into a schema's literal data (`const`, `enum`,
- * `default`, `examples`) is left alone, as is a pointer to a known name map
- * (`#/properties`), whose keys are names.
+ * What an object is to the validator. `schema`, `names` (a name map's own keys) and `data`
+ * (literal data under `const`, `enum`, `default` or `examples`) come from reading the schema
+ * from its root and from every local `$ref` (`#/...`) at a schema position. The `weak` roles
+ * cover the rest, such as `components` or `x-meta`, which the validator reads only through a
+ * reference this walk does not follow (an absolute URI, for example): there an object is
+ * normalised as a schema unless it sits under a name-map or data keyword.
  */
-function normalizeLocalRefTargets(root: unknown): void {
-  /**
-   * Follows a pointer. With the set of reference targets, it also tracks the position reached: a
-   * schema (the root, a subschema keyword, an entry of a name map or applicator array, or any
-   * reference target), a name map or applicator array, or an unknown container such as
-   * `components`, whose keys are names. `skip` is true for literal data and known name maps.
-   */
-  const resolve = (ref: string, targets?: Set<object>): { target: unknown; skip: boolean } => {
-    let target: unknown = root;
-    let position: 'schema' | 'names' | 'unknown' = 'schema';
-    for (const token of ref.slice(2).split('/')) {
-      let decoded: string;
-      try {
-        decoded = decodeURIComponent(token);
-      } catch {
-        return { target: undefined, skip: true };
-      }
-      const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
-      if (position === 'unknown' && isPlainObject(target) && targets?.has(target)) {
-        position = 'schema';
-      }
-      // A pointer into a schema's literal data names a value, not a schema: normalising it
-      // would change the value compared, such as dropping its `id`.
-      if (targets && position === 'schema' && DATA_KEYWORDS.has(name)) {
-        return { target: undefined, skip: true };
-      }
-      target =
-        isPlainObject(target) || Array.isArray(target)
-          ? Object.hasOwn(target, name)
-            ? (target as Record<string, unknown>)[name]
-            : undefined
-          : undefined;
-      if (position === 'names') {
-        position = 'schema';
-      } else if (position === 'schema') {
-        position =
-          SCHEMA_MAP_KEYWORD_SET.has(name) || (SUBSCHEMA_ARRAY_KEYWORDS.has(name) && Array.isArray(target))
-            ? 'names'
-            : SUBSCHEMA_KEYWORDS.has(name)
-              ? 'schema'
-              : 'unknown';
-      }
-    }
-    return { target, skip: position === 'names' };
-  };
+type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
-  const refs = new Set<string>();
-  const seen = new Set<object>();
-  const collect = (node: unknown, isNameMap = false): void => {
-    if (typeof node !== 'object' || node === null || seen.has(node)) {
+/** Returns the role of every object, reading the schema from its root and its local `$ref`s. */
+function assignRoles(root: unknown): Map<object, Set<Role>> {
+  const roles = new Map<object, Set<Role>>();
+  const pending: unknown[] = [];
+  const resolved = new Set<string>();
+  const mark = (node: object, role: Role): boolean => {
+    let set = roles.get(node);
+    if (!set) {
+      set = new Set();
+      roles.set(node, set);
+    }
+    if (set.has(role)) {
+      return false;
+    }
+    set.add(role);
+    return true;
+  };
+  const walk = (node: unknown, role: Role): void => {
+    if (typeof node !== 'object' || node === null) {
       return;
     }
-    seen.add(node);
     if (Array.isArray(node)) {
-      node.forEach(item => collect(item));
+      // Only an applicator's array holds schemas; any other array is data or unknown.
+      if (mark(node, role)) {
+        const itemRole = role === 'schema' ? 'schema' : role === 'data' || role === 'weak-data' ? role : 'weak';
+        node.forEach(item => walk(item, itemRole));
+      }
+      return;
+    }
+    if (!mark(node, role)) {
       return;
     }
     const record = node as Record<string, unknown>;
-    for (const [key, value] of Object.entries(record)) {
-      if (!isNameMap && DATA_KEYWORDS.has(key)) {
-        continue;
-      }
-      collect(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key));
+    if (role === 'data' || role === 'weak-data') {
+      Object.values(record).forEach(value => walk(value, role));
+      return;
     }
-    const ref = isNameMap ? undefined : record.$ref;
-    if (typeof ref === 'string' && ref.startsWith('#/')) {
-      refs.add(ref);
+    if (role === 'names' || role === 'weak-names') {
+      Object.values(record).forEach(value => walk(value, role === 'names' && isPlainObject(value) ? 'schema' : 'weak'));
+      return;
+    }
+    for (const [key, value] of Object.entries(record)) {
+      if (DATA_KEYWORDS.has(key)) {
+        walk(value, role === 'schema' ? 'data' : 'weak-data');
+      } else if (SCHEMA_MAP_KEYWORD_SET.has(key)) {
+        walk(value, role === 'schema' ? 'names' : 'weak-names');
+      } else if (
+        role === 'schema' &&
+        (SUBSCHEMA_KEYWORDS.has(key) || (SUBSCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)))
+      ) {
+        walk(value, 'schema');
+      } else {
+        walk(value, 'weak');
+      }
+    }
+    const ref = role === 'schema' ? record.$ref : undefined;
+    if (typeof ref === 'string' && ref.startsWith('#/') && !resolved.has(ref)) {
+      resolved.add(ref);
+      pending.push(resolvePointer(root, ref));
     }
   };
-  collect(root);
+  walk(root, 'schema');
+  // Each reference is resolved once, so the walk stays linear in the size of the schema.
+  while (pending.length > 0) {
+    walk(pending.pop(), 'schema');
+  }
+  return roles;
+}
 
-  // A target under a key the first walk skips, such as a component named `default`, can hold
-  // references of its own, so targets are searched until no new reference turns up.
-  const targets = new Set<object>();
-  let count = -1;
-  while (refs.size !== count) {
-    count = refs.size;
-    for (const ref of [...refs]) {
-      const { target, skip } = resolve(ref, targets);
-      if (!skip && isPlainObject(target) && !targets.has(target)) {
-        targets.add(target);
-        collect(target);
-      }
+/** Follows a local JSON Pointer (`#/a/b`); `undefined` when it does not resolve. */
+function resolvePointer(root: unknown, ref: string): unknown {
+  let target: unknown = root;
+  for (const token of ref.slice(2).split('/')) {
+    let name: string;
+    try {
+      name = decodeURIComponent(token).replace(/~1/g, '/').replace(/~0/g, '~');
+    } catch {
+      return undefined;
     }
-  }
-  for (const ref of refs) {
-    const { target, skip } = resolve(ref, targets);
-    if (!skip && isPlainObject(target)) {
-      normalizeSchemaObjects(target, false, new Set(), true);
+    if (typeof target !== 'object' || target === null || !Object.hasOwn(target, name)) {
+      return undefined;
     }
+    target = (target as Record<string, unknown>)[name];
   }
+  return target;
 }
 
 /**
- * Applies `nullable`, rewrites boolean exclusive bounds, and drops `format` and
- * `id` on every object the validator can read as a schema. A `$ref` can point at any path
- * (for example `#/components/schemas/User`), so the walk covers every object
- * rather than only subschemas under schema keywords. Values under data keywords (`const`, `enum`,
- * `default`, ...) are never entered. On a name map (`properties`, `$defs`, ...)
- * the keys are names, so the map itself is left alone and only its values are
- * walked as schemas.
+ * Applies `nullable`, rewrites boolean exclusive bounds, and drops `format` and `id` on every
+ * object the validator can read as a schema, leaving name maps and literal data alone. An
+ * object the schema reads both as a schema (through a `$ref`) and as a name map or literal
+ * data, such as the target of `{ $ref: '#/properties' }`, is left as written for the name map
+ * or the data. Left as written, `nullable`, `format` and `id` can only refuse more values, but
+ * a boolean `exclusiveMinimum` or `exclusiveMaximum` would be compared as the number 1 or 0
+ * and let values pass, so such a schema is refused.
  */
-function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set<object>(), isRefTarget = false): void {
-  if (typeof node !== 'object' || node === null || seen.has(node)) {
-    return;
-  }
-  seen.add(node);
-  if (Array.isArray(node)) {
-    node.forEach(item => normalizeSchemaObjects(item, false, seen));
-    return;
-  }
-  const record = node as Record<string, unknown>;
-  if (!isNameMap) {
-    normalizeSchemaObject(record, isRefTarget);
-  }
-  for (const [key, value] of Object.entries(record)) {
-    if (!isNameMap && DATA_KEYWORDS.has(key)) {
+function normalizeSchemaObjects(root: unknown): void {
+  for (const [node, set] of assignRoles(root)) {
+    if (Array.isArray(node)) {
       continue;
     }
-    normalizeSchemaObjects(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key), seen);
+    const record = node as Record<string, unknown>;
+    const strong = set.has('schema') || set.has('names') || set.has('data');
+    if (strong ? set.has('names') || set.has('data') : set.has('weak-names') || set.has('weak-data')) {
+      if (
+        set.has('schema') &&
+        (typeof record.exclusiveMinimum === 'boolean' || typeof record.exclusiveMaximum === 'boolean')
+      ) {
+        throw new Error(REF_ROLE_CONFLICT_MESSAGE);
+      }
+      continue;
+    }
+    normalizeSchemaObject(record);
   }
 }
 
@@ -339,18 +323,16 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
  *   patched validator does not check it either, also on a target this walk misses.
  * - A boolean `exclusiveMinimum`/`exclusiveMaximum` (OpenAPI 3.0, draft-04)
  *   takes the value of `minimum`/`maximum` when it is `true` beside a number,
- *   and is dropped otherwise. On a `$ref` target the first walk skipped, such
- *   a bound refuses the schema instead (see `normalizeSchemaObject`).
+ *   and is dropped otherwise.
  * - `id` is dropped: only draft-04 used it, Ajv ignored it, and the validator
  *   read it on objects that are not schemas.
- * Every object is visited except literal data and name maps, so a property
- * named `nullable` or `format` is left alone, and a `$ref` target is treated
- * like any other subschema.
+ * Name maps and literal data are left alone, so a property named `nullable`
+ * or `format` keeps its schema, and a `$ref` target is read like any other
+ * subschema (see `normalizeSchemaObjects`).
  */
 function toValidationSchema(schema: JSONSchema7): Schema {
   const copy = structuredClone(schema) as Schema;
   normalizeSchemaObjects(copy);
-  normalizeLocalRefTargets(copy);
   return copy;
 }
 

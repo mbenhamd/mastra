@@ -489,18 +489,29 @@ describe('json-schema standard-schema adapter', () => {
         ],
       });
 
-      // On a target named like a keyword, a bare boolean bound may be a property's schema, so
-      // the schema is refused rather than compared with `true` as 1.
-      const keywordNamed = toStandardSchema({
-        $ref: '#/components/schemas/properties',
-        components: { schemas: { properties: { exclusiveMinimum: true } } },
+      // A name map that a `$ref` also reads as a schema: there `exclusiveMaximum: true` is both a
+      // property's schema and a bound, so the schema is refused rather than compared with 1.
+      const mapAsSchema = toStandardSchema({
+        type: 'object',
+        properties: { exclusiveMaximum: true },
+        $defs: { bound: { $ref: '#/properties' } },
+        allOf: [{ $ref: '#/$defs/bound' }],
       } as unknown as JSONSchema7);
-      for (const value of [2, 'abc']) {
-        const result = await keywordNamed['~standard'].validate(value);
-        expect('issues' in result && result.issues?.[0]?.message).toContain(
-          'exclusiveMinimum: true without a numeric minimum',
-        );
+      for (const value of [0, {}]) {
+        const result = await mapAsSchema['~standard'].validate(value);
+        expect('issues' in result && result.issues?.[0]?.message).toContain('a $ref target that the schema also uses');
       }
+    });
+
+    it('keeps a property named id inside a component named like a keyword', async () => {
+      const standardSchema = toStandardSchema({
+        $ref: '#/components/schemas/properties',
+        components: { schemas: { properties: { type: 'object', properties: { id: { type: 'string' } } } } },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ id: 'a' })).toEqual({ value: { id: 'a' } });
+      expect('issues' in (await standardSchema['~standard'].validate({ id: 5 }))).toBe(true);
     });
 
     it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
