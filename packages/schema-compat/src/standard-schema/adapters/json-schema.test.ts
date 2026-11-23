@@ -731,6 +731,44 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ id: 1 }))).toBe(true);
     });
 
+    it('checks values against a component named like a keyword that holds its own reference', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: { a: { $ref: '#/components/schemas/type' }, n: { type: 'number' } },
+        components: {
+          schemas: {
+            type: { type: 'object', properties: { o: { $ref: '#/components/schemas/Other' } } },
+            Other: { type: 'string' },
+          },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ n: 1 })).toEqual({ value: { n: 1 } });
+      expect('issues' in (await standardSchema['~standard'].validate({ n: 'x' }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ a: { o: 'x' } }))).toBe(true);
+    });
+
+    it('refuses a schema that brings a key the validator writes while resolving references', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          n: { $ref: '#/properties/m', __absolute_ref__: '#/properties/m/default' },
+          m: { default: { type: 'number', minimum: 5 } },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ n: 5 })).toEqual({
+        issues: [
+          {
+            message:
+              'Schema validation error: __absolute_ref__ at "/properties/n/__absolute_ref__" is reserved for the validator, so the schema is refused',
+          },
+        ],
+      });
+    });
+
     const dynamicNode = {
       $dynamicAnchor: 'node',
       type: 'object',
@@ -807,6 +845,17 @@ describe('json-schema standard-schema adapter', () => {
         '$recursiveRef at "/properties/a~1b~0/default/$recursiveRef"',
       ],
       ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
+      [
+        'a $ref that is not a string',
+        {
+          type: 'object',
+          properties: {
+            n: { $ref: ['#/properties/m/default'] },
+            m: { default: { type: 'number', minimum: 5, exclusiveMinimum: true } },
+          },
+        },
+        '$ref that is not a string at "/properties/n/$ref"',
+      ],
     ])('refuses a schema with %s instead of resolving it', async (_case, schema, refused) => {
       const standardSchema = toStandardSchema(schema as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();

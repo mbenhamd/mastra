@@ -118,6 +118,9 @@ const UNSUPPORTED_KEYWORDS = new Set<string>([
   '$recursiveRef',
 ]);
 
+/** Keys the validator writes into a schema while resolving references; a schema must not bring its own. */
+const VALIDATOR_INTERNAL_KEYS = new Set<string>(['__absolute_recursive_ref__', '__absolute_ref__', '__absolute_uri__']);
+
 /** A `$ref` the adapter resolves: the whole schema (`#`) or a JSON Pointer into it (`#/...`). */
 function isLocalPointerRef(ref: string): boolean {
   return ref === '#' || ref.startsWith('#/');
@@ -129,7 +132,8 @@ function pointerToken(key: string): string {
 
 /**
  * Refuses a schema that uses `$id`, `$anchor`, `$dynamicAnchor`, `$dynamicRef`,
- * `$recursiveAnchor` or `$recursiveRef`, or a `$ref` other than `#` or `#/...`.
+ * `$recursiveAnchor` or `$recursiveRef`, a `$ref` other than a `#` or `#/...` string, or one of
+ * the keys the validator writes while resolving references (`__absolute_ref__` and the like).
  * The error names the keyword and its JSON Pointer in the schema.
  *
  * The scan covers every object at any depth, including literal data under
@@ -162,9 +166,12 @@ function refuseUnsupportedKeywords(node: unknown, pointer = '', isNameMap = fals
         `${key} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
       );
     }
-    if (key === '$ref' && typeof value === 'string' && !isLocalPointerRef(value)) {
+    if (VALIDATOR_INTERNAL_KEYS.has(key)) {
+      throw new Error(`${key} at "${at}" is reserved for the validator, so the schema is refused`);
+    }
+    if (key === '$ref' && (typeof value !== 'string' || !isLocalPointerRef(value))) {
       throw new Error(
-        `$ref "${value}" at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+        `$ref ${typeof value === 'string' ? `"${value}"` : 'that is not a string'} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
       );
     }
   }
@@ -380,9 +387,17 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
   // The validator resolves references on the normalised schema. A reference that lands
   // anywhere else than where the roles were read from, for example on a key that
   // normalisation removed, is refused rather than read with the wrong roles.
+  // The validator only resolves references in places it reads as schemas. A `$ref` inside an
+  // object it never reached that way (say a component named `type`, entered only through a
+  // `$ref`) has no resolved target yet; the validator looks it up when it gets there, with the
+  // same lookup, and throws if it is missing, so that case is left to it.
   const lookup = dereference(root);
   for (const [node, targets] of predicted) {
-    const actual = referenceTargets(node as Record<string, unknown>, lookup);
+    const record = node as Record<string, unknown>;
+    const actual = referenceTargets(record, lookup);
+    if (actual.length === 1 && actual[0] === undefined && typeof record.__absolute_ref__ !== 'string') {
+      continue;
+    }
     if (actual.length !== targets.length || actual.some((target, index) => !Object.is(target, targets[index]))) {
       throw new Error(REF_PLACEMENT_MESSAGE);
     }
@@ -443,7 +458,6 @@ const SUMMARY_KEYWORDS = new Set([
   'dependentSchemas',
   'allOf',
   '$ref',
-  '$recursiveRef',
 ]);
 
 /** The validator's error for a property refused by `additionalProperties` or `unevaluatedProperties`. */
