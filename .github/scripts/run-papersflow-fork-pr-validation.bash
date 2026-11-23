@@ -6120,6 +6120,23 @@ run_validator_self_tests() {
     fi
     assert_pf9666_owned_workspace_targets
     assert_not_contains 'PF-9666 exact patched cfworker dependency graph' "$output"
+
+    local factory_manifest_head
+    factory_manifest_head="$(
+      cd "$fixture_repo"
+      printf '%s\n' '{"name":"@mastra/factory","scripts":{"check":"true","build:lib":"true","lint":"true"}}' \
+        > mastracode/factory/package.json
+      printf '%s\n' 'export const projects = 3;' > mastracode/factory/src/routes/projects.ts
+      git add .
+      git commit -q -m 'redefine factory scripts'
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$factory_manifest_head" "$owned_base" "$test_root/pf9666-factory-manifest.log"
+    grep -Fq 'mastracode/factory/package.json' "$test_root/pf9666-factory-manifest.log" || {
+      echo 'The factory manifest refusal did not name mastracode/factory/package.json.' >&2
+      cat "$test_root/pf9666-factory-manifest.log" >&2
+      exit 1
+    }
     git -C "$fixture_repo" reset -q --hard "$base_sha"
     echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
   }
@@ -15527,7 +15544,7 @@ while IFS= read -r path; do
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
   grep -E \
-    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
+    '^(client-sdks/client-js|mastracode/(factory|sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
     "$changed_files" || true
 )
 
@@ -17036,9 +17053,12 @@ fi
 
 if workspace_changed mastracode/factory; then
   # Factory imports Code SDK, MCP, Slack, auth and storage packages through
-  # their dist exports, and declares no `build` script of its own, so the turbo
-  # build here builds exactly its workspace dependency graph. Its owned suites
-  # run through the MastraCode source-and-test pairs above.
+  # their dist exports. The turbo build builds that workspace dependency graph
+  # and, through factory's turbo.json, factory's own `build:lib`; the explicit
+  # `build:lib` below runs it once more as its own step. Its owned suites run
+  # through the MastraCode source-and-test pairs above. Its package.json is an
+  # unsupported input like the SDK and TUI manifests, so a PR cannot redefine
+  # the scripts this block runs.
   run_with_validation_budget 900 pnpm turbo build --filter ./mastracode/factory
   run_with_validation_budget 600 pnpm --filter ./mastracode/factory --fail-if-no-match check
   run_with_validation_budget 900 pnpm --filter ./mastracode/factory --fail-if-no-match build:lib
