@@ -181,28 +181,81 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
   // objects that are not schemas, such as two `example: { id: 1 }` or
   // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
   // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected. On a
-  // `$ref` target that is a name map, an object `id` is a property's schema.
-  if (!isRefTarget || typeof record.id !== 'object') {
+  // `$ref` target that is a name map, `id` is a property's schema (an object or
+  // a boolean), so there only a string `id` is dropped.
+  if (!isRefTarget || typeof record.id === 'string') {
     delete record.id;
   }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
- * Normalises the target of every local `$ref` (`#/...`) as a schema. The walk
- * leaves a name map's own keys alone, so a target named like a name-map
- * keyword, such as `#/components/schemas/properties`, was not normalised.
- * Literal data under `const`, `enum`, `default` and `examples` is not searched
- * for `$ref`, and a pointer into a schema's literal data is not normalised.
+ * Normalises the target of every local `$ref` (`#/...`), and every subschema
+ * under it, as a schema. The first walk leaves a name map's own keys and
+ * literal data alone, so a target named like a keyword, such as
+ * `#/components/schemas/properties` or `#/components/schemas/default`, was
+ * not normalised. A pointer into a schema's literal data (`const`, `enum`,
+ * `default`, `examples`) is left alone, as is a pointer to a known name map
+ * (`#/properties`), whose keys are names.
  */
 function normalizeLocalRefTargets(root: unknown): void {
+  /**
+   * Follows a pointer. With the set of reference targets, it also tracks the position reached: a
+   * schema (the root, a subschema keyword, an entry of a name map or applicator array, or any
+   * reference target), a name map or applicator array, or an unknown container such as
+   * `components`, whose keys are names. `skip` is true for literal data and known name maps.
+   */
+  const resolve = (ref: string, targets?: Set<object>): { target: unknown; skip: boolean } => {
+    let target: unknown = root;
+    let position: 'schema' | 'names' | 'unknown' = 'schema';
+    for (const token of ref.slice(2).split('/')) {
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(token);
+      } catch {
+        return { target: undefined, skip: true };
+      }
+      const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
+      if (position === 'unknown' && isPlainObject(target) && targets?.has(target)) {
+        position = 'schema';
+      }
+      // A pointer into a schema's literal data names a value, not a schema: normalising it
+      // would change the value compared, such as dropping its `id`.
+      if (targets && position === 'schema' && DATA_KEYWORDS.has(name)) {
+        return { target: undefined, skip: true };
+      }
+      target =
+        isPlainObject(target) || Array.isArray(target)
+          ? Object.hasOwn(target, name)
+            ? (target as Record<string, unknown>)[name]
+            : undefined
+          : undefined;
+      if (position === 'names') {
+        position = 'schema';
+      } else if (position === 'schema') {
+        position =
+          SCHEMA_MAP_KEYWORD_SET.has(name) || (SUBSCHEMA_ARRAY_KEYWORDS.has(name) && Array.isArray(target))
+            ? 'names'
+            : SUBSCHEMA_KEYWORDS.has(name)
+              ? 'schema'
+              : 'unknown';
+      }
+    }
+    return { target, skip: position === 'names' };
+  };
+
+  const refs = new Set<string>();
   const seen = new Set<object>();
-  const visit = (node: unknown, isNameMap = false): void => {
+  const collect = (node: unknown, isNameMap = false): void => {
     if (typeof node !== 'object' || node === null || seen.has(node)) {
       return;
     }
     seen.add(node);
     if (Array.isArray(node)) {
-      node.forEach(item => visit(item));
+      node.forEach(item => collect(item));
       return;
     }
     const record = node as Record<string, unknown>;
@@ -210,51 +263,35 @@ function normalizeLocalRefTargets(root: unknown): void {
       if (!isNameMap && DATA_KEYWORDS.has(key)) {
         continue;
       }
-      visit(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key));
+      collect(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key));
     }
     const ref = isNameMap ? undefined : record.$ref;
     if (typeof ref === 'string' && ref.startsWith('#/')) {
-      let target: unknown = root;
-      // What the pointer has reached: a known schema position (from the root through schema
-      // keywords), a name map or applicator array under one, or an unknown container such as
-      // `components`, whose keys are names.
-      let position: 'schema' | 'names' | 'unknown' = 'schema';
-      for (const token of ref.slice(2).split('/')) {
-        let decoded: string;
-        try {
-          decoded = decodeURIComponent(token);
-        } catch {
-          target = undefined;
-          break;
-        }
-        const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
-        // A pointer into a schema's literal data (`const`, `enum`, ...) names a value, not a
-        // schema: normalising it would change the value compared, such as dropping its `id`.
-        if (position === 'schema' && DATA_KEYWORDS.has(name)) {
-          target = undefined;
-          break;
-        }
-        target =
-          typeof target === 'object' && target !== null && Object.hasOwn(target, name)
-            ? (target as Record<string, unknown>)[name]
-            : undefined;
-        if (position === 'names') {
-          position = 'schema';
-        } else if (position === 'schema') {
-          position =
-            SCHEMA_MAP_KEYWORD_SET.has(name) || (SUBSCHEMA_ARRAY_KEYWORDS.has(name) && Array.isArray(target))
-              ? 'names'
-              : SUBSCHEMA_KEYWORDS.has(name)
-                ? 'schema'
-                : 'unknown';
-        }
-      }
-      if (typeof target === 'object' && target !== null && !Array.isArray(target)) {
-        normalizeSchemaObject(target as Record<string, unknown>, true);
-      }
+      refs.add(ref);
     }
   };
-  visit(root);
+  collect(root);
+
+  // A target under a key the first walk skips, such as a component named `default`, can hold
+  // references of its own, so targets are searched until no new reference turns up.
+  const targets = new Set<object>();
+  let count = -1;
+  while (refs.size !== count) {
+    count = refs.size;
+    for (const ref of [...refs]) {
+      const { target, skip } = resolve(ref, targets);
+      if (!skip && isPlainObject(target) && !targets.has(target)) {
+        targets.add(target);
+        collect(target);
+      }
+    }
+  }
+  for (const ref of refs) {
+    const { target, skip } = resolve(ref, targets);
+    if (!skip && isPlainObject(target)) {
+      normalizeSchemaObjects(target, false, new Set(), true);
+    }
+  }
 }
 
 /**
@@ -266,7 +303,7 @@ function normalizeLocalRefTargets(root: unknown): void {
  * the keys are names, so the map itself is left alone and only its values are
  * walked as schemas.
  */
-function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set<object>()): void {
+function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set<object>(), isRefTarget = false): void {
   if (typeof node !== 'object' || node === null || seen.has(node)) {
     return;
   }
@@ -277,7 +314,7 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
   }
   const record = node as Record<string, unknown>;
   if (!isNameMap) {
-    normalizeSchemaObject(record);
+    normalizeSchemaObject(record, isRefTarget);
   }
   for (const [key, value] of Object.entries(record)) {
     if (!isNameMap && DATA_KEYWORDS.has(key)) {

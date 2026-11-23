@@ -593,16 +593,37 @@ describe('json-schema standard-schema adapter', () => {
           default: { type: 'string', nullable: true },
           other: { $ref: '#/properties/default' },
           qty: { $ref: '#/components/schemas/default' },
+          // A forbidden property in a map an annotation refers to.
+          id: false,
+          // Subschemas inside a component named like a data keyword.
+          q: { $ref: '#/components/schemas/examples' },
+          // A pointer into a referenced component's literal data.
+          tok: { $ref: '#/components/schemas/Tok' },
         },
-        components: { schemas: { default: { type: 'number', minimum: 5, exclusiveMinimum: true } } },
+        'x-meta': { $ref: '#/properties' },
+        components: {
+          schemas: {
+            default: { type: 'number', minimum: 5, exclusiveMinimum: true },
+            examples: {
+              type: 'object',
+              properties: {
+                n: { type: 'number', minimum: 5, exclusiveMinimum: true },
+                s: { type: 'string', nullable: true },
+              },
+            },
+            Tok: { const: { id: 'k1', v: 1 }, 'x-meta': { $ref: '#/components/schemas/Tok/const' } },
+          },
+        },
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
-      expect(await standardSchema['~standard'].validate({ tag: { id: 'expected' }, other: null, qty: 6 })).toEqual({
-        value: { tag: { id: 'expected' }, other: null, qty: 6 },
-      });
+      const valid = { tag: { id: 'expected' }, other: null, qty: 6, q: { n: 6, s: null }, tok: { id: 'k1', v: 1 } };
+      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
       expect('issues' in (await standardSchema['~standard'].validate({ tag: {} }))).toBe(true);
       expect('issues' in (await standardSchema['~standard'].validate({ qty: 5 }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ id: 1 }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ q: { n: 5 } }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ tok: { v: 1 } }))).toBe(true);
     });
 
     it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
