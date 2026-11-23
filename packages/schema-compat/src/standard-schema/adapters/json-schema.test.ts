@@ -265,25 +265,38 @@ describe('json-schema standard-schema adapter', () => {
       expect(await nullable['~standard'].validate(nullableValue)).toEqual({ value: nullableValue });
     });
 
-    it('validates a recursive anyOf in time that does not double with each level', async () => {
-      const standardSchema = toStandardSchema({
-        $defs: {
-          node: {
-            anyOf: [
-              { type: 'object', properties: { kind: { const: 'a' }, child: { $ref: '#/$defs/node' } } },
-              { type: 'object', properties: { kind: { const: 'b' }, child: { $ref: '#/$defs/node' } } },
-            ],
-          },
-        },
-        $ref: '#/$defs/node',
-      } as JSONSchema7);
+    it('validates a recursive union in time that does not double with each level', async () => {
+      const child = { $ref: '#/$defs/node' };
+      // Branches told apart by a discriminator after the recursive property, and by `required` alone.
+      const byConst = {
+        anyOf: [
+          { type: 'object', properties: { child, kind: { const: 'a' } } },
+          { type: 'object', properties: { child, kind: { const: 'b' } } },
+        ],
+      };
+      const byRequired = {
+        oneOf: [
+          { type: 'object', required: ['text'], properties: { child } },
+          { type: 'object', required: ['label'], properties: { child } },
+        ],
+      };
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-      // Checking every branch to the bottom took 2^depth steps: 24 s at depth 20.
-      let tree: Record<string, unknown> = { kind: 'a' };
-      for (let depth = 0; depth < 40; depth++) tree = { kind: 'a', child: tree };
+      // Checking each branch's child again at every level took 2^depth steps: 13-25 s at depth 20.
+      for (const [node, leaf] of [
+        [byConst, { kind: 'b' }],
+        [byRequired, { label: 'x' }],
+      ] as const) {
+        const standardSchema = toStandardSchema({ $defs: { node }, $ref: '#/$defs/node' } as JSONSchema7);
+        let valid: Record<string, unknown> = leaf;
+        let invalid: Record<string, unknown> = { kind: 'c' };
+        for (let depth = 0; depth < 40; depth++) {
+          valid = { ...leaf, child: valid };
+          invalid = { ...leaf, child: invalid };
+        }
 
-      expect(await standardSchema['~standard'].validate(tree)).toEqual({ value: tree });
-      expect('issues' in (await standardSchema['~standard'].validate({ kind: 'a', child: { kind: 'c' } }))).toBe(true);
+        expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
+        expect('issues' in (await standardSchema['~standard'].validate(invalid))).toBe(true);
+      }
     });
 
     it('still rejects an own __proto__ key that the schema does not allow', async () => {
@@ -447,15 +460,27 @@ describe('json-schema standard-schema adapter', () => {
     it('applies nullable and ignores format on a subschema reached only by $ref', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
-        properties: { site: { $ref: '#/components/schemas/Site' } },
-        components: { schemas: { Site: { type: 'string', format: 'url', nullable: true } } },
+        properties: {
+          site: { $ref: '#/components/schemas/Site' },
+          // A target named like a keyword whose value maps names to schemas.
+          other: { $ref: '#/components/schemas/properties' },
+        },
+        components: {
+          schemas: {
+            Site: { type: 'string', format: 'url', nullable: true },
+            properties: { type: 'string', format: 'url', nullable: true },
+          },
+        },
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
       for (const site of [null, 'not a url']) {
-        expect(await standardSchema['~standard'].validate({ site })).toEqual({ value: { site } });
+        expect(await standardSchema['~standard'].validate({ site, other: site })).toEqual({
+          value: { site, other: site },
+        });
       }
       expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ other: 5 }))).toBe(true);
     });
 
     it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {

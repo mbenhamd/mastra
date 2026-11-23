@@ -126,6 +126,59 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
   }
 }
 
+/** Applies `nullable` and drops `format` and `id` on one schema object. */
+function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = false): void {
+  const types: unknown[] = Array.isArray(record.type) ? record.type : [record.type];
+  // A `type` of strings: in a name map reached by `$ref`, `type` is a property's schema.
+  if (record.nullable === true && record.type !== undefined && types.every(type => typeof type === 'string')) {
+    if (!types.includes('null')) {
+      record.type = [...types, 'null'];
+    }
+  }
+  if (typeof record.format === 'string') {
+    delete record.format;
+  }
+  // The validator reads `id` on every object it walks as a schema URI, so two
+  // objects that are not schemas, such as two `example: { id: 1 }` or
+  // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
+  // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected. On a
+  // `$ref` target that is a name map, an object `id` is a property's schema.
+  if (!isRefTarget || typeof record.id !== 'object') {
+    delete record.id;
+  }
+}
+
+/**
+ * Normalises the target of every local `$ref` (`#/...`) as a schema. The walk
+ * leaves a name map's own keys alone, so a target named like a name-map
+ * keyword, such as `#/components/schemas/properties`, was not normalised.
+ */
+function normalizeLocalRefTargets(root: unknown): void {
+  const seen = new Set<object>();
+  const visit = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    const ref = (node as Record<string, unknown>).$ref;
+    if (typeof ref === 'string' && ref.startsWith('#/')) {
+      let target: unknown = root;
+      for (const token of ref.slice(2).split('/')) {
+        const name = decodeURIComponent(token).replace(/~1/g, '/').replace(/~0/g, '~');
+        target =
+          typeof target === 'object' && target !== null && Object.hasOwn(target, name)
+            ? (target as Record<string, unknown>)[name]
+            : undefined;
+      }
+      if (typeof target === 'object' && target !== null && !Array.isArray(target)) {
+        normalizeSchemaObject(target as Record<string, unknown>, true);
+      }
+    }
+    Object.values(node).forEach(visit);
+  };
+  visit(root);
+}
+
 /**
  * Applies `nullable` and drops `format` and `id` on every
  * object the validator can read as a schema. A `$ref` can point at any path
@@ -148,20 +201,7 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
   }
   const record = node as Record<string, unknown>;
   if (!isNameMap) {
-    if (record.nullable === true && record.type !== undefined) {
-      const types: unknown[] = Array.isArray(record.type) ? record.type : [record.type];
-      if (!types.includes('null')) {
-        record.type = [...types, 'null'];
-      }
-    }
-    if (typeof record.format === 'string') {
-      delete record.format;
-    }
-    // The validator reads `id` on every object it walks as a schema URI, so two
-    // objects that are not schemas, such as two `example: { id: 1 }` or
-    // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
-    // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected.
-    delete record.id;
+    normalizeSchemaObject(record);
   }
   for (const [key, value] of Object.entries(record)) {
     if (!isNameMap && DATA_KEYWORDS.has(key)) {
@@ -185,6 +225,7 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
 function toValidationSchema(schema: JSONSchema7): Schema {
   const copy = structuredClone(schema) as Schema;
   normalizeSchemaObjects(copy);
+  normalizeLocalRefTargets(copy);
   return copy;
 }
 
@@ -409,8 +450,7 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    * In its draft-07 mode the validator skips keywords beside `$ref` (for example
    * `{ $ref, maxLength }`), which Ajv applied, so input Ajv refused would pass. The
    * validator reads the draft only for that and for draft-04, so draft-07 tuple
-   * `items` and `additionalItems` behave the same in 2020-12 mode; `dependencies`
-   * is rewritten as its 2020-12 forms first.
+   * `items`, `additionalItems` and `dependencies` behave the same in 2020-12 mode.
    */
   #getValidator(): Validator {
     if (!this.#validator) {
