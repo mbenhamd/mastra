@@ -213,6 +213,28 @@ describe('json-schema standard-schema adapter', () => {
       expect('value' in result && result.value).toBe(value);
     });
 
+    it('refuses an undeclared property set to undefined where the schema closes the object, as Ajv did', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          note: { type: 'string' },
+          nested: { type: 'object', properties: { a: {} }, unevaluatedProperties: false },
+        },
+        additionalProperties: false,
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ ok: true, extra: undefined })).toEqual({
+        issues: [{ message: 'Property "extra" does not match additional properties schema.', path: [] }],
+      });
+      expect(await standardSchema['~standard'].validate({ nested: { a: 1, b: undefined } })).toEqual({
+        issues: [{ message: 'Property "b" does not match unevaluated properties schema.', path: ['nested'] }],
+      });
+      const declared = { ok: true, note: undefined, nested: { a: undefined } };
+      expect(await standardSchema['~standard'].validate(declared)).toEqual({ value: declared });
+    });
+
     it('still rejects an own __proto__ key that the schema does not allow', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
@@ -351,6 +373,24 @@ describe('json-schema standard-schema adapter', () => {
       });
     });
 
+    it('resolves a $ref in a draft-07 dependency named like a keyword, and keeps property dependencies', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: { type: { type: 'string' }, detail: { type: 'string' }, a: {}, b: {} },
+        dependencies: { type: { $ref: '#/definitions/Details' }, a: ['b'], example: ['b'] },
+        definitions: { Details: { required: ['detail'] } },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      const valid = { type: 'note', detail: 'text', a: 1, b: 2 };
+      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
+      expect(await standardSchema['~standard'].validate({ type: 'note' })).toEqual({
+        issues: [{ message: 'Instance does not have required property "detail".', path: [] }],
+      });
+      expect('issues' in (await standardSchema['~standard'].validate({ a: 1 }))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate({ example: 1 }))).toBe(true);
+    });
+
     it('applies nullable and ignores format on a subschema reached only by $ref', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
@@ -365,18 +405,23 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);
     });
 
-    it('ignores examples, so example objects sharing an id leave the schema usable', async () => {
+    it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
         properties: {
-          user: { type: 'object', example: { id: 1 } },
-          owner: { type: 'object', examples: [{ id: 1 }] },
+          user: { type: 'object', example: { id: 1 }, 'x-meta': { id: 'u' }, externalDocs: { id: 7 } },
+          owner: { type: 'object', examples: [{ id: 1 }], 'x-meta': { id: 'u' }, externalDocs: { id: 7 } },
           account: { type: 'object', example: { id: 1 } },
+          sample: { $ref: '#/components/schemas/example' },
         },
+        components: { schemas: { example: { type: 'string' } } },
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
-      expect(await standardSchema['~standard'].validate({ user: {} })).toEqual({ value: { user: {} } });
+      expect(await standardSchema['~standard'].validate({ user: {}, sample: 's' })).toEqual({
+        value: { user: {}, sample: 's' },
+      });
+      expect('issues' in (await standardSchema['~standard'].validate({ sample: 5 }))).toBe(true);
     });
 
     const dynamicNode = {
@@ -490,6 +535,10 @@ describe('json-schema standard-schema adapter', () => {
         [1, 1.0],
         [null, null],
         [{ a: [1] }, { a: [1] }],
+        [
+          { a: 1, b: [2] },
+          { b: [2], a: 1 },
+        ],
       ]) {
         expect(await validate({ nested: { ids } })).toEqual({
           issues: [{ message: 'Duplicate items at indexes 0 and 1.', path: ['nested', 'ids'] }],
@@ -506,14 +555,15 @@ describe('json-schema standard-schema adapter', () => {
       });
     });
 
-    it('checks strings in time that grows linearly with their count, even beside an object', async () => {
-      // One array of 16,000 strings and an object against 16 arrays of 1,000 and an
-      // object. A linear check costs about the same for both; the pairwise check
+    it('checks strings and objects in time that grows linearly with their count', async () => {
+      // One array of 16,000 items, half strings and half objects, against 16 arrays
+      // of 1,000. A linear check costs about the same for both; the pairwise check
       // costs 16 times more for the long one. The fastest of five interleaved rounds
       // keeps a loaded host from deciding.
-      const long = { nested: { ids: [...Array.from({ length: 16_000 }, (_, i) => `t${i}`), {}] } };
+      const item = (prefix: string, i: number) => (i % 2 === 0 ? `${prefix}${i}` : { id: `${prefix}${i}`, n: [i] });
+      const long = { nested: { ids: Array.from({ length: 16_000 }, (_, i) => item('t', i)) } };
       const short = Array.from({ length: 16 }, (_, n) => ({
-        nested: { ids: [...Array.from({ length: 1_000 }, (_, i) => `t${n}-${i}`), {}] },
+        nested: { ids: Array.from({ length: 1_000 }, (_, i) => item(`t${n}-`, i)) },
       }));
       let longBest = Infinity;
       let shortBest = Infinity;

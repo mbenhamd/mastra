@@ -1,45 +1,94 @@
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
-index 1abb284311bf653d9a9d67c52d79c99a7db29c68..1495fd4b906bd083ed772e60ebe97c27b3e525cd 100644
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..c06b3b0fac1b32c5d3d50b841006e0443d32a35d 100644
 --- a/dist/commonjs/validate.js
 +++ b/dist/commonjs/validate.js
-@@ -36,6 +36,57 @@ function isMultipleOf(instance, divisor) {
+@@ -36,6 +36,106 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
-+// mbenhamd/mastra#631 (PF-9666): a uniqueItems check that is linear in the
-+// number of non-object items. The library compared every pair of items, so an
-+// array of tens of thousands of strings, or of strings plus one object, took
-+// seconds. Items that are not objects compare with === through one Map pass (so
-+// "1" and 1 differ, 1 and 1.0 are equal, and NaN equals nothing); only object and
-+// array items are compared pairwise, with deepCompareStrict, as before. An object
-+// never equals a non-object, so the two groups are independent. Returns the pair
-+// the pairwise loop reported, the lowest index that has an equal item and the
-+// lowest index equal to it, or null when every item is distinct.
++// mbenhamd/mastra#631 (PF-9666): a uniqueItems check in one pass. The library
++// compared every pair of items, so tens of thousands of strings or objects took
++// seconds. Here every item goes into a Map: an item that is not an object by
++// itself (compared with ===, so "1" and 1 differ, 1 and 1.0 are equal), an object
++// or array by a key that two items share exactly when deepCompareStrict finds
++// them equal (object keys sorted, so key order does not matter). An object
++// holding NaN, a function or another value without such a key is compared pair
++// by pair with the other such objects only, as before; JSON values never hold
++// one. Returns the pair the pairwise loop reported, the lowest index that has an
++// equal item and the lowest index equal to it, or null when every item is
++// distinct.
++function uniqueItemKey(value) {
++    if (value === null) {
++        return 'null';
++    }
++    switch (typeof value) {
++        case 'string':
++            return JSON.stringify(value);
++        case 'number':
++            return value === value ? 'n' + value : null;
++        case 'boolean':
++            return value ? 'true' : 'false';
++        case 'undefined':
++            return 'undefined';
++        case 'object': {
++            if (Array.isArray(value)) {
++                let key = '[';
++                for (let i = 0; i < value.length; i++) {
++                    const itemKey = uniqueItemKey(value[i]);
++                    if (itemKey === null) {
++                        return null;
++                    }
++                    key += (i === 0 ? '' : ',') + itemKey;
++                }
++                return key + ']';
++            }
++            const names = Object.keys(value).sort();
++            let key = '{';
++            for (let i = 0; i < names.length; i++) {
++                const itemKey = uniqueItemKey(value[names[i]]);
++                if (itemKey === null) {
++                    return null;
++                }
++                key += (i === 0 ? '' : ',') + JSON.stringify(names[i]) + ':' + itemKey;
++            }
++            return key + '}';
++        }
++        default:
++            return null;
++    }
++}
 +function findDuplicateItems(instance) {
 +    const length = instance.length;
-+    const firstIndex = new Map();
-+    const objectIndexes = [];
++    const firstValueIndex = new Map();
++    const firstObjectIndex = new Map();
++    const unkeyed = [];
 +    let pair = null;
 +    for (let i = 0; i < length; i++) {
 +        const item = instance[i];
++        let firstIndex = firstValueIndex;
++        let key = item;
 +        if (typeof item === 'object' && item !== null) {
-+            objectIndexes.push(i);
++            key = uniqueItemKey(item);
++            if (key === null) {
++                unkeyed.push(i);
++                continue;
++            }
++            firstIndex = firstObjectIndex;
++        }
++        else if (item !== item) {
 +            continue;
 +        }
-+        if (item !== item) {
-+            continue;
-+        }
-+        const first = firstIndex.get(item);
++        const first = firstIndex.get(key);
 +        if (first === undefined) {
-+            firstIndex.set(item, i);
++            firstIndex.set(key, i);
 +        }
 +        else if (pair === null || first < pair[0]) {
 +            pair = [first, i];
 +        }
 +    }
-+    const count = objectIndexes.length;
++    const count = unkeyed.length;
 +    for (let x = 0; x < count; x++) {
-+        const j = objectIndexes[x];
++        const j = unkeyed[x];
 +        if (pair !== null && j > pair[0]) {
 +            break;
 +        }
@@ -48,7 +97,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..1495fd4b906bd083ed772e60ebe97c27
 +            if (y === x) {
 +                continue;
 +            }
-+            const k = objectIndexes[y];
++            const k = unkeyed[y];
 +            const b = instance[k];
 +            if (a === b || (0, deep_compare_strict_js_1.deepCompareStrict)(a, b)) {
 +                return [j, k];
@@ -60,7 +109,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..1495fd4b906bd083ed772e60ebe97c27
  function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_js_1.dereference)(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
      if (schema === true) {
          return { valid: true, errors: [] };
-@@ -698,26 +749,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -698,26 +798,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          if ($uniqueItems) {
@@ -96,47 +145,96 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..1495fd4b906bd083ed772e60ebe97c27
          }
      }
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
-index 78c71b00e321ff99db657484d299c1684a4ef07e..eb6cecd56da316e30de64a508e4641973e7b32be 100644
+index 78c71b00e321ff99db657484d299c1684a4ef07e..36306f36b00f6feedd3f86e7dbe757fe2982dca4 100644
 --- a/dist/esm/validate.js
 +++ b/dist/esm/validate.js
-@@ -33,6 +33,57 @@ function isMultipleOf(instance, divisor) {
+@@ -33,6 +33,106 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
-+// mbenhamd/mastra#631 (PF-9666): a uniqueItems check that is linear in the
-+// number of non-object items. The library compared every pair of items, so an
-+// array of tens of thousands of strings, or of strings plus one object, took
-+// seconds. Items that are not objects compare with === through one Map pass (so
-+// "1" and 1 differ, 1 and 1.0 are equal, and NaN equals nothing); only object and
-+// array items are compared pairwise, with deepCompareStrict, as before. An object
-+// never equals a non-object, so the two groups are independent. Returns the pair
-+// the pairwise loop reported, the lowest index that has an equal item and the
-+// lowest index equal to it, or null when every item is distinct.
++// mbenhamd/mastra#631 (PF-9666): a uniqueItems check in one pass. The library
++// compared every pair of items, so tens of thousands of strings or objects took
++// seconds. Here every item goes into a Map: an item that is not an object by
++// itself (compared with ===, so "1" and 1 differ, 1 and 1.0 are equal), an object
++// or array by a key that two items share exactly when deepCompareStrict finds
++// them equal (object keys sorted, so key order does not matter). An object
++// holding NaN, a function or another value without such a key is compared pair
++// by pair with the other such objects only, as before; JSON values never hold
++// one. Returns the pair the pairwise loop reported, the lowest index that has an
++// equal item and the lowest index equal to it, or null when every item is
++// distinct.
++function uniqueItemKey(value) {
++    if (value === null) {
++        return 'null';
++    }
++    switch (typeof value) {
++        case 'string':
++            return JSON.stringify(value);
++        case 'number':
++            return value === value ? 'n' + value : null;
++        case 'boolean':
++            return value ? 'true' : 'false';
++        case 'undefined':
++            return 'undefined';
++        case 'object': {
++            if (Array.isArray(value)) {
++                let key = '[';
++                for (let i = 0; i < value.length; i++) {
++                    const itemKey = uniqueItemKey(value[i]);
++                    if (itemKey === null) {
++                        return null;
++                    }
++                    key += (i === 0 ? '' : ',') + itemKey;
++                }
++                return key + ']';
++            }
++            const names = Object.keys(value).sort();
++            let key = '{';
++            for (let i = 0; i < names.length; i++) {
++                const itemKey = uniqueItemKey(value[names[i]]);
++                if (itemKey === null) {
++                    return null;
++                }
++                key += (i === 0 ? '' : ',') + JSON.stringify(names[i]) + ':' + itemKey;
++            }
++            return key + '}';
++        }
++        default:
++            return null;
++    }
++}
 +function findDuplicateItems(instance) {
 +    const length = instance.length;
-+    const firstIndex = new Map();
-+    const objectIndexes = [];
++    const firstValueIndex = new Map();
++    const firstObjectIndex = new Map();
++    const unkeyed = [];
 +    let pair = null;
 +    for (let i = 0; i < length; i++) {
 +        const item = instance[i];
++        let firstIndex = firstValueIndex;
++        let key = item;
 +        if (typeof item === 'object' && item !== null) {
-+            objectIndexes.push(i);
++            key = uniqueItemKey(item);
++            if (key === null) {
++                unkeyed.push(i);
++                continue;
++            }
++            firstIndex = firstObjectIndex;
++        }
++        else if (item !== item) {
 +            continue;
 +        }
-+        if (item !== item) {
-+            continue;
-+        }
-+        const first = firstIndex.get(item);
++        const first = firstIndex.get(key);
 +        if (first === undefined) {
-+            firstIndex.set(item, i);
++            firstIndex.set(key, i);
 +        }
 +        else if (pair === null || first < pair[0]) {
 +            pair = [first, i];
 +        }
 +    }
-+    const count = objectIndexes.length;
++    const count = unkeyed.length;
 +    for (let x = 0; x < count; x++) {
-+        const j = objectIndexes[x];
++        const j = unkeyed[x];
 +        if (pair !== null && j > pair[0]) {
 +            break;
 +        }
@@ -145,7 +243,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..eb6cecd56da316e30de64a508e464197
 +            if (y === x) {
 +                continue;
 +            }
-+            const k = objectIndexes[y];
++            const k = unkeyed[y];
 +            const b = instance[k];
 +            if (a === b || deepCompareStrict(a, b)) {
 +                return [j, k];
@@ -157,7 +255,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..eb6cecd56da316e30de64a508e464197
  export function validate(instance, schema, draft = '2019-09', lookup = dereference(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
      if (schema === true) {
          return { valid: true, errors: [] };
-@@ -695,26 +746,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -695,26 +795,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          if ($uniqueItems) {

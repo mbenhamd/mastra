@@ -72,20 +72,14 @@ const SCHEMA_MAP_KEYWORDS = [
   '$defs',
   'definitions',
   'dependencies',
+  'dependentRequired',
   'dependentSchemas',
   'patternProperties',
   'properties',
 ] as const;
 
-/** Keywords whose value is literal data, never a schema. */
-const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum', 'example', 'examples']);
-
-/**
- * Annotation keywords removed before validation. They never constrain a value,
- * but the validator reads an object under them as a schema, so two examples
- * holding `{ id: 1 }` made every call fail with a duplicate schema URI.
- */
-const DROPPED_ANNOTATION_KEYWORDS = ['example', 'examples'] as const;
+/** Keywords whose value is literal data the validator compares or skips, never a schema. */
+const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum']);
 
 /**
  * Thrown for a schema that uses `$dynamicRef`. `@cfworker/json-schema` does not
@@ -133,7 +127,35 @@ function refuseDynamicRef(node: unknown, isNameMap = false, seen = new Set<objec
 }
 
 /**
- * Applies `nullable` and drops `format`, `example` and `examples` on every
+ * Rewrites draft-07 `dependencies` as its 2020-12 forms: a property-name array
+ * goes to `dependentRequired`, a schema to `dependentSchemas`. The validator
+ * resolves `$ref` only inside maps it knows hold schemas; under `dependencies`
+ * it skipped an entry named like a keyword (`type`, `minimum`, ...), so a
+ * `$ref` there stayed unresolved and every value was refused. An existing
+ * `dependentRequired` entry for the same name is merged; an existing
+ * `dependentSchemas` entry is combined with `allOf`, so both still apply.
+ */
+function splitDependencies(record: Record<string, unknown>): void {
+  const dependencies = record.dependencies;
+  if (typeof dependencies !== 'object' || dependencies === null || Array.isArray(dependencies)) {
+    return;
+  }
+  const required = { ...(record.dependentRequired as Record<string, unknown[]> | undefined) };
+  const schemas = { ...(record.dependentSchemas as Record<string, unknown> | undefined) };
+  for (const [name, value] of Object.entries(dependencies)) {
+    if (Array.isArray(value)) {
+      required[name] = Object.hasOwn(required, name) ? [...new Set([...required[name]!, ...value])] : value;
+    } else {
+      schemas[name] = Object.hasOwn(schemas, name) ? { allOf: [schemas[name], value] } : value;
+    }
+  }
+  delete record.dependencies;
+  if (Object.keys(required).length > 0) record.dependentRequired = required;
+  if (Object.keys(schemas).length > 0) record.dependentSchemas = schemas;
+}
+
+/**
+ * Applies `nullable` and drops `format` and `id` on every
  * object the validator can read as a schema. A `$ref` can point at any path
  * (for example `#/components/schemas/User`), so the walk covers every object
  * rather than only subschemas under schema keywords; a `format` left on a
@@ -163,9 +185,12 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
     if (typeof record.format === 'string') {
       delete record.format;
     }
-    for (const keyword of DROPPED_ANNOTATION_KEYWORDS) {
-      delete record[keyword];
-    }
+    // The validator reads `id` on every object it walks as a schema URI, so two
+    // objects that are not schemas, such as two `example: { id: 1 }` or
+    // `x-meta: { id: 'u' }`, made every call fail with a duplicate schema URI.
+    // Only draft-04 used `id`, and Ajv ignored it; `$id` is unaffected.
+    delete record.id;
+    splitDependencies(record);
   }
   for (const [key, value] of Object.entries(record)) {
     if (!isNameMap && DATA_KEYWORDS.has(key)) {
@@ -180,7 +205,9 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
  * - OpenAPI `nullable: true` beside a `type` adds `"null"` to that type, as Ajv's
  *   built-in `nullable` keyword does; `enum` and `const` still apply.
  * - `format` is dropped, because validation has never checked formats here.
- * - `example` and `examples` are dropped; they never constrain a value.
+ * - `id` is dropped: only draft-04 used it, Ajv ignored it, and the validator
+ *   read it on objects that are not schemas.
+ * - `dependencies` is rewritten as `dependentRequired` and `dependentSchemas`.
  * Every object is visited except literal data and name maps, so a property
  * named `nullable` or `format` is left alone, and a `$ref` target is treated
  * like any other subschema.
@@ -197,9 +224,8 @@ const UNDEFINED_PROPERTY_DEPTH = 256;
 /**
  * Validates a value as its JSON form would: a plain-object property whose
  * value is `undefined` is left out, because JSON has no `undefined` and the
- * validator rejects it anywhere. Ajv ignored such properties only for
- * `properties`, `required` and `dependencies`; here every keyword sees the
- * object without them, as it would after a JSON round trip.
+ * validator rejects it anywhere. As with Ajv, `additionalProperties` and
+ * `unevaluatedProperties` still see the key: see {@link undefinedKeysRefusedByClosedObjects}.
  *
  * The value is copied only along the paths that hold such a property, so a
  * value without one is validated as is. Copies keep every other own key,
@@ -209,8 +235,16 @@ const UNDEFINED_PROPERTY_DEPTH = 256;
  * loop but an `undefined` property reached only through it is still
  * rejected; JSON has no cycles. Nesting past
  * {@link UNDEFINED_PROPERTY_DEPTH} is left as is.
+ *
+ * With a `marker`, such a property keeps its key and gets the marker as its
+ * value instead, so a closed-object check can still see it.
  */
-function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<object, unknown>()): unknown {
+function withoutUndefinedProperties(
+  value: unknown,
+  marker?: object,
+  depth = 0,
+  copies = new Map<object, unknown>(),
+): unknown {
   if (typeof value !== 'object' || value === null || depth > UNDEFINED_PROPERTY_DEPTH) {
     return value;
   }
@@ -221,7 +255,7 @@ function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<
     copies.set(value, value);
     let copy: unknown[] | undefined;
     value.forEach((item, index) => {
-      const next = withoutUndefinedProperties(item, depth + 1, copies);
+      const next = withoutUndefinedProperties(item, marker, depth + 1, copies);
       if (next !== item) {
         copy ??= [...value];
         copy[index] = next;
@@ -237,7 +271,7 @@ function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<
   copies.set(value, value);
   const entries = Object.entries(value);
   const next = entries.map(
-    ([key, property]) => [key, withoutUndefinedProperties(property, depth + 1, copies)] as const,
+    ([key, property]) => [key, withoutUndefinedProperties(property, marker, depth + 1, copies)] as const,
   );
   if (next.every(([, property], index) => property !== undefined && property === entries[index]![1])) {
     return value;
@@ -245,12 +279,55 @@ function withoutUndefinedProperties(value: unknown, depth = 0, copies = new Map<
   // defineProperty, not assignment: an own `__proto__` key stays a key.
   const copy = Object.create(prototype) as object;
   for (const [key, property] of next) {
-    if (property !== undefined) {
-      Object.defineProperty(copy, key, { value: property, enumerable: true, writable: true, configurable: true });
+    if (property !== undefined || marker) {
+      Object.defineProperty(copy, key, {
+        value: property ?? marker,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
   copies.set(value, copy);
   return copy;
+}
+
+/** The value an `undefined` property gets in the copy that closed-object checks see. */
+const UNDEFINED_MARKER: object = Object.freeze({});
+
+/**
+ * The closed-object errors for properties whose value is `undefined`. The value
+ * is validated a second time with each such property present, holding
+ * {@link UNDEFINED_MARKER}; only `additionalProperties` and
+ * `unevaluatedProperties` errors that name one of those properties are kept.
+ * So, as with Ajv, `{ extra: undefined }` is refused where the schema forbids
+ * `extra`, while a declared property set to `undefined` still counts as absent.
+ * Model output can carry such a key: a structured-output schema wrapped to turn
+ * `null` into `undefined` turns an undeclared `null` key into one.
+ */
+function undefinedKeysRefusedByClosedObjects(validator: Validator, value: unknown): OutputUnit[] {
+  const marked = withoutUndefinedProperties(value, UNDEFINED_MARKER);
+  const result = validator.validate(marked);
+  if (result.valid) {
+    return [];
+  }
+  return result.errors.filter(error => {
+    if (!Object.hasOwn(CLOSED_OBJECT_MESSAGES, error.keyword)) {
+      return false;
+    }
+    let holder: unknown = marked;
+    for (const segment of instanceLocationToPath(error.instanceLocation)) {
+      holder =
+        typeof holder === 'object' && holder !== null ? (holder as Record<PropertyKey, unknown>)[segment] : undefined;
+    }
+    if (typeof holder !== 'object' || holder === null) {
+      return false;
+    }
+    const message = CLOSED_OBJECT_MESSAGES[error.keyword]!;
+    return Object.entries(holder).some(
+      ([key, property]) => property === UNDEFINED_MARKER && error.error === message(key),
+    );
+  });
 }
 
 /**
@@ -383,13 +460,19 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    */
   #validate(value: unknown): StandardSchemaV1.Result<Output> {
     try {
-      const result = this.#getValidator().validate(withoutUndefinedProperties(value));
+      const validator = this.#getValidator();
+      const jsonValue = withoutUndefinedProperties(value);
+      const result = validator.validate(jsonValue);
+      const errors = result.valid ? [] : leafErrors(result.errors);
+      if (jsonValue !== value) {
+        errors.push(...undefinedKeysRefusedByClosedObjects(validator, value));
+      }
 
-      if (result.valid) {
+      if (errors.length === 0) {
         return { value: value as Output };
       }
 
-      const issues: StandardSchemaV1.Issue[] = leafErrors(result.errors).map(error => ({
+      const issues: StandardSchemaV1.Issue[] = errors.map(error => ({
         message: error.error,
         path: instanceLocationToPath(error.instanceLocation),
       }));
@@ -461,14 +544,15 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    * In its draft-07 mode the validator skips keywords beside `$ref` (for example
    * `{ $ref, maxLength }`), which Ajv applied, so input Ajv refused would pass. The
    * validator reads the draft only for that and for draft-04, so draft-07 tuple
-   * `items`, `additionalItems` and `dependencies` behave the same in 2020-12 mode.
+   * `items` and `additionalItems` behave the same in 2020-12 mode; `dependencies`
+   * is rewritten as its 2020-12 forms first.
    */
   #getValidator(): Validator {
     if (!this.#validator) {
       if (!ValidatorClass) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
-      // Checked on the original, before `examples` is dropped, so a `$dynamicRef`
+      // Checked on the original, before the copy is normalised, so a `$dynamicRef`
       // anywhere in it is refused.
       refuseDynamicRef(this.#schema);
       const validationSchema = toValidationSchema(this.#schema);
