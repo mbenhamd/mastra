@@ -163,12 +163,14 @@ export interface ResolveComposioCatalogToolsOpts {
   /** Per-tool description overrides keyed by slug. */
   toolMeta?: Record<string, { description?: string; toolkit?: string }>;
   /**
-   * Arguments the host fixes per tool slug. Each key is removed from the
-   * input schema the model sees and set to its value on every call. A call
-   * that sends the key anyway fails the tool's input validation before it
-   * reaches Composio. Resolving throws when a slug is not in `toolSlugs` or a
-   * key is not one of the tool's input parameters, so a renamed Composio
-   * argument fails instead of silently going unfixed.
+   * Arguments the host fixes per tool slug (matched case-insensitively, as
+   * Composio matches slugs). Each key is removed from the input schema the
+   * model sees, and its value replaces whatever a call sends. Where the
+   * tool's schema does not allow additional properties, a call that sends the
+   * key is refused by input validation before it reaches Composio. Resolving
+   * throws when a slug is not in `toolSlugs` or a key is not one of the tool's
+   * top-level input parameters, so a renamed Composio argument fails instead
+   * of silently going unfixed.
    */
   fixedArguments?: Record<string, Record<string, unknown>>;
   /** Decides each call's identity from that call's request context. */
@@ -549,16 +551,20 @@ export class ComposioToolProvider extends BaseToolProvider {
    * `requireToolApproval` applies as in {@link resolveToolsVNext}.
    */
   async resolveCatalogTools(opts: ResolveComposioCatalogToolsOpts): Promise<Record<string, ToolAction<any, any, any>>> {
+    const catalogSlugs = new Set(opts.toolSlugs.map(slug => slug.toUpperCase()));
+    const unlisted = Object.keys(opts.fixedArguments ?? {}).filter(slug => !catalogSlugs.has(slug.toUpperCase()));
+    if (unlisted.length > 0) {
+      throw new Error(`[composio] fixed arguments name tools outside the catalog: ${unlisted.join(', ')}`);
+    }
     if (opts.toolSlugs.length === 0) return {};
     const slugs = opts.toolSlugs.filter(slug => !COMPOSIO_CONNECTION_MANAGEMENT_TOOLS.has(slug));
     if (slugs.length !== opts.toolSlugs.length) {
       throw new Error('[composio] connection-management tools need a caller-scoped session, not a shared catalog');
     }
-    const fixedArguments = opts.fixedArguments ?? {};
-    const unlisted = Object.keys(fixedArguments).filter(slug => !slugs.includes(slug));
-    if (unlisted.length > 0) {
-      throw new Error(`[composio] fixed arguments name tools outside the catalog: ${unlisted.join(', ')}`);
-    }
+    // Keyed upper-case: the SDK reports `tool.slug` as Composio returns it.
+    const fixedArguments = new Map(
+      Object.entries(opts.fixedArguments ?? {}).map(([slug, fixed]) => [slug.toUpperCase(), fixed]),
+    );
     const callIdentity = new AsyncLocalStorage<ComposioCallIdentity>();
     const rawToolFacts: ToolFactsBySlug = new Map();
     const captureFacts = captureToolFacts(rawToolFacts);
@@ -580,12 +586,12 @@ export class ComposioToolProvider extends BaseToolProvider {
         } else {
           delete params.connectedAccountId;
         }
-        const fixed = fixedArguments[toolSlug];
+        const fixed = fixedArguments.get(toolSlug.toUpperCase());
         if (fixed) params.arguments = { ...params.arguments, ...fixed };
         return params;
       },
       modifySchema: (input: { toolSlug: string; toolkitSlug: string; schema: ComposioTool }) =>
-        withoutFixedArguments(captureFacts(input), input.toolSlug, fixedArguments[input.toolSlug]),
+        withoutFixedArguments(captureFacts(input), input.toolSlug, fixedArguments.get(input.toolSlug.toUpperCase())),
     };
     const resolved = (await this.getMastraClient().tools.get(
       CATALOG_SCHEMA_USER_ID,
@@ -1113,8 +1119,11 @@ function captureToolFacts(into: ToolFactsBySlug) {
 
 /**
  * The tool schema without the host's fixed arguments, so the model is never
- * offered them. Returns a copy; the SDK keeps the raw schema for execution.
- * Throws when a fixed key is not one of the tool's input parameters.
+ * offered them. A tool with fixed arguments gets a copy; the SDK keeps the
+ * raw schema for execution. Only top-level `properties` and `required` are
+ * edited: a key that exists only inside `allOf`/`anyOf`/`oneOf` or behind a
+ * root `$ref` is reported as missing, which fails closed.
+ * Throws when a fixed key is not one of the tool's top-level input parameters.
  */
 function withoutFixedArguments(
   schema: ComposioTool,

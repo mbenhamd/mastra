@@ -431,6 +431,13 @@ export const composioTools = await composio.resolveCatalogTools({
     isOptional: true,
   },
   {
+    name: 'fixedArguments',
+    type: 'Record<string, Record<string, unknown>>',
+    description:
+      "Arguments set on every call, keyed by tool slug. The model isn't offered them, and the fixed value replaces whatever a call sends. When the tool's schema doesn't allow additional properties, a call that sends a fixed argument is refused before it reaches Composio.",
+    isOptional: true,
+  },
+  {
     name: 'resolveIdentity',
     type: '(input: { requestContext?: RequestContext; toolSlug: string; toolkit?: string }) => ComposioCallIdentity | undefined | Promise<ComposioCallIdentity | undefined>',
     description:
@@ -439,7 +446,7 @@ export const composioTools = await composio.resolveCatalogTools({
 ]}
 />
 
-`resolveCatalogTools()` returns the tools keyed by slug. It throws when `toolSlugs` contains a connection management tool, because those tools need a session owned by the caller. A call throws before it reaches Composio when `resolveIdentity` returns `undefined`, a blank user ID, or the reserved ID `__mastra_catalog_schema__` that the schemas are fetched under. `requireToolApproval` applies to catalog tools as well.
+`resolveCatalogTools()` returns the tools keyed by slug. It throws when `toolSlugs` contains a connection management tool, because those tools need a session owned by the caller. It also throws when `fixedArguments` names a tool outside `toolSlugs`, or an argument that isn't one of the tool's top-level input parameters, so a renamed Composio argument fails instead of going unset. A call throws before it reaches Composio when `resolveIdentity` returns `undefined`, a blank user ID, or the reserved ID `__mastra_catalog_schema__` that the schemas are fetched under. `requireToolApproval` applies to catalog tools as well.
 
 An approved call executes with the request context of the resumed run. Ensure that a resumed run carries the original caller's context.
 
