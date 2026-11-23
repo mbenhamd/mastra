@@ -479,6 +479,8 @@ describe('json-schema standard-schema adapter', () => {
       expect(await standardSchema['~standard'].validate(['not an email', null])).toEqual({
         value: ['not an email', null],
       });
+      expect('issues' in (await standardSchema['~standard'].validate([1, null]))).toBe(true);
+      expect('issues' in (await standardSchema['~standard'].validate(['a', 2]))).toBe(true);
     });
 
     it('resolves a $ref in a draft-07 dependency named like a keyword, and keeps property dependencies', async () => {
@@ -516,6 +518,7 @@ describe('json-schema standard-schema adapter', () => {
           other: { $ref: '#/components/schemas/properties' },
           // Literal data shaped like a reference is compared as written.
           tag: { const: { $ref: '#/properties/tag/const', id: 1 } },
+          pct: { const: { $ref: '#/%' }, examples: [{ $ref: '#/a%' }] },
         },
         components: {
           schemas: {
@@ -527,9 +530,10 @@ describe('json-schema standard-schema adapter', () => {
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
       const tag = { $ref: '#/properties/tag/const', id: 1 };
+      const pct = { $ref: '#/%' };
       for (const site of [null, 'not a url']) {
-        expect(await standardSchema['~standard'].validate({ site, other: site, tag })).toEqual({
-          value: { site, other: site, tag },
+        expect(await standardSchema['~standard'].validate({ site, other: site, tag, pct })).toEqual({
+          value: { site, other: site, tag, pct },
         });
       }
       expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);

@@ -15,7 +15,7 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c1719538
  exports.ignoredKeyword = {
      id: true,
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
-index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001f9cea5af 100644
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..cb56f532c9f8ed8d3c466d8602446b793b7296d0 100644
 --- a/dist/commonjs/validate.js
 +++ b/dist/commonjs/validate.js
 @@ -9,6 +9,62 @@ const ucs2_length_js_1 = require("./ucs2-length.js");
@@ -81,7 +81,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -36,7 +92,247 @@ function isMultipleOf(instance, divisor) {
+@@ -36,7 +92,256 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -202,15 +202,22 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
 +// annotations a reused result would not record.
 +// mbenhamd/mastra#631 (PF-9666): the reference targets that can reach
 +// themselves through subschemas and further references, found once per
-+// dereferenced document. Every nested object is followed, which can only add
-+// targets.
++// dereferenced document. Every nested object is followed, including literal
++// data shaped like a reference, which can only add targets; a reference that
++// does not resolve, such as a malformed pointer in a const value, adds none.
 +const recursiveTargetsByLookup = new WeakMap();
 +function referenceTarget(lookup, node) {
 +    if (typeof node.$ref !== 'string') {
 +        return undefined;
 +    }
 +    const uri = node.__absolute_ref__ || node.$ref;
-+    const target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    let target;
++    try {
++        target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    }
++    catch {
++        return undefined;
++    }
 +    return typeof target === 'object' && target !== null ? target : undefined;
 +}
 +function isRecursiveTarget(lookup, schema) {
@@ -293,6 +300,8 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
 +        activeMemo === false ||
 +        typeof schema !== 'object' ||
 +        schema === null ||
++        typeof instance !== 'object' ||
++        instance === null ||
 +        !(schema.$recursiveAnchor === true ||
 +            schema.$recursiveRef !== undefined ||
 +            isRecursiveTarget(lookup, schema))) {
@@ -329,7 +338,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -72,6 +368,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -72,6 +377,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceType = 'object';
              }
              break;
@@ -341,7 +350,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -85,7 +386,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -85,7 +395,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              ? lookup[__absolute_recursive_ref__]
              : recursiveAnchor;
          const keywordLocation = `${schemaLocation}/$recursiveRef`;
@@ -354,7 +363,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -97,7 +402,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -97,7 +411,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -363,7 +372,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -107,7 +412,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -107,7 +421,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              throw new Error(message);
          }
          const keywordLocation = `${schemaLocation}/$ref`;
@@ -376,7 +385,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -202,7 +511,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -202,7 +520,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -385,7 +394,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -214,28 +523,49 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -214,28 +532,49 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -445,7 +454,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          }
      }
      if ($allOf !== undefined) {
-@@ -243,7 +573,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -243,7 +582,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          const errorsLength = errors.length;
          let allValid = true;
          for (const [i, subSchema] of $allOf.entries()) {
@@ -454,7 +463,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
              const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
              errors.push(...result.errors);
              allValid = allValid && result.valid;
-@@ -264,27 +594,40 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -264,27 +603,40 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          }
      }
      if ($oneOf !== undefined) {
@@ -504,7 +513,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
          }
      }
      if (instanceType === 'object' || instanceType === 'array') {
-@@ -293,11 +636,15 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -293,11 +645,15 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -522,7 +531,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                  if (!thenResult.valid) {
                      errors.push({
                          instanceLocation,
-@@ -309,7 +656,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -309,7 +665,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          else if ($else !== undefined) {
@@ -535,7 +544,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
              if (!elseResult.valid) {
                  errors.push({
                      instanceLocation,
-@@ -323,7 +674,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -323,7 +683,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -544,7 +553,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -347,7 +698,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -347,7 +707,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -553,7 +562,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
              });
          }
          if ($propertyNames !== undefined) {
-@@ -368,10 +719,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -368,10 +728,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -566,7 +575,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -386,8 +737,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -386,8 +746,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
@@ -581,7 +590,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                      if (!result.valid) {
                          errors.push({
                              instanceLocation,
-@@ -402,11 +757,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -402,11 +766,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -595,7 +604,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -438,6 +793,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -438,6 +802,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -609,7 +618,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
                  const subInstancePointer = `${instanceLocation}/${(0, pointer_js_1.encodePointer)(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`);
                  thisEvaluated[key] = true;
-@@ -698,26 +1060,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -698,26 +1069,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          if ($uniqueItems) {
@@ -644,7 +653,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001
              }
          }
      }
-@@ -828,6 +1178,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -828,6 +1187,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              });
          }
      }
@@ -675,7 +684,7 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa
  export const ignoredKeyword = {
      id: true,
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
-index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d093d39fe8e 100644
+index 78c71b00e321ff99db657484d299c1684a4ef07e..073a825c3ca9da9a0ee56e65ab521fa04b9aaba1 100644
 --- a/dist/esm/validate.js
 +++ b/dist/esm/validate.js
 @@ -6,6 +6,62 @@ import { ucs2length } from './ucs2-length.js';
@@ -741,7 +750,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -33,7 +89,247 @@ function isMultipleOf(instance, divisor) {
+@@ -33,7 +89,256 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -862,15 +871,22 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
 +// annotations a reused result would not record.
 +// mbenhamd/mastra#631 (PF-9666): the reference targets that can reach
 +// themselves through subschemas and further references, found once per
-+// dereferenced document. Every nested object is followed, which can only add
-+// targets.
++// dereferenced document. Every nested object is followed, including literal
++// data shaped like a reference, which can only add targets; a reference that
++// does not resolve, such as a malformed pointer in a const value, adds none.
 +const recursiveTargetsByLookup = new WeakMap();
 +function referenceTarget(lookup, node) {
 +    if (typeof node.$ref !== 'string') {
 +        return undefined;
 +    }
 +    const uri = node.__absolute_ref__ || node.$ref;
-+    const target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    let target;
++    try {
++        target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    }
++    catch {
++        return undefined;
++    }
 +    return typeof target === 'object' && target !== null ? target : undefined;
 +}
 +function isRecursiveTarget(lookup, schema) {
@@ -953,6 +969,8 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
 +        activeMemo === false ||
 +        typeof schema !== 'object' ||
 +        schema === null ||
++        typeof instance !== 'object' ||
++        instance === null ||
 +        !(schema.$recursiveAnchor === true ||
 +            schema.$recursiveRef !== undefined ||
 +            isRecursiveTarget(lookup, schema))) {
@@ -989,7 +1007,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -69,6 +365,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -69,6 +374,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceType = 'object';
              }
              break;
@@ -1001,7 +1019,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -82,7 +383,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -82,7 +392,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              ? lookup[__absolute_recursive_ref__]
              : recursiveAnchor;
          const keywordLocation = `${schemaLocation}/$recursiveRef`;
@@ -1014,7 +1032,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -94,7 +399,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -94,7 +408,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -1023,7 +1041,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -104,7 +409,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -104,7 +418,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              throw new Error(message);
          }
          const keywordLocation = `${schemaLocation}/$ref`;
@@ -1036,7 +1054,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -199,7 +508,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -199,7 +517,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -1045,7 +1063,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -211,28 +520,49 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -211,28 +529,49 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -1105,7 +1123,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          }
      }
      if ($allOf !== undefined) {
-@@ -240,7 +570,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -240,7 +579,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          const errorsLength = errors.length;
          let allValid = true;
          for (const [i, subSchema] of $allOf.entries()) {
@@ -1114,7 +1132,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
              const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
              errors.push(...result.errors);
              allValid = allValid && result.valid;
-@@ -261,27 +591,40 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -261,27 +600,40 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          }
      }
      if ($oneOf !== undefined) {
@@ -1164,7 +1182,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
          }
      }
      if (instanceType === 'object' || instanceType === 'array') {
-@@ -290,11 +633,15 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -290,11 +642,15 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -1182,7 +1200,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                  if (!thenResult.valid) {
                      errors.push({
                          instanceLocation,
-@@ -306,7 +653,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -306,7 +662,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          else if ($else !== undefined) {
@@ -1195,7 +1213,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
              if (!elseResult.valid) {
                  errors.push({
                      instanceLocation,
-@@ -320,7 +671,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -320,7 +680,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -1204,7 +1222,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -344,7 +695,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -344,7 +704,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -1213,7 +1231,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
              });
          }
          if ($propertyNames !== undefined) {
-@@ -365,10 +716,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -365,10 +725,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -1226,7 +1244,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -383,8 +734,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -383,8 +743,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
@@ -1241,7 +1259,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                      if (!result.valid) {
                          errors.push({
                              instanceLocation,
-@@ -399,11 +754,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -399,11 +763,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -1255,7 +1273,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -435,6 +790,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -435,6 +799,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -1269,7 +1287,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
                  const subInstancePointer = `${instanceLocation}/${encodePointer(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${encodePointer(key)}`);
                  thisEvaluated[key] = true;
-@@ -695,26 +1057,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -695,26 +1066,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          if ($uniqueItems) {
@@ -1304,7 +1322,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d09
              }
          }
      }
-@@ -825,6 +1175,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -825,6 +1184,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              });
          }
      }

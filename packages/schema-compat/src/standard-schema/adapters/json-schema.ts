@@ -79,7 +79,7 @@ const SCHEMA_MAP_KEYWORDS = [
 ] as const;
 
 /** Keywords whose value is literal data the validator compares or skips, never a schema. */
-const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum']);
+const DATA_KEYWORDS = new Set<string>(['const', 'default', 'enum', 'examples']);
 
 /**
  * Thrown for a schema that uses `$dynamicRef`. `@cfworker/json-schema` does not
@@ -176,7 +176,14 @@ function normalizeLocalRefTargets(root: unknown): void {
     if (typeof ref === 'string' && ref.startsWith('#/')) {
       let target: unknown = root;
       for (const token of ref.slice(2).split('/')) {
-        const name = decodeURIComponent(token).replace(/~1/g, '/').replace(/~0/g, '~');
+        let decoded: string;
+        try {
+          decoded = decodeURIComponent(token);
+        } catch {
+          target = undefined;
+          break;
+        }
+        const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
         target =
           typeof target === 'object' && target !== null && Object.hasOwn(target, name)
             ? (target as Record<string, unknown>)[name]
