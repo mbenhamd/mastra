@@ -195,6 +195,8 @@ function normalizeLocalRefTargets(root: unknown): void {
     const ref = isNameMap ? undefined : record.$ref;
     if (typeof ref === 'string' && ref.startsWith('#/')) {
       let target: unknown = root;
+      // Whether the previous token named a name map, so this one is a name, not a keyword.
+      let inNameMap = false;
       for (const token of ref.slice(2).split('/')) {
         let decoded: string;
         try {
@@ -204,6 +206,13 @@ function normalizeLocalRefTargets(root: unknown): void {
           break;
         }
         const name = decoded.replace(/~1/g, '/').replace(/~0/g, '~');
+        // A pointer into literal data (`const`, `enum`, ...) names a value, not a schema:
+        // normalising it would change the value compared, such as dropping its `id`.
+        if (!inNameMap && DATA_KEYWORDS.has(name)) {
+          target = undefined;
+          break;
+        }
+        inNameMap = !inNameMap && SCHEMA_MAP_KEYWORD_SET.has(name);
         target =
           typeof target === 'object' && target !== null && Object.hasOwn(target, name)
             ? (target as Record<string, unknown>)[name]

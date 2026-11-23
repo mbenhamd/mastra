@@ -584,6 +584,24 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ site, code: 'd' }))).toBe(true);
     });
 
+    it('leaves literal data alone when an annotation $ref points into it', async () => {
+      const standardSchema = toStandardSchema({
+        type: 'object',
+        properties: {
+          tag: { const: { id: 'expected' }, 'x-meta': { $ref: '#/properties/tag/const' } },
+          // A property named like a data keyword is still a schema.
+          default: { type: 'string', nullable: true },
+          other: { $ref: '#/properties/default' },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ tag: { id: 'expected' }, other: null })).toEqual({
+        value: { tag: { id: 'expected' }, other: null },
+      });
+      expect('issues' in (await standardSchema['~standard'].validate({ tag: {} }))).toBe(true);
+    });
+
     it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
