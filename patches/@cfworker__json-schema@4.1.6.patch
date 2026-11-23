@@ -1,5 +1,5 @@
 diff --git a/dist/commonjs/dereference.js b/dist/commonjs/dereference.js
-index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c17195383e1fb7ca 100644
+index 1614c8339a4a376e682f09115218c09f9c5ef4f7..ed01a9559a41feebfa399ae474b91ee04d638e2f 100644
 --- a/dist/commonjs/dereference.js
 +++ b/dist/commonjs/dereference.js
 @@ -57,7 +57,10 @@ exports.schemaMapKeyword = {
@@ -14,6 +14,64 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c1719538
  };
  exports.ignoredKeyword = {
      id: true,
+@@ -68,6 +71,10 @@ exports.ignoredKeyword = {
+     $vocabulary: true,
+     $comment: true,
+     default: true,
++    // mbenhamd/mastra#631 (PF-9666): examples holds literal values, which Ajv
++    // never read as schemas. Walked as schemas, two examples with the same `id`
++    // made every validation fail with a duplicate schema URI.
++    examples: true,
+     enum: true,
+     const: true,
+     required: true,
+@@ -100,7 +107,13 @@ function dereference(schema, lookup = Object.create(null), baseURI = exports.ini
+         if (id) {
+             const url = resolveURI(id, baseURI);
+             if (url.hash.length > 1) {
+-                lookup[url.href] = schema;
++                // mbenhamd/mastra#631 (PF-9666): a fragment that is a JSON
++                // Pointer names a location, not this schema. Registered, it
++                // replaced the schema a `#/...` reference to that location
++                // reaches, so values passed that the real target refuses.
++                if (url.hash[1] !== '/') {
++                    lookup[url.href] = schema;
++                }
+             }
+             else {
+                 url.hash = '';
+@@ -108,7 +121,19 @@ function dereference(schema, lookup = Object.create(null), baseURI = exports.ini
+                     baseURI = url;
+                 }
+                 else {
++                    // mbenhamd/mastra#631 (PF-9666): a schema with its own `$id`
++                    // is walked once, under that `$id`, and registered under the
++                    // outer pointer only by itself. Walking its subschemas again
++                    // under the outer base doubled the work at every nested
++                    // `$id`. A pointer from the outer document into it still
++                    // resolves through the pointer fallback in validate.js.
+                     dereference(schema, lookup, baseURI);
++                    const outerURI = baseURI.href + '#' + basePointer;
++                    if (lookup[outerURI] !== undefined && lookup[outerURI] !== schema) {
++                        throw new Error(`Duplicate schema URI "${outerURI}".`);
++                    }
++                    lookup[outerURI] = schema;
++                    return lookup;
+                 }
+             }
+         }
+@@ -144,7 +169,10 @@ function dereference(schema, lookup = Object.create(null), baseURI = exports.ini
+             value: url.href
+         });
+     }
+-    if (schema.$anchor) {
++    // mbenhamd/mastra#631 (PF-9666): an anchor starting with "/" is not a valid
++    // anchor name; registered, it would replace the schema a `#/...` reference
++    // to that JSON Pointer reaches, as a pointer-shaped `$id` fragment would.
++    if (schema.$anchor && !String(schema.$anchor).startsWith('/')) {
+         const url = resolveURI('#' + schema.$anchor, baseURI);
+         lookup[url.href] = schema;
+     }
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
 index 1abb284311bf653d9a9d67c52d79c99a7db29c68..6099ce16955d318eca905b310c67e9c37d1954bc 100644
 --- a/dist/commonjs/validate.js
@@ -677,7 +735,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..6099ce16955d318eca905b310c67e9c3
      }
      return { valid: errors.length === 0, errors };
 diff --git a/dist/esm/dereference.js b/dist/esm/dereference.js
-index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa46322456 100644
+index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..c686dfbb6a9a2f086cd0f115ae852673d717e933 100644
 --- a/dist/esm/dereference.js
 +++ b/dist/esm/dereference.js
 @@ -53,7 +53,10 @@ export const schemaMapKeyword = {
@@ -692,6 +750,64 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa
  };
  export const ignoredKeyword = {
      id: true,
+@@ -64,6 +67,10 @@ export const ignoredKeyword = {
+     $vocabulary: true,
+     $comment: true,
+     default: true,
++    // mbenhamd/mastra#631 (PF-9666): examples holds literal values, which Ajv
++    // never read as schemas. Walked as schemas, two examples with the same `id`
++    // made every validation fail with a duplicate schema URI.
++    examples: true,
+     enum: true,
+     const: true,
+     required: true,
+@@ -96,7 +103,13 @@ export function dereference(schema, lookup = Object.create(null), baseURI = init
+         if (id) {
+             const url = resolveURI(id, baseURI);
+             if (url.hash.length > 1) {
+-                lookup[url.href] = schema;
++                // mbenhamd/mastra#631 (PF-9666): a fragment that is a JSON
++                // Pointer names a location, not this schema. Registered, it
++                // replaced the schema a `#/...` reference to that location
++                // reaches, so values passed that the real target refuses.
++                if (url.hash[1] !== '/') {
++                    lookup[url.href] = schema;
++                }
+             }
+             else {
+                 url.hash = '';
+@@ -104,7 +117,19 @@ export function dereference(schema, lookup = Object.create(null), baseURI = init
+                     baseURI = url;
+                 }
+                 else {
++                    // mbenhamd/mastra#631 (PF-9666): a schema with its own `$id`
++                    // is walked once, under that `$id`, and registered under the
++                    // outer pointer only by itself. Walking its subschemas again
++                    // under the outer base doubled the work at every nested
++                    // `$id`. A pointer from the outer document into it still
++                    // resolves through the pointer fallback in validate.js.
+                     dereference(schema, lookup, baseURI);
++                    const outerURI = baseURI.href + '#' + basePointer;
++                    if (lookup[outerURI] !== undefined && lookup[outerURI] !== schema) {
++                        throw new Error(`Duplicate schema URI "${outerURI}".`);
++                    }
++                    lookup[outerURI] = schema;
++                    return lookup;
+                 }
+             }
+         }
+@@ -140,7 +165,10 @@ export function dereference(schema, lookup = Object.create(null), baseURI = init
+             value: url.href
+         });
+     }
+-    if (schema.$anchor) {
++    // mbenhamd/mastra#631 (PF-9666): an anchor starting with "/" is not a valid
++    // anchor name; registered, it would replace the schema a `#/...` reference
++    // to that JSON Pointer reaches, as a pointer-shaped `$id` fragment would.
++    if (schema.$anchor && !String(schema.$anchor).startsWith('/')) {
+         const url = resolveURI('#' + schema.$anchor, baseURI);
+         lookup[url.href] = schema;
+     }
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
 index 78c71b00e321ff99db657484d299c1684a4ef07e..9524de3a65528af19a96beae95078b21e2ed6afb 100644
 --- a/dist/esm/validate.js

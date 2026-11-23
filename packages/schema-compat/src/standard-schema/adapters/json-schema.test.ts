@@ -644,6 +644,52 @@ describe('json-schema standard-schema adapter', () => {
       expect(await valid(anchored, { n: 6 })).toBe(false);
     });
 
+    it('keeps $id, examples and a schema named id from changing what a $ref reaches', async () => {
+      const valid = async (schema: JSONSchema7, value: unknown) => {
+        const standardSchema = toStandardSchema(schema);
+        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+        return !('issues' in (await standardSchema['~standard'].validate(value)));
+      };
+      // A $id whose fragment is a JSON Pointer does not replace the schema at that location.
+      const pointerId = {
+        type: 'object',
+        properties: { a: { type: 'string' }, c: { $ref: '#/properties/a' } },
+        definitions: { z: { $id: '#/properties/a' } },
+      } as JSONSchema7;
+      expect(await valid(pointerId, { c: 's' })).toBe(true);
+      expect(await valid(pointerId, { c: 1 })).toBe(false);
+      // Two OpenAPI examples with the same id are literal values, not schemas.
+      const examples = {
+        type: 'object',
+        properties: { user: { $ref: '#/components/schemas/User' } },
+        components: {
+          schemas: { User: { type: 'object', properties: { id: { type: 'integer' } } } },
+          examples: { a: { value: { id: 1 } }, b: { value: { id: 1 } } },
+        },
+      } as JSONSchema7;
+      expect(await valid(examples, { user: { id: 1 } })).toBe(true);
+      expect(await valid(examples, { user: { id: 'x' } })).toBe(false);
+      // A boolean schema named id stays the target of a $ref to it.
+      const boolId = {
+        type: 'object',
+        properties: { a: { $ref: '#/definitions/id' } },
+        definitions: { id: false },
+      } as JSONSchema7;
+      expect(await valid(boolId, {})).toBe(true);
+      expect(await valid(boolId, { a: 1 })).toBe(false);
+    });
+
+    it('validates a schema with 40 nested $id resources', { timeout: 60_000 }, async () => {
+      // Walking each $id resource once per enclosing base would take 2^40 steps.
+      let schema: Record<string, unknown> = { type: 'string' };
+      for (let i = 0; i < 40; i++) {
+        schema = { $id: `http://e.x/l${i}`, type: 'object', properties: { a: schema } };
+      }
+      const standardSchema = toStandardSchema(schema as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      expect('issues' in (await standardSchema['~standard'].validate({}))).toBe(false);
+    });
+
     it('leaves literal data alone when an annotation $ref points into it', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',

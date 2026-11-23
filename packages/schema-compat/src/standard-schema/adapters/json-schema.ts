@@ -336,18 +336,20 @@ function forEachObject(root: unknown, visit: (node: object) => void): void {
  * object the validator can read as a schema, leaving name maps and literal data alone. An
  * object the schema reads both as a schema (through a `$ref`) and as a name map or literal
  * data, such as the target of `{ $ref: '#/properties' }`, is left as written for the name map
- * or the data. Left as written, `nullable`, `format` and `id` can only refuse more values, but
- * a boolean `exclusiveMinimum` or `exclusiveMaximum` would be compared as the number 1 or 0
- * and let values pass, so such a schema is refused.
+ * or the data. Left as written, `nullable`, `format` and `id` refuse more values there, and so
+ * let more through under `not`, `oneOf` or `if`; a boolean `exclusiveMinimum` or
+ * `exclusiveMaximum` would be compared as the number 1 or 0 and let values pass directly, so
+ * such a schema is refused.
  */
 function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => Lookup): void {
-  // References are resolved on a copy without an `id` that is not an object, which normalisation drops from
-  // every object the validator reads as a schema, so `dereference` sees the `$id` bases it will
-  // see. Any other difference is caught by the check at the end.
+  // References are resolved on a copy without a string or number `id`, which normalisation
+  // drops from every object the validator reads as a schema, so `dereference` sees the `$id`
+  // bases it will see. An object or boolean under the name `id` stays: it can be a property's
+  // schema. Any other difference is caught by the check at the end.
   const copy = structuredClone(root);
   forEachObject(copy, node => {
     const id = Array.isArray(node) ? undefined : (node as Record<string, unknown>).id;
-    if (id !== undefined && (typeof id !== 'object' || id === null)) {
+    if (typeof id === 'string' || typeof id === 'number') {
       delete (node as Record<string, unknown>).id;
     }
   });
