@@ -608,6 +608,42 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in (await standardSchema['~standard'].validate({ site, code: 'd' }))).toBe(true);
     });
 
+    it('reads a target reached by an absolute, relative or anchor $ref with the role the validator gives it', async () => {
+      const valid = async (schema: JSONSchema7, value: unknown) => {
+        const standardSchema = toStandardSchema(schema);
+        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+        return !('issues' in (await standardSchema['~standard'].validate(value)));
+      };
+      // A name map read as a schema keeps the literal data under it as written.
+      for (const $ref of ['http://x.test/root#/definitions', 'root#/definitions']) {
+        const schema = {
+          $id: 'http://x.test/root',
+          type: 'object',
+          properties: { v: { $ref } },
+          required: ['v'],
+          definitions: { const: { type: 'string', nullable: true, format: 'email' } },
+        } as JSONSchema7;
+        expect(await valid(schema, { v: { type: 'string', nullable: true, format: 'email' } })).toBe(true);
+        expect(await valid(schema, { v: { type: ['string', 'null'], nullable: true } })).toBe(false);
+      }
+      // A component named like a keyword reached by an absolute URI excludes its bound.
+      const bounded = {
+        $id: 'http://x.test/root',
+        type: 'object',
+        properties: { n: { $ref: 'http://x.test/root#/components/schemas/properties' } },
+        components: { schemas: { properties: { type: 'number', minimum: 5, exclusiveMinimum: true } } },
+      } as JSONSchema7;
+      expect(await valid(bounded, { n: 6 })).toBe(true);
+      expect(await valid(bounded, { n: 5 })).toBe(false);
+      // An anchor on literal data that holds a boolean bound is refused.
+      const anchored = {
+        type: 'object',
+        properties: { n: { $ref: '#lim' } },
+        examples: { a: { $anchor: 'lim', minimum: 5, exclusiveMinimum: true } },
+      } as JSONSchema7;
+      expect(await valid(anchored, { n: 6 })).toBe(false);
+    });
+
     it('leaves literal data alone when an annotation $ref points into it', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',

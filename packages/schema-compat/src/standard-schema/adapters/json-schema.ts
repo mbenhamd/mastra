@@ -18,10 +18,12 @@ const VENDOR = 'json-schema';
  * {@link jsonSchemaValidatorLoading} is true.
  */
 let ValidatorClass: typeof Validator | undefined;
+let dereferenceSchema: ((schema: Schema) => Lookup) | undefined;
 let validatorUnavailableReason = 'still loading';
 const validatorLoad: Promise<void> = import('@cfworker/json-schema').then(
   module => {
     ValidatorClass = module.Validator;
+    dereferenceSchema = module.dereference;
   },
   (error: unknown) => {
     validatorUnavailableReason = error instanceof Error ? error.message : String(error);
@@ -182,6 +184,9 @@ function normalizeSchemaObject(record: Record<string, unknown>): void {
   delete record.id;
 }
 
+const REF_PLACEMENT_MESSAGE =
+  'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused';
+
 const REF_ROLE_CONFLICT_MESSAGE =
   'a $ref target that the schema also uses as a name map or as literal data holds a boolean exclusiveMinimum or exclusiveMaximum, which cannot be read both ways, so the schema is refused';
 
@@ -192,18 +197,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * What an object is to the validator. `schema`, `names` (a name map's own keys) and `data`
  * (literal data under `const`, `enum`, `default` or `examples`) come from reading the schema
- * from its root and from every local `$ref` (`#/...`) at a schema position. The `weak` roles
- * cover the rest, such as `components` or `x-meta`, which the validator reads only through a
- * reference this walk does not follow (an absolute URI, for example): there an object is
- * normalised as a schema unless it sits under a name-map or data keyword.
+ * from its root and from every `$ref` and `$recursiveRef` at a schema position, resolved as the
+ * validator resolves them: against `$id` bases and `$anchor`s, then by JSON Pointer. The `weak`
+ * roles cover objects that reading never reaches, such as an unused `components` or `x-meta`:
+ * there an object is normalised as a schema unless it sits under a name-map or data keyword.
  */
 type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
-/** Returns the role of every object, reading the schema from its root and its local `$ref`s. */
-function assignRoles(root: unknown): Map<object, Set<Role>> {
+/** Returns the role of every object, reading the schema from its root and through its references. */
+function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) => unknown[]): Map<object, Set<Role>> {
   const roles = new Map<object, Set<Role>>();
   const pending: unknown[] = [];
-  const resolved = new Set<string>();
   const mark = (node: object, role: Role): boolean => {
     let set = roles.get(node);
     if (!set) {
@@ -254,36 +258,77 @@ function assignRoles(root: unknown): Map<object, Set<Role>> {
         walk(value, 'weak');
       }
     }
-    const ref = role === 'schema' ? record.$ref : undefined;
-    if (typeof ref === 'string' && ref.startsWith('#/') && !resolved.has(ref)) {
-      resolved.add(ref);
-      pending.push(resolvePointer(root, ref));
+    if (role === 'schema') {
+      pending.push(...targetsOf(record));
     }
   };
   walk(root, 'schema');
-  // Each reference is resolved once, so the walk stays linear in the size of the schema.
+  // Each object is walked once per role, so the walk stays linear in the size of the schema.
   while (pending.length > 0) {
     walk(pending.pop(), 'schema');
   }
   return roles;
 }
 
-/** Follows a local JSON Pointer (`#/a/b`); `undefined` when it does not resolve. */
-function resolvePointer(root: unknown, ref: string): unknown {
-  let target: unknown = root;
-  for (const token of ref.slice(2).split('/')) {
+type Lookup = Record<string, unknown>;
+
+/**
+ * The validator's fallback for a reference missing from its lookup (see the cfworker patch):
+ * the JSON Pointer in the fragment, walked from the document the URI names.
+ */
+function resolveByPointer(lookup: Lookup, uri: string): unknown {
+  const hash = uri.indexOf('#');
+  if (hash < 0 || uri[hash + 1] !== '/') {
+    return undefined;
+  }
+  let node: unknown = lookup[uri.slice(0, hash)];
+  for (const token of uri.slice(hash + 2).split('/')) {
     let name: string;
     try {
       name = decodeURIComponent(token).replace(/~1/g, '/').replace(/~0/g, '~');
     } catch {
       return undefined;
     }
-    if (typeof target !== 'object' || target === null || !Object.hasOwn(target, name)) {
+    if (typeof node !== 'object' || node === null || !Object.hasOwn(node, name)) {
       return undefined;
     }
-    target = (target as Record<string, unknown>)[name];
+    node = (node as Record<string, unknown>)[name];
   }
-  return target;
+  return node;
+}
+
+/**
+ * What the `$ref` and `$recursiveRef` on `node` resolve to, as the validator resolves them after
+ * `dereference` recorded their absolute URIs on the object. A `$recursiveRef` can also land on
+ * an outer `$recursiveAnchor` schema, which is read as a schema anyway.
+ */
+function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknown[] {
+  const targets: unknown[] = [];
+  if (typeof node.$ref === 'string') {
+    const uri = typeof node.__absolute_ref__ === 'string' ? node.__absolute_ref__ : node.$ref;
+    targets.push(lookup[uri] ?? resolveByPointer(lookup, uri));
+  }
+  if (typeof node.__absolute_recursive_ref__ === 'string') {
+    targets.push(lookup[node.__absolute_recursive_ref__]);
+  }
+  return targets;
+}
+
+/** Walks every object and array once, plain objects and arrays alike. */
+function forEachObject(root: unknown, visit: (node: object) => void): void {
+  const seen = new Set<object>();
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+    visit(node);
+    for (const value of Object.values(node)) {
+      stack.push(value);
+    }
+  }
 }
 
 /**
@@ -295,8 +340,43 @@ function resolvePointer(root: unknown, ref: string): unknown {
  * a boolean `exclusiveMinimum` or `exclusiveMaximum` would be compared as the number 1 or 0
  * and let values pass, so such a schema is refused.
  */
-function normalizeSchemaObjects(root: unknown): void {
-  for (const [node, set] of assignRoles(root)) {
+function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => Lookup): void {
+  // References are resolved on a copy without an `id` that is not an object, which normalisation drops from
+  // every object the validator reads as a schema, so `dereference` sees the `$id` bases it will
+  // see. Any other difference is caught by the check at the end.
+  const copy = structuredClone(root);
+  forEachObject(copy, node => {
+    const id = Array.isArray(node) ? undefined : (node as Record<string, unknown>).id;
+    if (id !== undefined && (typeof id !== 'object' || id === null)) {
+      delete (node as Record<string, unknown>).id;
+    }
+  });
+  const copyLookup = dereference(copy);
+  const toCopy = new Map<unknown, unknown>();
+  const toRoot = new Map<unknown, unknown>();
+  const pairs: Array<[unknown, unknown]> = [[root, copy]];
+  while (pairs.length > 0) {
+    const [node, twin] = pairs.pop()!;
+    if (typeof node !== 'object' || node === null || toCopy.has(node)) {
+      continue;
+    }
+    toCopy.set(node, twin);
+    toRoot.set(twin, node);
+    for (const [key, value] of Object.entries(node)) {
+      pairs.push([value, (twin as Record<string, unknown>)[key]]);
+    }
+  }
+  const predicted = new Map<object, unknown[]>();
+  const targetsOf = (node: Record<string, unknown>): unknown[] => {
+    const twin = toCopy.get(node);
+    const targets = isPlainObject(twin)
+      ? referenceTargets(twin, copyLookup).map(target => (toRoot.has(target) ? toRoot.get(target) : target))
+      : [];
+    predicted.set(node, targets);
+    return targets;
+  };
+  const roles = assignRoles(root, targetsOf);
+  for (const [node, set] of roles) {
     if (Array.isArray(node)) {
       continue;
     }
@@ -312,6 +392,16 @@ function normalizeSchemaObjects(root: unknown): void {
       continue;
     }
     normalizeSchemaObject(record);
+  }
+  // The validator resolves references on the normalised schema. A reference that lands
+  // anywhere else than where the roles were read from, for example because a dropped `id`
+  // held a base URI, is refused rather than read with the wrong roles.
+  const lookup = dereference(root);
+  for (const [node, targets] of predicted) {
+    const actual = referenceTargets(node as Record<string, unknown>, lookup);
+    if (actual.length !== targets.length || actual.some((target, index) => !Object.is(target, targets[index]))) {
+      throw new Error(REF_PLACEMENT_MESSAGE);
+    }
   }
 }
 
@@ -330,9 +420,9 @@ function normalizeSchemaObjects(root: unknown): void {
  * or `format` keeps its schema, and a `$ref` target is read like any other
  * subschema (see `normalizeSchemaObjects`).
  */
-function toValidationSchema(schema: JSONSchema7): Schema {
+function toValidationSchema(schema: JSONSchema7, dereference: (schema: Schema) => Lookup): Schema {
   const copy = structuredClone(schema) as Schema;
-  normalizeSchemaObjects(copy);
+  normalizeSchemaObjects(copy, dereference);
   return copy;
 }
 
@@ -563,13 +653,13 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    */
   #getValidator(): Validator {
     if (!this.#validator) {
-      if (!ValidatorClass) {
+      if (!ValidatorClass || !dereferenceSchema) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
       // Checked on the original, before the copy is normalised, so a `$dynamicRef`
       // anywhere in it is refused.
       refuseDynamicRef(this.#schema);
-      const validationSchema = toValidationSchema(this.#schema);
+      const validationSchema = toValidationSchema(this.#schema, dereferenceSchema);
       this.#validator = new ValidatorClass(validationSchema, '2020-12', false);
     }
     return this.#validator;
