@@ -78,11 +78,12 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
    * at, keyed by toolkit slug (for example `{ gmail: '20261120_00' }`).
    * Forwarded to both Composio clients.
    *
-   * Without it the SDK reads `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>` from the
-   * environment, and any toolkit still unmapped runs Composio's `latest`
-   * version: provider execution skips the SDK's version check. A host that
-   * must not follow Composio's schema changes unannounced maps every toolkit
-   * it offers.
+   * The SDK lays this map over its `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>`
+   * environment values, key by key, with the map winning. A toolkit in
+   * neither runs Composio's `latest` version: provider execution skips the
+   * SDK's version check. Slugs match case-insensitively but are otherwise
+   * compared as written. A host that must not follow Composio's schema
+   * changes unannounced maps every toolkit it offers.
    */
   toolkitVersions?: Readonly<Record<string, string>>;
 }
