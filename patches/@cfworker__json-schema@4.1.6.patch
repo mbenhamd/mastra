@@ -15,7 +15,7 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c1719538
  exports.ignoredKeyword = {
      id: true,
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
-index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894a9f3b39e 100644
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..4a105c6ede2be065f24bad3b1a593001f9cea5af 100644
 --- a/dist/commonjs/validate.js
 +++ b/dist/commonjs/validate.js
 @@ -9,6 +9,62 @@ const ucs2_length_js_1 = require("./ucs2-length.js");
@@ -81,7 +81,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -36,7 +92,167 @@ function isMultipleOf(instance, divisor) {
+@@ -36,7 +92,247 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -188,19 +188,94 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +    }
 +    return pair;
 +}
-+// mbenhamd/mastra#631 (PF-9666): within one top-level call, the schema a $ref
-+// or $recursiveRef resolves to is validated against each instance at most once
-+// per instance location, shortCircuit mode and recursive anchor while the
-+// branches of an anyOf or oneOf are checked, and the result is reused. A
-+// recursive anyOf or oneOf reaches every level through a reference and
-+// validated the same child once per branch at every level, so valid and
-+// invalid input took time exponential in the nesting depth. Outside a union no
-+// value is checked twice, so nothing is kept there. A reused result is the
-+// same except that its errors keep the keywordLocation of the first
++// mbenhamd/mastra#631 (PF-9666): within one top-level call, a schema that a
++// $ref or $recursiveRef resolves to and that can reach itself through further
++// references is validated against each instance at most twice per instance
++// location, shortCircuit mode and recursive anchor: the first visit only
++// records the value, and the result of the second is reused.
++// A recursive schema whose anyOf, oneOf or allOf branches reach the same child
++// validated that child once per branch at every level, so input took time
++// exponential in its nesting depth. Without a reference cycle the nesting is
++// bounded by the schema itself, so other targets are not kept. A reused result
++// is the same except that its errors keep the keywordLocation of the first
 +// evaluation. Not used when the schema has an unevaluated keyword, which reads
 +// annotations a reused result would not record.
++// mbenhamd/mastra#631 (PF-9666): the reference targets that can reach
++// themselves through subschemas and further references, found once per
++// dereferenced document. Every nested object is followed, which can only add
++// targets.
++const recursiveTargetsByLookup = new WeakMap();
++function referenceTarget(lookup, node) {
++    if (typeof node.$ref !== 'string') {
++        return undefined;
++    }
++    const uri = node.__absolute_ref__ || node.$ref;
++    const target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    return typeof target === 'object' && target !== null ? target : undefined;
++}
++function isRecursiveTarget(lookup, schema) {
++    let targets = recursiveTargetsByLookup.get(lookup);
++    if (targets === undefined) {
++        targets = new Set();
++        const nodes = new Set();
++        const pending = Object.values(lookup);
++        while (pending.length > 0) {
++            const node = pending.pop();
++            if (typeof node === 'object' && node !== null && !nodes.has(node)) {
++                nodes.add(node);
++                pending.push(...Object.values(node));
++            }
++        }
++        const referenced = new Set();
++        for (const node of nodes) {
++            const target = referenceTarget(lookup, node);
++            if (target !== undefined) {
++                referenced.add(target);
++            }
++        }
++        for (const target of referenced) {
++            const visited = new Set();
++            const next = [target];
++            while (next.length > 0) {
++                const node = next.pop();
++                if (visited.has(node)) {
++                    continue;
++                }
++                visited.add(node);
++                const children = Object.values(node);
++                const linked = referenceTarget(lookup, node);
++                if (linked !== undefined) {
++                    children.push(linked);
++                }
++                if (children.includes(target)) {
++                    targets.add(target);
++                    break;
++                }
++                for (const child of children) {
++                    if (typeof child === 'object' && child !== null) {
++                        next.push(child);
++                    }
++                }
++            }
++        }
++        recursiveTargetsByLookup.set(lookup, targets);
++    }
++    return targets.has(schema);
++}
++const anchorIds = new WeakMap();
++let nextAnchorId = 0;
++function anchorId(anchor) {
++    if (anchor === null) {
++        return '';
++    }
++    let id = anchorIds.get(anchor);
++    if (id === undefined) {
++        id = `${nextAnchorId++}:`;
++        anchorIds.set(anchor, id);
++    }
++    return id;
++}
 +let activeMemo = null;
-+let unionDepth = 0;
  function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_js_1.dereference)(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
 +    if (activeMemo === null) {
 +        activeMemo = usesUnevaluated(lookup) ? false : new Map();
@@ -209,7 +284,6 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +        }
 +        finally {
 +            activeMemo = null;
-+            unionDepth = 0;
 +        }
 +    }
 +    return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
@@ -217,9 +291,11 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +function validateRef(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated) {
 +    if (activeMemo === null ||
 +        activeMemo === false ||
-+        unionDepth === 0 ||
 +        typeof schema !== 'object' ||
-+        schema === null) {
++        schema === null ||
++        !(schema.$recursiveAnchor === true ||
++            schema.$recursiveRef !== undefined ||
++            isRecursiveTarget(lookup, schema))) {
 +        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
 +    }
 +    let bySchema = activeMemo.get(schema);
@@ -227,21 +303,25 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +        bySchema = new Map();
 +        activeMemo.set(schema, bySchema);
 +    }
-+    let byInstance = bySchema.get(instance);
-+    if (byInstance === undefined) {
-+        byInstance = new Map();
-+        bySchema.set(instance, byInstance);
++    // Most values are reached once: the first visit only marks the value, and
++    // results are kept from the second visit on.
++    const entry = bySchema.get(instance);
++    if (entry === undefined) {
++        bySchema.set(instance, true);
++        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
 +    }
-+    let byAnchor = byInstance.get(recursiveAnchor);
-+    if (byAnchor === undefined) {
-+        byAnchor = new Map();
-+        byInstance.set(recursiveAnchor, byAnchor);
++    const key = (shortCircuit ? 's' : 'a') + anchorId(recursiveAnchor) + instanceLocation;
++    const kept = entry === true ? undefined : entry.get(key);
++    if (kept !== undefined) {
++        return kept;
 +    }
-+    const key = (shortCircuit ? 's' : 'a') + instanceLocation;
-+    let result = byAnchor.get(key);
-+    if (result === undefined) {
-+        result = validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
-+        byAnchor.set(key, result);
++    const result = validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
++    const current = bySchema.get(instance);
++    if (current === true) {
++        bySchema.set(instance, new Map([[key, result]]));
++    }
++    else {
++        current.set(key, result);
 +    }
 +    return result;
 +}
@@ -249,7 +329,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -72,6 +288,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -72,6 +368,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceType = 'object';
              }
              break;
@@ -261,16 +341,20 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -85,7 +306,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -85,7 +386,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              ? lookup[__absolute_recursive_ref__]
              : recursiveAnchor;
          const keywordLocation = `${schemaLocation}/$recursiveRef`;
 -        const result = validate(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, evaluated);
-+        const result = validateRef(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, evaluated);
++        const refEvaluated = Object.create(null);
++        const result = validateRef(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, refEvaluated);
++        if (result.valid) {
++            Object.assign(evaluated, refEvaluated);
++        }
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -97,7 +318,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -97,7 +402,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -279,16 +363,20 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -107,7 +328,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -107,7 +412,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              throw new Error(message);
          }
          const keywordLocation = `${schemaLocation}/$ref`;
 -        const result = validate(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
-+        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
++        const refEvaluated = Object.create(null);
++        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, refEvaluated);
++        if (result.valid) {
++            Object.assign(evaluated, refEvaluated);
++        }
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -202,7 +423,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -202,7 +511,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -297,7 +385,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -214,29 +435,48 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -214,28 +523,49 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -309,16 +397,18 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +        // errors are collected only when no branch is valid.
          const keywordLocation = `${schemaLocation}/anyOf`;
 -        const errorsLength = errors.length;
-+        unionDepth++;
 +        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
 +        const needsAnnotations = usesUnevaluated(lookup);
          let anyValid = false;
++        const probeResults = [];
          for (const [i, subSchema] of $anyOf.entries()) {
-             const subEvaluated = Object.create(evaluated);
+-            const subEvaluated = Object.create(evaluated);
 -            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
 -            errors.push(...result.errors);
 -            anyValid = anyValid || result.valid;
++            const subEvaluated = Object.create(null);
 +            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
++            probeResults[i] = result;
              if (result.valid) {
 +                anyValid = true;
                  subEvaluateds.push(subEvaluated);
@@ -341,7 +431,9 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
              });
 +            const reported = new Set();
 +            for (const [i, subSchema] of $anyOf.entries()) {
-+                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                const result = shortCircuit
++                    ? probeResults[i]
++                    : validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(null));
 +                for (const error of result.errors) {
 +                    // Branches share a reused child result; report its errors once.
 +                    if (!reported.has(error)) {
@@ -351,11 +443,18 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +                }
 +            }
          }
-+        unionDepth--;
      }
      if ($allOf !== undefined) {
-         const keywordLocation = `${schemaLocation}/allOf`;
-@@ -264,28 +504,39 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -243,7 +573,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+         const errorsLength = errors.length;
+         let allValid = true;
+         for (const [i, subSchema] of $allOf.entries()) {
+-            const subEvaluated = Object.create(evaluated);
++            const subEvaluated = Object.create(null);
+             const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             errors.push(...result.errors);
+             allValid = allValid && result.valid;
+@@ -264,27 +594,40 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          }
      }
      if ($oneOf !== undefined) {
@@ -363,13 +462,15 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +        // as for anyOf; the full errors are collected only when the keyword fails.
          const keywordLocation = `${schemaLocation}/oneOf`;
 -        const errorsLength = errors.length;
-+        unionDepth++;
 +        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
++        const probeResults = [];
          const matches = $oneOf.filter((subSchema, i) => {
-             const subEvaluated = Object.create(evaluated);
+-            const subEvaluated = Object.create(evaluated);
 -            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
 -            errors.push(...result.errors);
++            const subEvaluated = Object.create(null);
 +            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
++            probeResults[i] = result;
              if (result.valid) {
                  subEvaluateds.push(subEvaluated);
              }
@@ -389,7 +490,9 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
              });
 +            const reported = new Set();
 +            for (const [i, subSchema] of $oneOf.entries()) {
-+                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                const result = shortCircuit
++                    ? probeResults[i]
++                    : validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(null));
 +                for (const error of result.errors) {
 +                    // Branches share a reused child result; report its errors once.
 +                    if (!reported.has(error)) {
@@ -399,11 +502,9 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
 +                }
 +            }
          }
-+        unionDepth--;
      }
      if (instanceType === 'object' || instanceType === 'array') {
-         Object.assign(evaluated, ...subEvaluateds);
-@@ -293,7 +544,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -293,11 +636,15 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -412,7 +513,29 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
          if (conditionResult) {
              Object.assign(evaluated, ifEvaluated);
              if ($then !== undefined) {
-@@ -323,7 +574,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+-                const thenResult = validate(instance, $then, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/then`, evaluated);
++                const thenEvaluated = Object.create(null);
++                const thenResult = validate(instance, $then, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/then`, thenEvaluated);
++                if (thenResult.valid) {
++                    Object.assign(evaluated, thenEvaluated);
++                }
+                 if (!thenResult.valid) {
+                     errors.push({
+                         instanceLocation,
+@@ -309,7 +656,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+             }
+         }
+         else if ($else !== undefined) {
+-            const elseResult = validate(instance, $else, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/else`, evaluated);
++            const elseEvaluated = Object.create(null);
++            const elseResult = validate(instance, $else, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/else`, elseEvaluated);
++            if (elseResult.valid) {
++                Object.assign(evaluated, elseEvaluated);
++            }
+             if (!elseResult.valid) {
+                 errors.push({
+                     instanceLocation,
+@@ -323,7 +674,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -421,7 +544,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -347,7 +598,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -347,7 +698,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -430,7 +553,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
              });
          }
          if ($propertyNames !== undefined) {
-@@ -368,10 +619,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -368,10 +719,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -443,16 +566,22 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -386,7 +637,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -386,8 +737,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
 -                if (hasOwnProperty(instance, key)) {
+-                    const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`, evaluated);
 +                if (isPresent(instance, key)) {
-                     const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`, evaluated);
++                    const dependentEvaluated = Object.create(null);
++                    const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`, dependentEvaluated);
++                    if (result.valid) {
++                        Object.assign(evaluated, dependentEvaluated);
++                    }
                      if (!result.valid) {
                          errors.push({
-@@ -402,11 +653,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+                             instanceLocation,
+@@ -402,11 +757,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -466,7 +595,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -438,6 +689,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -438,6 +793,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -480,7 +609,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
                  const subInstancePointer = `${instanceLocation}/${(0, pointer_js_1.encodePointer)(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`);
                  thisEvaluated[key] = true;
-@@ -698,26 +956,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -698,26 +1060,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          if ($uniqueItems) {
@@ -515,6 +644,20 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..169796d4828665b936537b8c58072894
              }
          }
      }
+@@ -828,6 +1178,12 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+             });
+         }
+     }
++    if (errors.length > 1 && activeMemo !== null && activeMemo !== false) {
++        const unique = new Set(errors);
++        if (unique.size !== errors.length) {
++            return { valid: false, errors: [...unique] };
++        }
++    }
+     return { valid: errors.length === 0, errors };
+ }
+ //# sourceMappingURL=validate.js.map
+\ No newline at end of file
 diff --git a/dist/esm/dereference.js b/dist/esm/dereference.js
 index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa46322456 100644
 --- a/dist/esm/dereference.js
@@ -532,7 +675,7 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa
  export const ignoredKeyword = {
      id: true,
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
-index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549fd721c5b 100644
+index 78c71b00e321ff99db657484d299c1684a4ef07e..0ab4dde5463b5a84523f717d1f803d093d39fe8e 100644
 --- a/dist/esm/validate.js
 +++ b/dist/esm/validate.js
 @@ -6,6 +6,62 @@ import { ucs2length } from './ucs2-length.js';
@@ -598,7 +741,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -33,7 +89,167 @@ function isMultipleOf(instance, divisor) {
+@@ -33,7 +89,247 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -705,19 +848,94 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +    }
 +    return pair;
 +}
-+// mbenhamd/mastra#631 (PF-9666): within one top-level call, the schema a $ref
-+// or $recursiveRef resolves to is validated against each instance at most once
-+// per instance location, shortCircuit mode and recursive anchor while the
-+// branches of an anyOf or oneOf are checked, and the result is reused. A
-+// recursive anyOf or oneOf reaches every level through a reference and
-+// validated the same child once per branch at every level, so valid and
-+// invalid input took time exponential in the nesting depth. Outside a union no
-+// value is checked twice, so nothing is kept there. A reused result is the
-+// same except that its errors keep the keywordLocation of the first
++// mbenhamd/mastra#631 (PF-9666): within one top-level call, a schema that a
++// $ref or $recursiveRef resolves to and that can reach itself through further
++// references is validated against each instance at most twice per instance
++// location, shortCircuit mode and recursive anchor: the first visit only
++// records the value, and the result of the second is reused.
++// A recursive schema whose anyOf, oneOf or allOf branches reach the same child
++// validated that child once per branch at every level, so input took time
++// exponential in its nesting depth. Without a reference cycle the nesting is
++// bounded by the schema itself, so other targets are not kept. A reused result
++// is the same except that its errors keep the keywordLocation of the first
 +// evaluation. Not used when the schema has an unevaluated keyword, which reads
 +// annotations a reused result would not record.
++// mbenhamd/mastra#631 (PF-9666): the reference targets that can reach
++// themselves through subschemas and further references, found once per
++// dereferenced document. Every nested object is followed, which can only add
++// targets.
++const recursiveTargetsByLookup = new WeakMap();
++function referenceTarget(lookup, node) {
++    if (typeof node.$ref !== 'string') {
++        return undefined;
++    }
++    const uri = node.__absolute_ref__ || node.$ref;
++    const target = lookup[uri] ?? resolveByPointer(lookup, uri);
++    return typeof target === 'object' && target !== null ? target : undefined;
++}
++function isRecursiveTarget(lookup, schema) {
++    let targets = recursiveTargetsByLookup.get(lookup);
++    if (targets === undefined) {
++        targets = new Set();
++        const nodes = new Set();
++        const pending = Object.values(lookup);
++        while (pending.length > 0) {
++            const node = pending.pop();
++            if (typeof node === 'object' && node !== null && !nodes.has(node)) {
++                nodes.add(node);
++                pending.push(...Object.values(node));
++            }
++        }
++        const referenced = new Set();
++        for (const node of nodes) {
++            const target = referenceTarget(lookup, node);
++            if (target !== undefined) {
++                referenced.add(target);
++            }
++        }
++        for (const target of referenced) {
++            const visited = new Set();
++            const next = [target];
++            while (next.length > 0) {
++                const node = next.pop();
++                if (visited.has(node)) {
++                    continue;
++                }
++                visited.add(node);
++                const children = Object.values(node);
++                const linked = referenceTarget(lookup, node);
++                if (linked !== undefined) {
++                    children.push(linked);
++                }
++                if (children.includes(target)) {
++                    targets.add(target);
++                    break;
++                }
++                for (const child of children) {
++                    if (typeof child === 'object' && child !== null) {
++                        next.push(child);
++                    }
++                }
++            }
++        }
++        recursiveTargetsByLookup.set(lookup, targets);
++    }
++    return targets.has(schema);
++}
++const anchorIds = new WeakMap();
++let nextAnchorId = 0;
++function anchorId(anchor) {
++    if (anchor === null) {
++        return '';
++    }
++    let id = anchorIds.get(anchor);
++    if (id === undefined) {
++        id = `${nextAnchorId++}:`;
++        anchorIds.set(anchor, id);
++    }
++    return id;
++}
 +let activeMemo = null;
-+let unionDepth = 0;
  export function validate(instance, schema, draft = '2019-09', lookup = dereference(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
 +    if (activeMemo === null) {
 +        activeMemo = usesUnevaluated(lookup) ? false : new Map();
@@ -726,7 +944,6 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +        }
 +        finally {
 +            activeMemo = null;
-+            unionDepth = 0;
 +        }
 +    }
 +    return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
@@ -734,9 +951,11 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +function validateRef(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated) {
 +    if (activeMemo === null ||
 +        activeMemo === false ||
-+        unionDepth === 0 ||
 +        typeof schema !== 'object' ||
-+        schema === null) {
++        schema === null ||
++        !(schema.$recursiveAnchor === true ||
++            schema.$recursiveRef !== undefined ||
++            isRecursiveTarget(lookup, schema))) {
 +        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
 +    }
 +    let bySchema = activeMemo.get(schema);
@@ -744,21 +963,25 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +        bySchema = new Map();
 +        activeMemo.set(schema, bySchema);
 +    }
-+    let byInstance = bySchema.get(instance);
-+    if (byInstance === undefined) {
-+        byInstance = new Map();
-+        bySchema.set(instance, byInstance);
++    // Most values are reached once: the first visit only marks the value, and
++    // results are kept from the second visit on.
++    const entry = bySchema.get(instance);
++    if (entry === undefined) {
++        bySchema.set(instance, true);
++        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
 +    }
-+    let byAnchor = byInstance.get(recursiveAnchor);
-+    if (byAnchor === undefined) {
-+        byAnchor = new Map();
-+        byInstance.set(recursiveAnchor, byAnchor);
++    const key = (shortCircuit ? 's' : 'a') + anchorId(recursiveAnchor) + instanceLocation;
++    const kept = entry === true ? undefined : entry.get(key);
++    if (kept !== undefined) {
++        return kept;
 +    }
-+    const key = (shortCircuit ? 's' : 'a') + instanceLocation;
-+    let result = byAnchor.get(key);
-+    if (result === undefined) {
-+        result = validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
-+        byAnchor.set(key, result);
++    const result = validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
++    const current = bySchema.get(instance);
++    if (current === true) {
++        bySchema.set(instance, new Map([[key, result]]));
++    }
++    else {
++        current.set(key, result);
 +    }
 +    return result;
 +}
@@ -766,7 +989,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -69,6 +285,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -69,6 +365,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceType = 'object';
              }
              break;
@@ -778,16 +1001,20 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -82,7 +303,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -82,7 +383,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              ? lookup[__absolute_recursive_ref__]
              : recursiveAnchor;
          const keywordLocation = `${schemaLocation}/$recursiveRef`;
 -        const result = validate(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, evaluated);
-+        const result = validateRef(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, evaluated);
++        const refEvaluated = Object.create(null);
++        const result = validateRef(instance, recursiveAnchor === null ? schema : recursiveAnchor, draft, lookup, shortCircuit, refSchema, instanceLocation, keywordLocation, refEvaluated);
++        if (result.valid) {
++            Object.assign(evaluated, refEvaluated);
++        }
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -94,7 +315,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -94,7 +399,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -796,16 +1023,20 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -104,7 +325,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -104,7 +409,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              throw new Error(message);
          }
          const keywordLocation = `${schemaLocation}/$ref`;
 -        const result = validate(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
-+        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
++        const refEvaluated = Object.create(null);
++        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, refEvaluated);
++        if (result.valid) {
++            Object.assign(evaluated, refEvaluated);
++        }
          if (!result.valid) {
              errors.push({
                  instanceLocation,
-@@ -199,7 +420,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -199,7 +508,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -814,7 +1045,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -211,29 +432,48 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -211,28 +520,49 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -826,16 +1057,18 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +        // errors are collected only when no branch is valid.
          const keywordLocation = `${schemaLocation}/anyOf`;
 -        const errorsLength = errors.length;
-+        unionDepth++;
 +        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
 +        const needsAnnotations = usesUnevaluated(lookup);
          let anyValid = false;
++        const probeResults = [];
          for (const [i, subSchema] of $anyOf.entries()) {
-             const subEvaluated = Object.create(evaluated);
+-            const subEvaluated = Object.create(evaluated);
 -            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
 -            errors.push(...result.errors);
 -            anyValid = anyValid || result.valid;
++            const subEvaluated = Object.create(null);
 +            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
++            probeResults[i] = result;
              if (result.valid) {
 +                anyValid = true;
                  subEvaluateds.push(subEvaluated);
@@ -858,7 +1091,9 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
              });
 +            const reported = new Set();
 +            for (const [i, subSchema] of $anyOf.entries()) {
-+                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                const result = shortCircuit
++                    ? probeResults[i]
++                    : validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(null));
 +                for (const error of result.errors) {
 +                    // Branches share a reused child result; report its errors once.
 +                    if (!reported.has(error)) {
@@ -868,11 +1103,18 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +                }
 +            }
          }
-+        unionDepth--;
      }
      if ($allOf !== undefined) {
-         const keywordLocation = `${schemaLocation}/allOf`;
-@@ -261,28 +501,39 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -240,7 +570,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+         const errorsLength = errors.length;
+         let allValid = true;
+         for (const [i, subSchema] of $allOf.entries()) {
+-            const subEvaluated = Object.create(evaluated);
++            const subEvaluated = Object.create(null);
+             const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
+             errors.push(...result.errors);
+             allValid = allValid && result.valid;
+@@ -261,27 +591,40 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          }
      }
      if ($oneOf !== undefined) {
@@ -880,13 +1122,15 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +        // as for anyOf; the full errors are collected only when the keyword fails.
          const keywordLocation = `${schemaLocation}/oneOf`;
 -        const errorsLength = errors.length;
-+        unionDepth++;
 +        const branchAnchor = $recursiveAnchor === true ? recursiveAnchor : null;
++        const probeResults = [];
          const matches = $oneOf.filter((subSchema, i) => {
-             const subEvaluated = Object.create(evaluated);
+-            const subEvaluated = Object.create(evaluated);
 -            const result = validate(instance, subSchema, draft, lookup, shortCircuit, $recursiveAnchor === true ? recursiveAnchor : null, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
 -            errors.push(...result.errors);
++            const subEvaluated = Object.create(null);
 +            const result = validate(instance, subSchema, draft, lookup, true, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, subEvaluated);
++            probeResults[i] = result;
              if (result.valid) {
                  subEvaluateds.push(subEvaluated);
              }
@@ -906,7 +1150,9 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
              });
 +            const reported = new Set();
 +            for (const [i, subSchema] of $oneOf.entries()) {
-+                const result = validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(evaluated));
++                const result = shortCircuit
++                    ? probeResults[i]
++                    : validate(instance, subSchema, draft, lookup, shortCircuit, branchAnchor, instanceLocation, `${keywordLocation}/${i}`, Object.create(null));
 +                for (const error of result.errors) {
 +                    // Branches share a reused child result; report its errors once.
 +                    if (!reported.has(error)) {
@@ -916,11 +1162,9 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
 +                }
 +            }
          }
-+        unionDepth--;
      }
      if (instanceType === 'object' || instanceType === 'array') {
-         Object.assign(evaluated, ...subEvaluateds);
-@@ -290,7 +541,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -290,11 +633,15 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -929,7 +1173,29 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
          if (conditionResult) {
              Object.assign(evaluated, ifEvaluated);
              if ($then !== undefined) {
-@@ -320,7 +571,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+-                const thenResult = validate(instance, $then, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/then`, evaluated);
++                const thenEvaluated = Object.create(null);
++                const thenResult = validate(instance, $then, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/then`, thenEvaluated);
++                if (thenResult.valid) {
++                    Object.assign(evaluated, thenEvaluated);
++                }
+                 if (!thenResult.valid) {
+                     errors.push({
+                         instanceLocation,
+@@ -306,7 +653,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+             }
+         }
+         else if ($else !== undefined) {
+-            const elseResult = validate(instance, $else, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/else`, evaluated);
++            const elseEvaluated = Object.create(null);
++            const elseResult = validate(instance, $else, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${schemaLocation}/else`, elseEvaluated);
++            if (elseResult.valid) {
++                Object.assign(evaluated, elseEvaluated);
++            }
+             if (!elseResult.valid) {
+                 errors.push({
+                     instanceLocation,
+@@ -320,7 +671,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -938,7 +1204,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -344,7 +595,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -344,7 +695,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -947,7 +1213,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
              });
          }
          if ($propertyNames !== undefined) {
-@@ -365,10 +616,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -365,10 +716,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -960,16 +1226,22 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -383,7 +634,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -383,8 +734,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
 -                if (hasOwnProperty(instance, key)) {
+-                    const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${encodePointer(key)}`, evaluated);
 +                if (isPresent(instance, key)) {
-                     const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${encodePointer(key)}`, evaluated);
++                    const dependentEvaluated = Object.create(null);
++                    const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${encodePointer(key)}`, dependentEvaluated);
++                    if (result.valid) {
++                        Object.assign(evaluated, dependentEvaluated);
++                    }
                      if (!result.valid) {
                          errors.push({
-@@ -399,11 +650,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+                             instanceLocation,
+@@ -399,11 +754,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -983,7 +1255,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -435,6 +686,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -435,6 +790,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -997,7 +1269,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
                  const subInstancePointer = `${instanceLocation}/${encodePointer(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${encodePointer(key)}`);
                  thisEvaluated[key] = true;
-@@ -695,26 +953,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -695,26 +1057,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          if ($uniqueItems) {
@@ -1032,3 +1304,16 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..cf21daffe7b5e056e91c19d058fc1549
              }
          }
      }
+@@ -825,6 +1175,12 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+             });
+         }
+     }
++    if (errors.length > 1 && activeMemo !== null && activeMemo !== false) {
++        const unique = new Set(errors);
++        if (unique.size !== errors.length) {
++            return { valid: false, errors: [...unique] };
++        }
++    }
+     return { valid: errors.length === 0, errors };
+ }
+ //# sourceMappingURL=validate.js.map

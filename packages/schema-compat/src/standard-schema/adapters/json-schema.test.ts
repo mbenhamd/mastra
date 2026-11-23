@@ -235,6 +235,27 @@ describe('json-schema standard-schema adapter', () => {
       expect(await standardSchema['~standard'].validate(declared)).toEqual({ value: declared });
     });
 
+    it('lets unevaluatedProperties in a subschema see only that subschema, as Ajv did', async () => {
+      const standardSchema = toStandardSchema({
+        $defs: { base: { properties: { tag: { type: 'string' } } } },
+        type: 'object',
+        properties: {
+          // `tag` is evaluated by the sibling $ref, not by the allOf branch.
+          inner: { $ref: '#/$defs/base', allOf: [{ unevaluatedProperties: false }] },
+          // The branch's annotations reach an unevaluatedProperties beside it.
+          outer: { allOf: [{ $ref: '#/$defs/base' }], unevaluatedProperties: false },
+        },
+      } as JSONSchema7);
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+      expect(await standardSchema['~standard'].validate({ inner: { tag: 'x' } })).toEqual({
+        issues: [{ message: 'Property "tag" does not match unevaluated properties schema.', path: ['inner'] }],
+      });
+      expect(await standardSchema['~standard'].validate({ outer: { tag: 'x' } })).toEqual({
+        value: { outer: { tag: 'x' } },
+      });
+    });
+
     it('takes the branch Ajv took for an undefined property, and keeps a null beside it', async () => {
       // The key is absent for `required` in `if`, so the closed `else` applies.
       const conditional = toStandardSchema({
@@ -306,16 +327,23 @@ describe('json-schema standard-schema adapter', () => {
         expect('issues' in (await standardSchema['~standard'].validate(invalid))).toBe(true);
       }
 
-      // A scalar under a chain of unions whose two branches share the next definition.
-      const $defs: Record<string, JSONSchema7> = { d30: { type: 'string' } };
-      for (let level = 0; level < 30; level++) {
-        const next = { $ref: `#/$defs/d${level + 1}` };
-        $defs[`d${level}`] = { anyOf: [next, next] };
+      // An "extends" chain: allOf reaches the child through the base and again directly.
+      const extendsChain = toStandardSchema({
+        $defs: {
+          base: { type: 'object', properties: { id: { type: 'string' }, child: { $ref: '#/$defs/node' } } },
+          node: { allOf: [{ $ref: '#/$defs/base' }, { properties: { child: { $ref: '#/$defs/node' } } }] },
+        },
+        $ref: '#/$defs/node',
+      } as JSONSchema7);
+      let valid: Record<string, unknown> = { id: 'leaf' };
+      let invalid: Record<string, unknown> = { id: 5 };
+      for (let depth = 0; depth < 40; depth++) {
+        valid = { id: 'x', child: valid };
+        invalid = { id: 'x', child: invalid };
       }
-      const chain = toStandardSchema({ $defs, $ref: '#/$defs/d0' } as JSONSchema7);
 
-      expect(await chain['~standard'].validate('a')).toEqual({ value: 'a' });
-      expect('issues' in (await chain['~standard'].validate(1))).toBe(true);
+      expect(await extendsChain['~standard'].validate(valid)).toEqual({ value: valid });
+      expect('issues' in (await extendsChain['~standard'].validate(invalid))).toBe(true);
     });
 
     it('still rejects an own __proto__ key that the schema does not allow', async () => {
