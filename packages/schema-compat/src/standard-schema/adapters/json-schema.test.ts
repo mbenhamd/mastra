@@ -1,5 +1,5 @@
 import type { JSONSchema7 } from 'json-schema';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { isStandardSchemaWithJSON } from '../standard-schema';
 import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady, toStandardSchema } from './json-schema';
 
@@ -741,50 +741,6 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
-  describe('where code generation from strings is disallowed', () => {
-    // Composio's GMAIL_FETCH_EMAILS input schema as its API served it on 2026-11-22,
-    // with descriptions and examples left out, and `additionalProperties: false` as
-    // applyCompatLayer adds it. Note the OpenAPI `nullable` fields.
-    const gmailFetchEmails: JSONSchema7 = {
-      type: 'object',
-      title: 'FetchEmailsRequest',
-      additionalProperties: false,
-      properties: {
-        query: { type: 'string', title: 'Query', default: null, nullable: true } as JSONSchema7,
-        user_id: { type: 'string', title: 'User Id', default: 'me' },
-        verbose: { type: 'boolean', title: 'Verbose', default: true },
-        ids_only: { type: 'boolean', title: 'Ids Only', default: false },
-        label_ids: { type: 'array', items: { type: 'string', properties: {} }, title: 'Label Ids' },
-        page_token: { type: 'string', title: 'Page Token', default: null, nullable: true } as JSONSchema7,
-        max_results: { type: 'integer', title: 'Max Results', default: 1, maximum: 500, minimum: 1 },
-        include_payload: { type: 'boolean', title: 'Include Payload', default: true },
-        include_spam_trash: { type: 'boolean', title: 'Include Spam Trash', default: false },
-      },
-    };
-
-    it('accepts and rejects a real tool input the way it did before, with readable issues', async () => {
-      // As under `node --disallow-code-generation-from-strings`: building a function
-      // from a string throws.
-      vi.stubGlobal('Function', function () {
-        throw new EvalError('Code generation from strings disallowed for this context');
-      });
-      try {
-        const schema = toStandardSchema(gmailFetchEmails);
-
-        const input = { query: 'is:unread', page_token: null, max_results: 10, label_ids: ['INBOX'] };
-        expect(await schema['~standard'].validate(input)).toEqual({ value: input });
-
-        expect(await schema['~standard'].validate({ max_results: 5000, label_ids: [3] })).toEqual({
-          issues: [
-            { message: 'Instance type "number" is invalid. Expected "string".', path: ['label_ids', 0] },
-            { message: '5000 is greater than 500.', path: ['max_results'] },
-          ],
-        });
-      } finally {
-        vi.unstubAllGlobals();
-      }
-    });
-  });
   describe('jsonSchemaValidatorReady', () => {
     it('also waits for the validator load of another adapter copy in the process', async () => {
       // A bundled or second-version copy of this adapter registers its load in the same global set

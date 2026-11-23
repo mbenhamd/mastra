@@ -1,7 +1,10 @@
 import { defineConfig } from 'vitest/config';
 
 // This test makes the lazy validator import fail, so it needs a process where no other file has loaded it.
-const FRESH_PROCESS_TESTS = ['src/standard-schema/adapters/json-schema-blob-worker.test.ts'];
+const BLOB_WORKER_TEST = 'src/standard-schema/adapters/json-schema-blob-worker.test.ts';
+// This test needs a process that disallows code generation from strings before anything is imported.
+const NO_CODEGEN_TEST = 'src/standard-schema/adapters/json-schema-no-codegen.test.ts';
+const FRESH_PROCESS_TESTS = [BLOB_WORKER_TEST, NO_CODEGEN_TEST];
 
 export default defineConfig({
   test: {
@@ -12,9 +15,19 @@ export default defineConfig({
         test: {
           name: 'unit:packages/schema-compat:fresh-process',
           environment: 'node',
-          include: FRESH_PROCESS_TESTS,
+          include: [BLOB_WORKER_TEST],
           pool: 'forks',
           isolate: true,
+        },
+      },
+      {
+        test: {
+          name: 'unit:packages/schema-compat:no-codegen',
+          environment: 'node',
+          include: [NO_CODEGEN_TEST],
+          pool: 'forks',
+          isolate: true,
+          execArgv: ['--disallow-code-generation-from-strings'],
         },
       },
       {
