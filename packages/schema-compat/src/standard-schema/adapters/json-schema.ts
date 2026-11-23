@@ -168,8 +168,15 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
         record[exclusive] = record[bound];
         delete record[bound];
       } else if (!isRefTarget) {
-        // On a `$ref` target that is a name map, a boolean is a property's schema.
         delete record[exclusive];
+      } else {
+        // A target the first walk skipped may be a name map, where a boolean is a property's
+        // schema: dropping a `false` there would let the property pass, and keeping it as a
+        // bound compares values with `true` or `false` as if they were numbers. Neither is
+        // safe, so the schema is refused.
+        throw new Error(
+          `${exclusive}: ${String(record[exclusive])} without a numeric ${bound} on a $ref target is not supported, so the schema is refused`,
+        );
       }
     }
   }
@@ -331,7 +338,9 @@ function normalizeSchemaObjects(node: unknown, isNameMap = false, seen = new Set
  * - `format` is dropped, because validation has never checked formats here; the
  *   patched validator does not check it either, also on a target this walk misses.
  * - A boolean `exclusiveMinimum`/`exclusiveMaximum` (OpenAPI 3.0, draft-04)
- *   takes the value of `minimum`/`maximum`, or is dropped when `false`.
+ *   takes the value of `minimum`/`maximum` when it is `true` beside a number,
+ *   and is dropped otherwise. On a `$ref` target the first walk skipped, such
+ *   a bound refuses the schema instead (see `normalizeSchemaObject`).
  * - `id` is dropped: only draft-04 used it, Ajv ignored it, and the validator
  *   read it on objects that are not schemas.
  * Every object is visited except literal data and name maps, so a property

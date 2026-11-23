@@ -488,6 +488,19 @@ describe('json-schema standard-schema adapter', () => {
           { message: '0 is less than 1.', path: ['open'] },
         ],
       });
+
+      // On a target named like a keyword, a bare boolean bound may be a property's schema, so
+      // the schema is refused rather than compared with `true` as 1.
+      const keywordNamed = toStandardSchema({
+        $ref: '#/components/schemas/properties',
+        components: { schemas: { properties: { exclusiveMinimum: true } } },
+      } as unknown as JSONSchema7);
+      for (const value of [2, 'abc']) {
+        const result = await keywordNamed['~standard'].validate(value);
+        expect('issues' in result && result.issues?.[0]?.message).toContain(
+          'exclusiveMinimum: true without a numeric minimum',
+        );
+      }
     });
 
     it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
