@@ -280,11 +280,19 @@ describe('json-schema standard-schema adapter', () => {
           { type: 'object', required: ['label'], properties: { child } },
         ],
       };
+      // The same union reached through $recursiveRef instead of $ref.
+      const byRecursiveRef = {
+        oneOf: [
+          { type: 'object', required: ['text'], properties: { child: { $recursiveRef: '#' } } },
+          { type: 'object', required: ['label'], properties: { child: { $recursiveRef: '#' } } },
+        ],
+      };
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       // Checking each branch's child again at every level took 2^depth steps: 13-25 s at depth 20.
       for (const [node, leaf] of [
         [byConst, { kind: 'b' }],
         [byRequired, { label: 'x' }],
+        [byRecursiveRef, { label: 'x' }],
       ] as const) {
         const standardSchema = toStandardSchema({ $defs: { node }, $ref: '#/$defs/node' } as JSONSchema7);
         let valid: Record<string, unknown> = leaf;
