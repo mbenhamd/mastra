@@ -152,15 +152,27 @@ function normalizeSchemaObject(record: Record<string, unknown>, isRefTarget = fa
  * Normalises the target of every local `$ref` (`#/...`) as a schema. The walk
  * leaves a name map's own keys alone, so a target named like a name-map
  * keyword, such as `#/components/schemas/properties`, was not normalised.
+ * Literal data under `const`, `enum` and `default` is not searched for `$ref`.
  */
 function normalizeLocalRefTargets(root: unknown): void {
   const seen = new Set<object>();
-  const visit = (node: unknown): void => {
+  const visit = (node: unknown, isNameMap = false): void => {
     if (typeof node !== 'object' || node === null || seen.has(node)) {
       return;
     }
     seen.add(node);
-    const ref = (node as Record<string, unknown>).$ref;
+    if (Array.isArray(node)) {
+      node.forEach(item => visit(item));
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    for (const [key, value] of Object.entries(record)) {
+      if (!isNameMap && DATA_KEYWORDS.has(key)) {
+        continue;
+      }
+      visit(value, !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key));
+    }
+    const ref = isNameMap ? undefined : record.$ref;
     if (typeof ref === 'string' && ref.startsWith('#/')) {
       let target: unknown = root;
       for (const token of ref.slice(2).split('/')) {
@@ -174,7 +186,6 @@ function normalizeLocalRefTargets(root: unknown): void {
         normalizeSchemaObject(target as Record<string, unknown>, true);
       }
     }
-    Object.values(node).forEach(visit);
   };
   visit(root);
 }

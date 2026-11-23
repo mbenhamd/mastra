@@ -15,7 +15,7 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..46a2a058e63170f5137af406c1719538
  exports.ignoredKeyword = {
      id: true,
 diff --git a/dist/commonjs/validate.js b/dist/commonjs/validate.js
-index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5b464985d 100644
+index 1abb284311bf653d9a9d67c52d79c99a7db29c68..8019dcc5c710831270511a9a2c17cf4b306378b3 100644
 --- a/dist/commonjs/validate.js
 +++ b/dist/commonjs/validate.js
 @@ -9,6 +9,62 @@ const ucs2_length_js_1 = require("./ucs2-length.js");
@@ -81,7 +81,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -36,7 +92,156 @@ function isMultipleOf(instance, divisor) {
+@@ -36,7 +92,160 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -188,15 +188,17 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
 +    }
 +    return pair;
 +}
-+// mbenhamd/mastra#631 (PF-9666): within one top-level call, each schema object
-+// is validated against each object or array instance at most once per
-+// instance location and shortCircuit mode, and the result is reused. A
-+// recursive anyOf or oneOf validated the same child once per branch at every
-+// level, so valid and invalid input took time exponential in the nesting
-+// depth. A reused result is the same except that its errors keep the
-+// keywordLocation of the first evaluation. Not used when the schema has an
-+// unevaluated keyword, which reads annotations a reused result would not
-+// record, or under a $recursiveAnchor, whose target depends on the path.
++// mbenhamd/mastra#631 (PF-9666): within one top-level call, the schema a $ref
++// resolves to is validated against each instance at most once
++// per instance location and shortCircuit mode, and the result is reused. A
++// recursive anyOf or oneOf reaches every level through a $ref and validated the
++// same child once per branch at every level, so valid and invalid input took
++// time exponential in the nesting depth. Only $ref targets are kept, so a
++// schema without $ref allocates nothing. A reused result is the same except
++// that its errors keep the keywordLocation of the first evaluation. Not used
++// when the schema has an unevaluated keyword, which reads annotations a reused
++// result would not record, or under a $recursiveAnchor, whose target depends on
++// the path.
 +let activeMemo = null;
  function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_js_1.dereference)(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
 +    if (activeMemo === null) {
@@ -208,10 +210,12 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
 +            activeMemo = null;
 +        }
 +    }
-+    if (activeMemo === false ||
++    return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
++}
++function validateRef(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated) {
++    if (activeMemo === null ||
++        activeMemo === false ||
 +        recursiveAnchor !== null ||
-+        typeof instance !== 'object' ||
-+        instance === null ||
 +        typeof schema !== 'object' ||
 +        schema === null) {
 +        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
@@ -238,7 +242,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -72,6 +277,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -72,6 +281,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceType = 'object';
              }
              break;
@@ -250,7 +254,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -97,7 +307,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -97,7 +311,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -259,7 +263,16 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -202,7 +412,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -107,7 +321,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+             throw new Error(message);
+         }
+         const keywordLocation = `${schemaLocation}/$ref`;
+-        const result = validate(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
++        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
+         if (!result.valid) {
+             errors.push({
+                 instanceLocation,
+@@ -202,7 +416,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -268,7 +281,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -214,28 +424,45 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -214,28 +428,45 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -323,7 +336,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          }
      }
      if ($allOf !== undefined) {
-@@ -264,27 +491,36 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -264,27 +495,36 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          }
      }
      if ($oneOf !== undefined) {
@@ -368,7 +381,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          }
      }
      if (instanceType === 'object' || instanceType === 'array') {
-@@ -293,7 +529,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -293,7 +533,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -377,7 +390,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
          if (conditionResult) {
              Object.assign(evaluated, ifEvaluated);
              if ($then !== undefined) {
-@@ -323,7 +559,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -323,7 +563,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -386,7 +399,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -347,7 +583,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -347,7 +587,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -395,7 +408,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
              });
          }
          if ($propertyNames !== undefined) {
-@@ -368,10 +604,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -368,10 +608,10 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -408,7 +421,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -386,7 +622,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -386,7 +626,7 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
@@ -417,7 +430,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
                      const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`, evaluated);
                      if (!result.valid) {
                          errors.push({
-@@ -402,11 +638,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -402,11 +642,11 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -431,7 +444,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -438,6 +674,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -438,6 +678,13 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -445,7 +458,7 @@ index 1abb284311bf653d9a9d67c52d79c99a7db29c68..2b913f00d65e64432ed8a1563a44dca5
                  const subInstancePointer = `${instanceLocation}/${(0, pointer_js_1.encodePointer)(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${(0, pointer_js_1.encodePointer)(key)}`);
                  thisEvaluated[key] = true;
-@@ -698,26 +941,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
+@@ -698,26 +945,14 @@ function validate(instance, schema, draft = '2019-09', lookup = (0, dereference_
              }
          }
          if ($uniqueItems) {
@@ -497,7 +510,7 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..abed45a736109d78e71a667649a480fa
  export const ignoredKeyword = {
      id: true,
 diff --git a/dist/esm/validate.js b/dist/esm/validate.js
-index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29a54f6163 100644
+index 78c71b00e321ff99db657484d299c1684a4ef07e..5017ff50b6dd50ff94e00c48ee9ef3a70b4e2575 100644
 --- a/dist/esm/validate.js
 +++ b/dist/esm/validate.js
 @@ -6,6 +6,62 @@ import { ucs2length } from './ucs2-length.js';
@@ -563,7 +576,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
  function decimalInteger(value) {
      const coefficientAndExponent = Math.abs(value).toString().split('e');
      const coefficient = coefficientAndExponent[0];
-@@ -33,7 +89,156 @@ function isMultipleOf(instance, divisor) {
+@@ -33,7 +89,160 @@ function isMultipleOf(instance, divisor) {
          (divisorCoefficient * 10n ** BigInt(-exponentDifference)) ===
          0n);
  }
@@ -670,15 +683,17 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
 +    }
 +    return pair;
 +}
-+// mbenhamd/mastra#631 (PF-9666): within one top-level call, each schema object
-+// is validated against each object or array instance at most once per
-+// instance location and shortCircuit mode, and the result is reused. A
-+// recursive anyOf or oneOf validated the same child once per branch at every
-+// level, so valid and invalid input took time exponential in the nesting
-+// depth. A reused result is the same except that its errors keep the
-+// keywordLocation of the first evaluation. Not used when the schema has an
-+// unevaluated keyword, which reads annotations a reused result would not
-+// record, or under a $recursiveAnchor, whose target depends on the path.
++// mbenhamd/mastra#631 (PF-9666): within one top-level call, the schema a $ref
++// resolves to is validated against each instance at most once
++// per instance location and shortCircuit mode, and the result is reused. A
++// recursive anyOf or oneOf reaches every level through a $ref and validated the
++// same child once per branch at every level, so valid and invalid input took
++// time exponential in the nesting depth. Only $ref targets are kept, so a
++// schema without $ref allocates nothing. A reused result is the same except
++// that its errors keep the keywordLocation of the first evaluation. Not used
++// when the schema has an unevaluated keyword, which reads annotations a reused
++// result would not record, or under a $recursiveAnchor, whose target depends on
++// the path.
 +let activeMemo = null;
  export function validate(instance, schema, draft = '2019-09', lookup = dereference(schema), shortCircuit = true, recursiveAnchor = null, instanceLocation = '#', schemaLocation = '#', evaluated = Object.create(null)) {
 +    if (activeMemo === null) {
@@ -690,10 +705,12 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
 +            activeMemo = null;
 +        }
 +    }
-+    if (activeMemo === false ||
++    return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
++}
++function validateRef(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated) {
++    if (activeMemo === null ||
++        activeMemo === false ||
 +        recursiveAnchor !== null ||
-+        typeof instance !== 'object' ||
-+        instance === null ||
 +        typeof schema !== 'object' ||
 +        schema === null) {
 +        return validateOnce(instance, schema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, schemaLocation, evaluated);
@@ -720,7 +737,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
      if (schema === true) {
          return { valid: true, errors: [] };
      }
-@@ -69,6 +274,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -69,6 +278,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceType = 'object';
              }
              break;
@@ -732,7 +749,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          default:
              throw new Error(`Instances of "${rawInstanceType}" type are not supported.`);
      }
-@@ -94,7 +304,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -94,7 +308,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($ref !== undefined) {
          const uri = __absolute_ref__ || $ref;
@@ -741,7 +758,16 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          if (refSchema === undefined) {
              let message = `Unresolved $ref "${$ref}".`;
              if (__absolute_ref__ && __absolute_ref__ !== $ref) {
-@@ -199,7 +409,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -104,7 +318,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+             throw new Error(message);
+         }
+         const keywordLocation = `${schemaLocation}/$ref`;
+-        const result = validate(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
++        const result = validateRef(instance, refSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, keywordLocation, evaluated);
+         if (!result.valid) {
+             errors.push({
+                 instanceLocation,
+@@ -199,7 +413,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      if ($not !== undefined) {
          const keywordLocation = `${schemaLocation}/not`;
@@ -750,7 +776,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          if (result.valid) {
              errors.push({
                  instanceLocation,
-@@ -211,28 +421,45 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -211,28 +425,45 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      }
      let subEvaluateds = [];
      if ($anyOf !== undefined) {
@@ -805,7 +831,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          }
      }
      if ($allOf !== undefined) {
-@@ -261,27 +488,36 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -261,27 +492,36 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          }
      }
      if ($oneOf !== undefined) {
@@ -850,7 +876,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          }
      }
      if (instanceType === 'object' || instanceType === 'array') {
-@@ -290,7 +526,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -290,7 +530,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if ($if !== undefined) {
          const keywordLocation = `${schemaLocation}/if`;
          const ifEvaluated = Object.create(null);
@@ -859,7 +885,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
          if (conditionResult) {
              Object.assign(evaluated, ifEvaluated);
              if ($then !== undefined) {
-@@ -320,7 +556,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -320,7 +560,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
      if (instanceType === 'object') {
          if ($required !== undefined) {
              for (const key of $required) {
@@ -868,7 +894,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
                      errors.push({
                          instanceLocation,
                          keyword: 'required',
-@@ -344,7 +580,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -344,7 +584,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  instanceLocation,
                  keyword: 'maxProperties',
                  keywordLocation: `${schemaLocation}/maxProperties`,
@@ -877,7 +903,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
              });
          }
          if ($propertyNames !== undefined) {
-@@ -365,10 +601,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -365,10 +605,10 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentRequired !== undefined) {
              const keywordLocation = `${schemaLocation}/dependantRequired`;
              for (const key in $dependentRequired) {
@@ -890,7 +916,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
                              errors.push({
                                  instanceLocation,
                                  keyword: 'dependentRequired',
-@@ -383,7 +619,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -383,7 +623,7 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependentSchemas !== undefined) {
              for (const [key, dependentSchema] of Object.entries($dependentSchemas)) {
                  const keywordLocation = `${schemaLocation}/dependentSchemas`;
@@ -899,7 +925,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
                      const result = validate(instance, dependentSchema, draft, lookup, shortCircuit, recursiveAnchor, instanceLocation, `${keywordLocation}/${encodePointer(key)}`, evaluated);
                      if (!result.valid) {
                          errors.push({
-@@ -399,11 +635,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -399,11 +639,11 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
          if ($dependencies !== undefined) {
              const keywordLocation = `${schemaLocation}/dependencies`;
              for (const key in $dependencies) {
@@ -913,7 +939,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
                                  errors.push({
                                      instanceLocation,
                                      keyword: 'dependencies',
-@@ -435,6 +671,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -435,6 +675,13 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
                  if (!hasOwnProperty(instance, key)) {
                      continue;
                  }
@@ -927,7 +953,7 @@ index 78c71b00e321ff99db657484d299c1684a4ef07e..398a74acd0d49a4a77dfeac6f6904d29
                  const subInstancePointer = `${instanceLocation}/${encodePointer(key)}`;
                  const result = validate(instance[key], propertySchema, draft, lookup, shortCircuit, recursiveAnchor, subInstancePointer, `${keywordLocation}/${encodePointer(key)}`);
                  thisEvaluated[key] = true;
-@@ -695,26 +938,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
+@@ -695,26 +942,14 @@ export function validate(instance, schema, draft = '2019-09', lookup = dereferen
              }
          }
          if ($uniqueItems) {

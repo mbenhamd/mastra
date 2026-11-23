@@ -297,6 +297,17 @@ describe('json-schema standard-schema adapter', () => {
         expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
         expect('issues' in (await standardSchema['~standard'].validate(invalid))).toBe(true);
       }
+
+      // A scalar under a chain of unions whose two branches share the next definition.
+      const $defs: Record<string, JSONSchema7> = { d30: { type: 'string' } };
+      for (let level = 0; level < 30; level++) {
+        const next = { $ref: `#/$defs/d${level + 1}` };
+        $defs[`d${level}`] = { anyOf: [next, next] };
+      }
+      const chain = toStandardSchema({ $defs, $ref: '#/$defs/d0' } as JSONSchema7);
+
+      expect(await chain['~standard'].validate('a')).toEqual({ value: 'a' });
+      expect('issues' in (await chain['~standard'].validate(1))).toBe(true);
     });
 
     it('still rejects an own __proto__ key that the schema does not allow', async () => {
@@ -306,9 +317,12 @@ describe('json-schema standard-schema adapter', () => {
         additionalProperties: false,
       });
 
+      expect(await standardSchema['~standard'].validate({ a: 'x' })).toEqual({ value: { a: 'x' } });
       const result = await standardSchema['~standard'].validate(JSON.parse('{"a":"x","__proto__":{}}'));
 
-      expect('issues' in result).toBe(true);
+      expect(result.issues?.map(issue => issue.message)).toEqual([
+        'Property "__proto__" does not match additional properties schema.',
+      ]);
     });
 
     it('should preserve recursive $ref schemas when converting output JSON Schema', () => {
@@ -464,6 +478,8 @@ describe('json-schema standard-schema adapter', () => {
           site: { $ref: '#/components/schemas/Site' },
           // A target named like a keyword whose value maps names to schemas.
           other: { $ref: '#/components/schemas/properties' },
+          // Literal data shaped like a reference is compared as written.
+          tag: { const: { $ref: '#/properties/tag/const', id: 1 } },
         },
         components: {
           schemas: {
@@ -474,9 +490,10 @@ describe('json-schema standard-schema adapter', () => {
       } as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
+      const tag = { $ref: '#/properties/tag/const', id: 1 };
       for (const site of [null, 'not a url']) {
-        expect(await standardSchema['~standard'].validate({ site, other: site })).toEqual({
-          value: { site, other: site },
+        expect(await standardSchema['~standard'].validate({ site, other: site, tag })).toEqual({
+          value: { site, other: site, tag },
         });
       }
       expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);
