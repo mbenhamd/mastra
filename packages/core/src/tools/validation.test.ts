@@ -10,6 +10,7 @@ import {
   ToolSchemaValidationError,
   validateRequestContext,
   validateToolInput,
+  validateToolInputAsync,
   validateToolOutput,
   validateToolSuspendData,
 } from './validation';
@@ -2591,6 +2592,62 @@ describe('Standard Schema path segment format (PathSegment objects) — mock sch
     expect(result.error!.message).toContain('address.city');
     expect(result.error!.message).toContain('address.zip');
     expect(result.error!.message).not.toContain('[object Object]');
+  });
+});
+
+describe('validateToolInputAsync - same outcome as validateToolInput', () => {
+  // Agent tool calls validate asynchronously (CoreToolBuilder) and skip the
+  // synchronous check; both must accept, refuse and report alike.
+  const schema = z.object({
+    title: z.string(),
+    subtitle: z.string().optional(),
+    note: z.string().nullable().optional(),
+    tags: z.array(z.string()).optional(),
+    layout: z.object({ columns: z.number() }).optional(),
+    content: z.object({ body: z.string(), caption: z.string().optional() }),
+    either: z.union([z.string(), z.array(z.number())]).optional(),
+  });
+  const promptSchema = z.object({ prompt: z.string(), limit: z.number().optional() });
+  const cases: [string, typeof schema | typeof promptSchema, unknown][] = [
+    ['valid', schema, { title: 'A', content: { body: 'b' } }],
+    ['nulls on optional fields', schema, { title: 'A', subtitle: null, content: { body: 'b', caption: null } }],
+    ['null on a nullable field', schema, { title: 'A', note: null, content: { body: 'b' } }],
+    ['fault plus nulls', schema, { title: 'A', subtitle: null, content: { body: 42, caption: null } }],
+    ['fault only', schema, { title: 'A', content: { body: 42 } }],
+    ['missing required', schema, { content: { body: 'b' } }],
+    ['stringified array', schema, { title: 'A', tags: '["x","y"]', content: { body: 'b' } }],
+    [
+      'stringified object plus nulls',
+      schema,
+      { title: 'A', layout: '{"columns":2}', subtitle: null, content: { body: 'b' } },
+    ],
+    ['stringified array plus fault', schema, { title: 'A', tags: '["x"]', content: { body: 1 } }],
+    ['malformed stringified array', schema, { title: 'A', tags: '[x', content: { body: 'b' } }],
+    ['JSON-looking string in a string union', schema, { title: 'A', either: '[1,2]', content: { body: 'b' } }],
+    [
+      'invalid JSON-looking string in a string union plus nulls',
+      schema,
+      { title: 'A', either: '["a"]', subtitle: null, content: { body: 'b' } },
+    ],
+    ['top-level null', promptSchema, null],
+    ['prompt alias', promptSchema, { query: 'find it' }],
+    ['prompt alias plus null', promptSchema, { query: 'find it', limit: null }],
+    ['prompt alias plus fault', promptSchema, { query: 'find it', limit: 'many' }],
+  ];
+  const outcome = (result: Awaited<ReturnType<typeof validateToolInputAsync>>) =>
+    result.error
+      ? {
+          refused: result.error.message
+            .split('\n')
+            .filter(line => line.startsWith('- '))
+            .map(line => line.slice(2, line.indexOf(':'))),
+        }
+      : { accepted: result.data };
+
+  it.each(cases)('%s', async (_, caseSchema, input) => {
+    const sync = validateToolInput(caseSchema, structuredClone(input), 'tool');
+    const async = await validateToolInputAsync(caseSchema, structuredClone(input), 'tool');
+    expect(outcome(async)).toEqual(outcome(sync));
   });
 });
 
