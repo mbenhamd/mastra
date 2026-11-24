@@ -581,8 +581,11 @@ export function validateToolInput<T = unknown>(
 }
 
 /**
- * Validates tool input with the same normalization as `validateToolInput`, while
- * also supporting Standard Schema validators that return promises.
+ * Validates tool input with the same pipeline as `validateToolInput` (each
+ * fallback building on the previous one, and the same issues reported when
+ * every attempt fails), while also supporting Standard Schema validators that
+ * return promises. Keep the two in step: agent tool calls validate here, and
+ * `Tool.execute` then skips its own synchronous check.
  */
 export async function validateToolInputAsync<T = unknown>(
   schema: StandardSchemaWithJSON<T> | undefined,
@@ -598,28 +601,37 @@ export async function validateToolInputAsync<T = unknown>(
     const validation = await safeValidateAsync(schema, normalizedInput);
     if ('value' in validation) return { data: validation.value };
 
+    let currentInput = normalizedInput;
+    let currentIssues = validation.issues;
+
     const coercedInput = coerceStringifiedJsonValues(schema, normalizedInput);
     if (coercedInput !== normalizedInput) {
       const coercedValidation = await safeValidateAsync(schema, coercedInput);
       if ('value' in coercedValidation) return { data: coercedValidation.value };
+      currentInput = coercedInput;
+      currentIssues = coercedValidation.issues;
     }
 
     const failingNullPaths = new Set(
-      validation.issues
+      currentIssues
         .filter(issue => {
           if (!issue.path || issue.path.length === 0) return false;
-          const value = getValueAtPath(normalizedInput, issue.path);
+          const value = getValueAtPath(currentInput, issue.path);
           return value === null || value === undefined;
         })
         .map(issue => issue.path?.map(p => (typeof p === 'object' && 'key' in p ? String(p.key) : String(p))).join('.'))
         .filter((path): path is string => Boolean(path)),
     );
     const strippedInput =
-      failingNullPaths.size > 0 ? stripNullishValuesAtPaths(input, failingNullPaths) : stripNullishValues(input);
+      failingNullPaths.size > 0
+        ? stripNullishValuesAtPaths(currentInput, failingNullPaths)
+        : stripNullishValues(coercedInput !== normalizedInput ? coercedInput : input);
     const normalizedStripped = normalizeNullishInput(schema, strippedInput);
     const retryValidation = await safeValidateAsync(schema, normalizedStripped);
     if ('value' in retryValidation) return { data: retryValidation.value };
+    if (failingNullPaths.size > 0) currentInput = normalizedStripped;
 
+    let aliasIssues: typeof validation.issues | undefined;
     const promptJsonSchema = standardSchemaToJSONSchema(schema, { io: 'input' });
     const schemaExpectsPrompt =
       promptJsonSchema.type === 'object' &&
@@ -627,28 +639,33 @@ export async function validateToolInputAsync<T = unknown>(
       'prompt' in promptJsonSchema.properties;
     if (
       schemaExpectsPrompt &&
-      normalizedInput != null &&
-      typeof normalizedInput === 'object' &&
-      !Array.isArray(normalizedInput)
+      currentInput != null &&
+      typeof currentInput === 'object' &&
+      !Array.isArray(currentInput)
     ) {
-      const obj = normalizedInput as Record<string, unknown>;
+      const obj = currentInput as Record<string, unknown>;
       if (obj.prompt == null) {
         const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
         if (alias !== undefined) {
           const promptValidation = await safeValidateAsync(schema, { ...obj, prompt: alias });
           if ('value' in promptValidation) return { data: promptValidation.value };
+          aliasIssues = promptValidation.issues;
         }
       }
     }
 
-    const errorMessages = validation.issues
+    // As in validateToolInputUnsafe (GitHub #24539): after a path-stripped
+    // retry, its issues are the real ones; the first pass also lists nulls on
+    // optional fields that stripping resolved.
+    const finalIssues = aliasIssues ?? (failingNullPaths.size > 0 ? retryValidation.issues : currentIssues);
+    const errorMessages = finalIssues
       .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
       .join('\n');
     return {
       error: markToolValidationError<T>({
         error: true,
         message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
-        validationErrors: buildFormattedErrors<T>(validation.issues),
+        validationErrors: buildFormattedErrors<T>(finalIssues),
       }),
     };
   } catch {

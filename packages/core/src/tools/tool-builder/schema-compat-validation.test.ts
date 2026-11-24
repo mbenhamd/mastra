@@ -975,6 +975,57 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     });
   });
 
+  describe('explicit nulls on optional fields without the OpenAI compat layer', () => {
+    // Models without the OpenAI compat layer (Anthropic, OpenRouter Gemini) see
+    // the author's .optional() fields, and some send null for them. Agent tool
+    // calls validate asynchronously; the refusal must name the real fault only.
+    const nonOpenAiModels = [
+      ['anthropic', haikuModelConfig],
+      [
+        'openrouter gemini',
+        {
+          provider: 'openrouter',
+          modelId: 'google/gemini-2.5-flash-lite',
+          specificationVersion: 'v4' as const,
+          supportsStructuredOutputs: false,
+        },
+      ],
+    ] as const;
+    const slideTool = (): ToolAction<any, any> => ({
+      id: 'propose-slide',
+      description: 'Propose a slide',
+      inputSchema: z.object({
+        title: z.string(),
+        subtitle: z.string().optional(),
+        content: z.object({ body: z.string() }),
+        position: z.number().optional(),
+      }),
+      execute: async input => ({ ok: true, input }),
+    });
+    const callOptions = { abortSignal: new AbortController().signal, toolCallId: 'slide-call', messages: [] };
+
+    it.each(nonOpenAiModels)('lists only the real fault when it comes with nulls (%s)', async (_, model) => {
+      const result = await buildCoreTool(slideTool(), 'propose-slide', model).execute?.(
+        { title: 'Results', subtitle: null, content: { body: 42 }, position: null },
+        callOptions,
+      );
+      expect(result).toHaveProperty('error', true);
+      const listed = (result as { message: string }).message
+        .split('\n')
+        .filter(line => line.startsWith('- '))
+        .map(line => line.slice(2, line.indexOf(':')));
+      expect(listed).toEqual(['content.body']);
+    });
+
+    it.each(nonOpenAiModels)('accepts nulls on optional fields alone (%s)', async (_, model) => {
+      const result = await buildCoreTool(slideTool(), 'propose-slide', model).execute?.(
+        { title: 'Results', subtitle: null, content: { body: 'Survival improved.' }, position: null },
+        callOptions,
+      );
+      expect(result).toEqual({ ok: true, input: { title: 'Results', content: { body: 'Survival improved.' } } });
+    });
+  });
+
   describe('strict: false opts out of strict-mode schema rewriting', () => {
     const openaiModelConfig = {
       provider: 'openai',
