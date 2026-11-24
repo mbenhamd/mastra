@@ -125,7 +125,7 @@ type HarnessToolContextSlot = {
 };
 
 // Same text as the durable tool-call step's refusal of unparseable arguments.
-function invalidToolArgumentsError(toolName: string | undefined): Error {
+function invalidToolArgumentsError(toolName: string): Error {
   return new Error(
     `Tool "${toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
   );
@@ -1482,14 +1482,6 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // still clear it); a cached `required: false` must never short-circuit it.
         const toolRequiresApproval = approvalRequirement.required || policyAsk;
 
-        // execute() is intentionally deferred until after approval, but its
-        // schema validation must not be deferred with it. Otherwise an invalid
-        // provider call can be presented to a user, accepted, and only then
-        // collapse into a validation result on the resumed leg. Return that
-        // same result to the model now so it can repair the call before anyone
-        // is asked to approve it. Keep execute() validation as the final
-        // authority and do not reuse transformed data here: transforms are not
-        // guaranteed to be idempotent.
         // Unparseable arguments are refused at the step's own guard below, after
         // approval. Refuse them here instead, so the user is never asked to approve
         // a call that cannot run. The approval check would not catch them: it
@@ -1502,6 +1494,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           };
         }
 
+        // execute() is intentionally deferred until after approval, but its
+        // schema validation must not be deferred with it. Otherwise an invalid
+        // provider call can be presented to a user, accepted, and only then
+        // collapse into a validation result on the resumed leg. Return that
+        // same result to the model now so it can repair the call before anyone
+        // is asked to approve it. Keep execute() validation as the final
+        // authority and do not reuse transformed data here: transforms are not
+        // guaranteed to be idempotent.
         if (toolRequiresApproval && resumeData === undefined && typeof validateInput === 'function') {
           const preflightValidation = await validateInput(args);
           if (preflightValidation.error !== undefined) {

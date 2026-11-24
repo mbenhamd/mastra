@@ -2663,6 +2663,8 @@ describe('createToolCallStep tool approval workflow', () => {
       streamState,
     } as any);
 
+    // A regression suspends; resolve it so the assertions below fail instead of the test hanging.
+    suspend.mockResolvedValueOnce('suspended');
     const refused = await step.execute(makeExecuteParams({ inputData: { ...makeInputData(), args: null } }));
 
     expect(suspend).not.toHaveBeenCalled();
