@@ -124,6 +124,13 @@ type HarnessToolContextSlot = {
   registerPlanApproval?: (params: Record<string, unknown>) => Promise<void>;
 };
 
+// Same text as the durable tool-call step's refusal of unparseable arguments.
+function invalidToolArgumentsError(toolName: string | undefined): Error {
+  return new Error(
+    `Tool "${toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
+  );
+}
+
 function buildToolRequestContext(
   requestContext: RequestContext,
   opts: { runId: string; toolCallId: string },
@@ -1483,6 +1490,18 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // is asked to approve it. Keep execute() validation as the final
         // authority and do not reuse transformed data here: transforms are not
         // guaranteed to be idempotent.
+        // Unparseable arguments are refused at the step's own guard below, after
+        // approval. Refuse them here instead, so the user is never asked to approve
+        // a call that cannot run. The approval check would not catch them: it
+        // validates `null` as `{}`, which an all-optional schema accepts. The
+        // durable path refuses the same call before its approval gate.
+        if (toolRequiresApproval && resumeData === undefined && (args === null || args === undefined)) {
+          return {
+            error: serializeToolError(invalidToolArgumentsError(inputData.toolName)),
+            ...inputData,
+          };
+        }
+
         if (toolRequiresApproval && resumeData === undefined && typeof validateInput === 'function') {
           const preflightValidation = await validateInput(args);
           if (preflightValidation.error !== undefined) {
@@ -2085,11 +2104,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         if (args === null || args === undefined) {
           return {
-            error: serializeToolError(
-              new Error(
-                `Tool "${inputData.toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
-              ),
-            ),
+            error: serializeToolError(invalidToolArgumentsError(inputData.toolName)),
             ...inputData,
           };
         }
