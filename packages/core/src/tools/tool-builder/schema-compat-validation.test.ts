@@ -1107,12 +1107,15 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       ['prompt alias plus fault', promptSchema, { query: 'find it', limit: 'many' }],
     ];
 
-    it.each(cases)('%s: refused before approval, or run by execute', async (_, inputSchema, input) => {
+    it.each(cases)('%s: refused before approval exactly when execute refuses it', async (_, inputSchema, input) => {
       const coreTool = buildCoreTool(gatedTool(inputSchema), 'gated-tool', geminiModel);
       const preflight = await coreTool.validateInput?.(structuredClone(input));
-      if (preflight?.error !== undefined) return;
       const executed = await coreTool.execute?.(structuredClone(input), callOptions);
-      expect(executed).toMatchObject({ ok: true });
+      if (preflight?.error === undefined) {
+        expect(executed).toMatchObject({ ok: true });
+      } else {
+        expect(executed).toHaveProperty('error', true);
+      }
     });
   });
 
