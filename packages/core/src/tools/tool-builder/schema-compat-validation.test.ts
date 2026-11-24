@@ -1026,6 +1026,96 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
     });
   });
 
+  describe('an approved tool call is not refused at execute for its input', () => {
+    // The approval check runs before a user is asked; execute() later validates
+    // the same raw arguments against the compat schema. On a compat-layer model
+    // the check must refuse whatever execute() would refuse.
+    const geminiModel = {
+      provider: 'openrouter',
+      modelId: 'google/gemini-2.5-flash-lite',
+      specificationVersion: 'v4' as const,
+      supportsStructuredOutputs: false,
+    };
+    const schema = z.object({
+      title: z.string(),
+      subtitle: z.string().optional(),
+      note: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      layout: z.object({ columns: z.number() }).optional(),
+      content: z.object({ body: z.string(), caption: z.string().optional() }),
+      either: z.union([z.string(), z.array(z.number())]).optional(),
+    });
+    const promptSchema = z.object({ prompt: z.string(), limit: z.number().optional() });
+    const gatedTool = (inputSchema: typeof schema | typeof promptSchema): ToolAction<any, any> => ({
+      id: 'gated-tool',
+      description: 'A tool that needs approval',
+      inputSchema,
+      requireApproval: true,
+      execute: async input => ({ ok: true, input }),
+    });
+    const callOptions = { abortSignal: new AbortController().signal, toolCallId: 'gated-call', messages: [] };
+    const listed = (error: unknown) =>
+      String((error as { message?: unknown }).message)
+        .split('\n')
+        .filter(line => line.startsWith('- '))
+        .map(line => line.slice(2, line.indexOf(':')));
+
+    it('refuses a stringified value with a null before approval, as execute would', async () => {
+      const input = { title: 'A', tags: '["x"]', subtitle: null, content: { body: 'b' } };
+      const preflight = await buildCoreTool(gatedTool(schema), 'gated-tool', geminiModel).validateInput?.(input);
+      const executed = await buildCoreTool(gatedTool(schema), 'gated-tool', geminiModel).execute?.(input, callOptions);
+      expect(executed).toHaveProperty('error', true);
+      expect(listed(preflight?.error)).toEqual(listed(executed));
+    });
+
+    it('lets a valid call through approval and execute', async () => {
+      const input = { title: 'A', subtitle: null, tags: ['x'], content: { body: 'b' } };
+      const coreTool = buildCoreTool(gatedTool(schema), 'gated-tool', geminiModel);
+      await expect(coreTool.validateInput?.(input)).resolves.toEqual({
+        data: { title: 'A', tags: ['x'], content: { body: 'b' } },
+      });
+      await expect(coreTool.execute?.(input, callOptions)).resolves.toEqual({
+        ok: true,
+        input: { title: 'A', tags: ['x'], content: { body: 'b' } },
+      });
+    });
+
+    const cases: [string, typeof schema | typeof promptSchema, unknown][] = [
+      ['valid', schema, { title: 'A', content: { body: 'b' } }],
+      ['nulls on optional fields', schema, { title: 'A', subtitle: null, content: { body: 'b', caption: null } }],
+      ['null on a nullable field', schema, { title: 'A', note: null, content: { body: 'b' } }],
+      ['fault plus nulls', schema, { title: 'A', subtitle: null, content: { body: 42, caption: null } }],
+      ['fault only', schema, { title: 'A', content: { body: 42 } }],
+      ['missing required', schema, { content: { body: 'b' } }],
+      ['stringified array', schema, { title: 'A', tags: '["x","y"]', content: { body: 'b' } }],
+      [
+        'stringified object plus nulls',
+        schema,
+        { title: 'A', layout: '{"columns":2}', subtitle: null, content: { body: 'b' } },
+      ],
+      ['stringified array plus fault', schema, { title: 'A', tags: '["x"]', content: { body: 1 } }],
+      ['malformed stringified array', schema, { title: 'A', tags: '[x', content: { body: 'b' } }],
+      ['JSON-looking string in a string union', schema, { title: 'A', either: '[1,2]', content: { body: 'b' } }],
+      [
+        'invalid JSON-looking string in a string union plus nulls',
+        schema,
+        { title: 'A', either: '["a"]', subtitle: null, content: { body: 'b' } },
+      ],
+      ['top-level null', promptSchema, null],
+      ['prompt alias', promptSchema, { query: 'find it' }],
+      ['prompt alias plus null', promptSchema, { query: 'find it', limit: null }],
+      ['prompt alias plus fault', promptSchema, { query: 'find it', limit: 'many' }],
+    ];
+
+    it.each(cases)('%s: refused before approval, or run by execute', async (_, inputSchema, input) => {
+      const coreTool = buildCoreTool(gatedTool(inputSchema), 'gated-tool', geminiModel);
+      const preflight = await coreTool.validateInput?.(structuredClone(input));
+      if (preflight?.error !== undefined) return;
+      const executed = await coreTool.execute?.(structuredClone(input), callOptions);
+      expect(executed).toMatchObject({ ok: true });
+    });
+  });
+
   describe('strict: false opts out of strict-mode schema rewriting', () => {
     const openaiModelConfig = {
       provider: 'openai',

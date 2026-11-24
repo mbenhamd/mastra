@@ -1460,10 +1460,22 @@ export class CoreToolBuilder extends MastraBase {
       // validator separately. The agent loop uses this to keep schema-invalid
       // calls out of a user-facing approval queue; execute() still performs
       // authoritative validation immediately before side effects.
-      validateInput: (params: unknown) =>
-        approvalInputValidationSchema
-          ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
-          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name),
+      // execute() validates the same raw arguments against the compat schema
+      // when a layer applies, so the approval check runs that validator too: a
+      // call the user approves must not then fail execute() on its input. The
+      // native check still runs after it for constraints the compat schema drops.
+      validateInput: async (params: unknown) => {
+        if (!approvalInputValidationSchema) {
+          return validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name);
+        }
+        if (inputValidationSchema) {
+          const executeValidation = await validateToolInputAsync(inputValidationSchema, params, this.options.name);
+          if (executeValidation.error !== undefined) {
+            return executeValidation;
+          }
+        }
+        return validateToolInputAsync(approvalInputValidationSchema, params, this.options.name);
+      },
       approvalInputEditing,
       execute: this.originalTool.execute
         ? this.createExecute(
