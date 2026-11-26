@@ -1831,7 +1831,7 @@ verify_pf9666_patched_cfworker_graph() (
   # In a UTF-8 locale grep drops a line holding an invalid byte; read bytes.
   # No match (status 1) is an empty set; a read error refuses.
   local graph_status=0
-  LC_ALL=C grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
+  LC_ALL=C grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|(^|/)patches/' \
     "$actual_paths" > "$actual_paths.graph" || graph_status=$?
   if (( graph_status > 1 )) || ! LC_ALL=C sort -u -o "$actual_paths" "$actual_paths.graph"; then
     rm -f "$actual_paths.graph"
@@ -3083,6 +3083,20 @@ run_pf9666_patched_cfworker_admission_self_tests() (
   output="$test_root/invalid-utf8-manifest.log"
   if run_fixture_admission "$output" LC_ALL=C.UTF-8; then
     echo 'A manifest under a directory name that is not UTF-8 unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+
+  # A patch file in a nested patches directory is a seventh graph file.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  mkdir -p "$fixture_repo/agent-sdks/openai/patches"
+  printf 'extra\n' > "$fixture_repo/agent-sdks/openai/patches/extra.patch"
+  git -C "$fixture_repo" add agent-sdks/openai/patches/extra.patch
+  git -C "$fixture_repo" commit -q -m 'add a nested patch file'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/nested-patch.log"
+  if run_fixture_admission "$output"; then
+    echo 'A nested patch file unexpectedly passed PF-9666 admission.' >&2
     return 1
   fi
   grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
