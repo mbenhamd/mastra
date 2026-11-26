@@ -1817,7 +1817,8 @@ verify_pf9666_patched_cfworker_graph() (
     return 1
   fi
   tr '\0' '\n' < "$actual_paths.z" > "$actual_paths"
-  grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
+  # In a UTF-8 locale grep drops a line holding an invalid byte; read bytes.
+  LC_ALL=C grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
     "$actual_paths" | LC_ALL=C sort -u > "$actual_paths.graph" || true
   mv "$actual_paths.graph" "$actual_paths"
   if ! cmp -s "$expected_paths" "$actual_paths"; then
@@ -3048,6 +3049,22 @@ run_pf9666_patched_cfworker_admission_self_tests() (
   output="$test_root/non-ascii-manifest.log"
   if run_fixture_admission "$output"; then
     echo 'A manifest under a non-ASCII directory unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+
+  # A name with a byte that is not UTF-8, checked under a UTF-8 locale.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  local invalid_utf8_dir
+  invalid_utf8_dir="$(printf 'pkg-\351')"
+  mkdir -p "$fixture_repo/$invalid_utf8_dir"
+  printf '{"name":"unreviewed"}\n' > "$fixture_repo/$invalid_utf8_dir/package.json"
+  git -C "$fixture_repo" add "$invalid_utf8_dir/package.json"
+  git -C "$fixture_repo" commit -q -m 'add a manifest under a directory name that is not UTF-8'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/invalid-utf8-manifest.log"
+  if run_fixture_admission "$output" LC_ALL=C.UTF-8; then
+    echo 'A manifest under a directory name that is not UTF-8 unexpectedly passed PF-9666 admission.' >&2
     return 1
   fi
   grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
@@ -6173,7 +6190,8 @@ run_validator_self_tests() {
       git rev-parse HEAD
     )"
     assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log"
-    grep -Fq 'agent-sdks/openai/package.json' "$test_root/pf9666-sdk-manifest.log" || {
+    grep -A1 -F 'require dedicated validation' "$test_root/pf9666-sdk-manifest.log" |
+      grep -Fxq 'agent-sdks/openai/package.json' || {
       echo 'The Agent SDK manifest refusal did not name agent-sdks/openai/package.json.' >&2
       cat "$test_root/pf9666-sdk-manifest.log" >&2
       exit 1
@@ -6196,9 +6214,43 @@ run_validator_self_tests() {
       cat "$output" >&2
       exit 1
     fi
-    assert_contains 'agent-sdks/openai/src/provider.e2e.test.ts' "$output"
+    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/provider.e2e.test.ts' || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/provider.e2e.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
     if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
       echo 'The Agent SDK suite ran with an unsupported test file.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    local sdk_symlink_head
+    sdk_symlink_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('runs', () => {});" > agent-sdks/openai/src/real.ts
+      ln -s real.ts agent-sdks/openai/src/linked.test.ts
+      git add .
+      git commit -q -m 'add an openai test symlink'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-symlink.log"
+    if run_fixture "$sdk_symlink_head" "$output" BASE_SHA="$owned_base"; then
+      echo 'An Agent SDK test symlink unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/linked.test.ts' || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a test symlink.' >&2
       cat "$command_log" >&2
       exit 1
     fi
@@ -16639,14 +16691,21 @@ fi
 # with mocked provider SDKs; provider credentials are cleared regardless.
 # Their Vitest configs collect every src/**/*.test.ts, so a test file the test
 # classification refuses (end-to-end, integration or Playwright) would run in
-# the whole-suite command. Refuse such a file before anything runs.
+# the whole-suite command. Refuse such a file, one that is not a regular Git
+# blob, or one that cannot be read, before anything runs.
 agent_sdk_unsupported_tests() {
-  local file
+  local file playwright_status
   while IFS= read -r -d '' file; do
     [[ "$file" =~ \.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || continue
     if [[ "$file" == */integration-tests/* || "$file" == *$'\n'* || \
       "$file" =~ \.e2e\.(test|spec)\. || "$file" =~ integration\.(test|spec)\. ]] ||
-      grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+      ! git_regular_file_at_head "$file"; then
+      printf '%s\n' "$file"
+      continue
+    fi
+    playwright_status=0
+    grep -Eq "['\"]@playwright/test['\"]" "$file" || playwright_status=$?
+    if (( playwright_status != 1 )); then
       printf '%s\n' "$file"
     fi
   done < <(git ls-files -z -- "$1")
