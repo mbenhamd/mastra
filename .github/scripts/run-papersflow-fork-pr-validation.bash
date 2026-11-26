@@ -1788,7 +1788,7 @@ verify_pf9666_patched_cfworker_graph() (
 
   expected_paths="$(mktemp)"
   actual_paths="$(mktemp)"
-  trap 'rm -f "$expected_paths" "$actual_paths"' EXIT
+  trap 'rm -f "$expected_paths" "$actual_paths" "$actual_paths.z" "$actual_paths.graph"' EXIT
 
   printf '%s\n' "$patch_path" pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
   LC_ALL=C sort -u "$manifest_changes" > "$actual_paths"
@@ -1805,10 +1805,18 @@ verify_pf9666_patched_cfworker_graph() (
     packages/schema-compat/package.json \
     pnpm-lock.yaml \
     pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
-  if ! git diff --no-renames --name-only "$base_sha" "$head_sha" > "$actual_paths"; then
+  # -z prints every path verbatim; without it Git quotes unusual names and the
+  # end-anchored filter below would miss them. A path containing a newline
+  # cannot be compared line by line, so it is refused.
+  if ! git diff --no-renames --name-only -z "$base_sha" "$head_sha" > "$actual_paths.z"; then
     echo 'PF-9666 could not list the changed paths.' >&2
     return 1
   fi
+  if [[ "$(tr -cd '\n' < "$actual_paths.z" | wc -c)" -ne 0 ]]; then
+    echo 'PF-9666 refuses a changed path that contains a newline.' >&2
+    return 1
+  fi
+  tr '\0' '\n' < "$actual_paths.z" > "$actual_paths"
   grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
     "$actual_paths" | LC_ALL=C sort -u > "$actual_paths.graph" || true
   mv "$actual_paths.graph" "$actual_paths"
@@ -3028,6 +3036,21 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     return 1
   fi
   grep -Fq 'PF-9666 watched dependency-graph paths are outside the exact reviewed set' "$output"
+
+  # Git quotes a non-ASCII path by default; the verbatim listing must still
+  # see this seventh dependency-graph file.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  mkdir -p "$fixture_repo/pkg-é"
+  printf '{"name":"unreviewed"}\n' > "$fixture_repo/pkg-é/package.json"
+  git -C "$fixture_repo" add "pkg-é/package.json"
+  git -C "$fixture_repo" commit -q -m 'add a manifest under a non-ASCII directory'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/non-ascii-manifest.log"
+  if run_fixture_admission "$output"; then
+    echo 'A manifest under a non-ASCII directory unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
 
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
   head_sha="$reviewed_head"
@@ -6137,6 +6160,48 @@ run_validator_self_tests() {
       cat "$test_root/pf9666-factory-manifest.log" >&2
       exit 1
     }
+
+    local sdk_manifest_head
+    sdk_manifest_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' '{"name":"@mastra/openai","scripts":{"build":"true","lint":"true"}}' \
+        > agent-sdks/openai/package.json
+      printf '%s\n' 'export const utils = 3;' > agent-sdks/openai/src/utils.ts
+      git add .
+      git commit -q -m 'redefine openai scripts'
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log"
+    grep -Fq 'agent-sdks/openai/package.json' "$test_root/pf9666-sdk-manifest.log" || {
+      echo 'The Agent SDK manifest refusal did not name agent-sdks/openai/package.json.' >&2
+      cat "$test_root/pf9666-sdk-manifest.log" >&2
+      exit 1
+    }
+
+    local sdk_e2e_head
+    sdk_e2e_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('calls the provider', () => {});" \
+        > agent-sdks/openai/src/provider.e2e.test.ts
+      git add .
+      git commit -q -m 'add an openai e2e test'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-e2e.log"
+    if run_fixture "$sdk_e2e_head" "$output" BASE_SHA="$owned_base"; then
+      echo 'An Agent SDK end-to-end test unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'agent-sdks/openai/src/provider.e2e.test.ts' "$output"
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with an unsupported test file.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
     git -C "$fixture_repo" reset -q --hard "$base_sha"
     echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
   }
@@ -15541,10 +15606,16 @@ while IFS= read -r path; do
       [[ "$inngest_pf2057_dependency_cleanup" == true ]]; }; then
     continue
   fi
+  # The Agent SDK manifests are admitted only as the two blobs the exact PF-9666
+  # patched cfworker graph pins.
+  if [[ "$path" == agent-sdks/claude/package.json || "$path" == agent-sdks/openai/package.json ]] &&
+    [[ "$pf9666_patched_cfworker_graph" == true ]]; then
+    continue
+  fi
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
   grep -E \
-    '^(client-sdks/client-js|mastracode/(factory|sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
+    '^(agent-sdks/(claude|openai)|client-sdks/client-js|mastracode/(factory|sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
     "$changed_files" || true
 )
 
@@ -16566,8 +16637,28 @@ fi
 # Agent SDK packages resolve @mastra/core and @mastra/schema-compat through the
 # dist outputs build:core produced above. Their Vitest suites are in-process
 # with mocked provider SDKs; provider credentials are cleared regardless.
+# Their Vitest configs collect every src/**/*.test.ts, so a test file the test
+# classification refuses (end-to-end, integration or Playwright) would run in
+# the whole-suite command. Refuse such a file before anything runs.
+agent_sdk_unsupported_tests() {
+  local file
+  while IFS= read -r -d '' file; do
+    [[ "$file" =~ \.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || continue
+    if [[ "$file" == */integration-tests/* || "$file" == *$'\n'* || \
+      "$file" =~ \.e2e\.(test|spec)\. || "$file" =~ integration\.(test|spec)\. ]] ||
+      grep -Eq "['\"]@playwright/test['\"]" "$file"; then
+      printf '%s\n' "$file"
+    fi
+  done < <(git ls-files -z -- "$1")
+}
 for agent_sdk in agent-sdks/claude agent-sdks/openai; do
   if workspace_changed "$agent_sdk"; then
+    agent_sdk_refused_tests="$(agent_sdk_unsupported_tests "$agent_sdk")"
+    if [[ -n "$agent_sdk_refused_tests" ]]; then
+      echo "These $agent_sdk test files are not supported by fork PR validation:" >&2
+      printf '%s\n' "$agent_sdk_refused_tests" >&2
+      exit 1
+    fi
     run_with_validation_budget 900 pnpm --filter "./$agent_sdk" --fail-if-no-match build
     run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match exec tsc --noEmit
     run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match lint
