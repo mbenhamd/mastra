@@ -78,6 +78,7 @@ import {
   validateToolInputAsync,
   validateToolOutput,
   validateToolSuspendData,
+  isSamePlainValue,
 } from '../validation';
 import type { ValidationError } from '../validation';
 
@@ -1359,6 +1360,30 @@ export class CoreToolBuilder extends MastraBase {
     const approvalInputValidationSchema = resolveNativeInputValidationSchema(originalSchema);
     const approvalInputEditing = resolveApprovalInputEditing(approvalInputValidationSchema);
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
+    const sharedPreApprovalValidations = new WeakMap<
+      object,
+      { snapshot: unknown; result: ReturnType<typeof validateToolInputAsync> }
+    >();
+    const validateBeforeApproval = async (nativeSchema: StandardSchemaWithJSON, params: unknown) => {
+      if (inputValidationSchema) {
+        // The loops remove a truthy top-level `_background` before execute()
+        // validates, so the compat check sees the arguments without it. The
+        // native check below still sees it, as before.
+        const executeParams =
+          params !== null &&
+          typeof params === 'object' &&
+          !Array.isArray(params) &&
+          Object.hasOwn(params, '_background') &&
+          (params as Record<string, unknown>)._background
+            ? (({ _background: _removedByLoop, ...rest }) => rest)(params as Record<string, unknown>)
+            : params;
+        const executeValidation = await validateToolInputAsync(inputValidationSchema, executeParams, this.options.name);
+        if (executeValidation.error !== undefined) {
+          return executeValidation;
+        }
+      }
+      return validateToolInputAsync(nativeSchema, params, this.options.name);
+    };
     let processedInputSchema: Schema | undefined;
 
     if (originalSchema) {
@@ -1513,13 +1538,30 @@ export class CoreToolBuilder extends MastraBase {
         if (!approvalInputValidationSchema) {
           return validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name);
         }
-        if (inputValidationSchema) {
-          const executeValidation = await validateToolInputAsync(inputValidationSchema, params, this.options.name);
-          if (executeValidation.error !== undefined) {
-            return executeValidation;
+        // The agent loops check one call's arguments twice before approval (the
+        // schema preflight and the beforeApproval checks) with the same object.
+        // The second check reuses the first one's answer while the arguments
+        // are unchanged, so the compat pass adds no extra run of the author's
+        // refinements and transforms.
+        const shareable = params !== null && typeof params === 'object';
+        if (shareable) {
+          const shared = sharedPreApprovalValidations.get(params);
+          if (shared) {
+            sharedPreApprovalValidations.delete(params);
+            if (isSamePlainValue(shared.snapshot, params)) return shared.result;
           }
         }
-        return validateToolInputAsync(approvalInputValidationSchema, params, this.options.name);
+        const result = validateBeforeApproval(approvalInputValidationSchema, params);
+        if (shareable) {
+          let snapshot: unknown;
+          try {
+            snapshot = structuredClone(params);
+          } catch {
+            return result;
+          }
+          sharedPreApprovalValidations.set(params, { snapshot, result });
+        }
+        return result;
       },
       approvalInputEditing,
       execute: this.originalTool.execute

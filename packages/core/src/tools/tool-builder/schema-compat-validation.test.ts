@@ -1117,6 +1117,32 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
         expect(executed).toHaveProperty('error', true);
       }
     });
+
+    it("runs the author's refinement once per pre-approval check pair, as the native check alone did", async () => {
+      // The loops check the same arguments object twice before approval. Fork
+      // main ran only the native check there: the refinement ran twice.
+      let refinements = 0;
+      const counted = schema.refine(() => {
+        refinements += 1;
+        return true;
+      });
+      const coreTool = buildCoreTool(gatedTool(counted as unknown as typeof schema), 'gated-tool', geminiModel);
+      const args = { title: 'A', content: { body: 'b' } };
+
+      expect((await coreTool.validateInput?.(args))?.error).toBeUndefined();
+      expect((await coreTool.validateInput?.(args))?.error).toBeUndefined();
+
+      expect(refinements).toBe(2);
+    });
+
+    it('checks a stringified `_background` as the loop does, which removes it before execute', async () => {
+      const foreground = z.object({ title: z.string(), _background: z.object({ enabled: z.boolean() }).optional() });
+      const coreTool = buildCoreTool(gatedTool(foreground as unknown as typeof schema), 'gated-tool', geminiModel);
+
+      const preflight = await coreTool.validateInput?.({ title: 'A', _background: '{"enabled":false}' });
+
+      expect(preflight?.error).toBeUndefined();
+    });
   });
 
   describe('strict: false opts out of strict-mode schema rewriting', () => {
