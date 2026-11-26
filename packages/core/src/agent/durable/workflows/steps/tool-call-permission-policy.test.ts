@@ -178,7 +178,7 @@ describe('durable tool-call per-tool permission policy', () => {
 
     const result = await executeStep({ requestContext, permissionPolicyRequired: true, suspend });
 
-    expect(validateInput).toHaveBeenCalledWith(TOOL_ARGS);
+    expect(validateInput).toHaveBeenCalledWith(TOOL_ARGS, { backgroundRemoval: 'present' });
     expect(result).toMatchObject({
       result: validationError,
     });

@@ -1135,13 +1135,62 @@ describe('CoreToolBuilder - Schema Compatibility in Validation', () => {
       expect(refinements).toBe(2);
     });
 
-    it('checks a stringified `_background` as the loop does, which removes it before execute', async () => {
+    // Each loop removes a top-level `_background` before execute() validates, by
+    // its own rule: the standard loop when the value is truthy, the durable loop
+    // whenever the key is present. The compat check must see what execute() sees.
+    const backgroundSeen = () => {
+      const seen: boolean[] = [];
+      const foreground = z
+        .object({
+          title: z.string(),
+          _background: z.union([z.literal(false), z.object({ enabled: z.boolean() })]).optional(),
+        })
+        .superRefine(value => {
+          seen.push(Object.hasOwn(value, '_background'));
+        });
+      const coreTool = buildCoreTool(gatedTool(foreground as unknown as typeof schema), 'gated-tool', geminiModel);
+      return { seen, coreTool };
+    };
+
+    it('checks a stringified `_background` as the standard loop does, which removes it before execute', async () => {
       const foreground = z.object({ title: z.string(), _background: z.object({ enabled: z.boolean() }).optional() });
       const coreTool = buildCoreTool(gatedTool(foreground as unknown as typeof schema), 'gated-tool', geminiModel);
 
-      const preflight = await coreTool.validateInput?.({ title: 'A', _background: '{"enabled":false}' });
+      const preflight = await coreTool.validateInput?.(
+        { title: 'A', _background: '{"enabled":false}' },
+        { backgroundRemoval: 'truthy' },
+      );
 
       expect(preflight?.error).toBeUndefined();
+    });
+
+    it('checks `_background` as the standard loop does: removed when truthy, kept when falsy', async () => {
+      const { seen, coreTool } = backgroundSeen();
+
+      const truthy = await coreTool.validateInput?.(
+        { title: 'A', _background: { enabled: false } },
+        { backgroundRemoval: 'truthy' },
+      );
+      expect(truthy?.error).toBeUndefined();
+      // compat check without it, native check with it
+      expect(seen).toEqual([false, true]);
+
+      seen.length = 0;
+      const falsy = await coreTool.validateInput?.({ title: 'A', _background: false }, { backgroundRemoval: 'truthy' });
+      expect(falsy?.error).toBeUndefined();
+      expect(seen).toEqual([true, true]);
+    });
+
+    it('checks `_background` as the durable loop does: removed whenever present, falsy included', async () => {
+      const { seen, coreTool } = backgroundSeen();
+
+      const falsy = await coreTool.validateInput?.(
+        { title: 'A', _background: false },
+        { backgroundRemoval: 'present' },
+      );
+
+      expect(falsy?.error).toBeUndefined();
+      expect(seen).toEqual([false, true]);
     });
   });
 
