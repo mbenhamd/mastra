@@ -2182,8 +2182,8 @@ export class Agent<
    */
   async #validateRequestContext(requestContext?: RequestContext) {
     if (this.#requestContextSchema) {
-      const contextValues = getRequestContextInputValues(requestContext);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      const contextValues = getRequestContextInputValues(requestContext);
       const validation = await this.#requestContextSchema['~standard'].validate(contextValues);
 
       if (validation.issues) {

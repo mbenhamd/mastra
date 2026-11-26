@@ -608,8 +608,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // mirroring Agent.stream()/generate(). Without this, schema violations are
   // silently ignored on the durable path.
   if (typedAgent.requestContextSchema) {
-    const contextValues = getRequestContextInputValues(requestContext);
     if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+    const contextValues = getRequestContextInputValues(requestContext);
     const validation = await typedAgent.requestContextSchema['~standard'].validate(contextValues);
 
     if (validation.issues) {

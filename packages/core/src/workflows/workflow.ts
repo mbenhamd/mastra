@@ -5388,8 +5388,8 @@ export class Run<
 
   protected async _validateRequestContext(requestContext?: RequestContext) {
     if (this.validateInputs && this.requestContextSchema) {
-      const contextValues = getRequestContextInputValues(requestContext);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      const contextValues = getRequestContextInputValues(requestContext);
       const validation = this.requestContextSchema['~standard'].validate(contextValues);
 
       if (validation instanceof Promise) {
