@@ -837,6 +837,16 @@ describe('json-schema standard-schema adapter', () => {
         '$recursiveAnchor at "/$defs/$recursiveAnchor"',
       ],
       ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
+      ['a string $id in a name map', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
+      [
+        'a keyword that a $ref inside an object-valued prefixItems reaches',
+        {
+          type: 'array',
+          prefixItems: { length: 1, 0: { $ref: '#/default' } },
+          default: { $recursiveAnchor: true, type: 'object' },
+        },
+        '$recursiveAnchor at "/default/$recursiveAnchor"',
+      ],
       [
         'a $ref that is not a string',
         {

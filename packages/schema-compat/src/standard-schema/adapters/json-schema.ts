@@ -159,11 +159,13 @@ function refuseUnsupportedKey(key: string, value: unknown, at: string): void {
  * - an object read as a schema (`schema`), including a name map or literal data that a
  *   `$ref` reaches, is checked for every key;
  * - an object no reading reaches (`weak`, such as the value of `x-meta` or an unused
- *   `components` entry) is checked too, because the validator's dereference still walks it;
+ *   `components` entry) is checked too, because the validator's dereference still walks it,
+ *   and its `$ref` targets are read as schemas;
  * - a name map's own keys and literal data under `const`, `enum`, `default` or `examples` are
  *   names and values, so a property named `$id` or a `const` holding `{ "$id": "k" }` is kept.
- *   Where the dereference walk also reaches such an object as an unknown keyword's value, a key
- *   whose value is not an object (which the walk could read as that keyword) is refused.
+ *   In a name map, or where the dereference walk also reaches such an object as an unknown
+ *   keyword's value, a key whose value is not an object (which is no property schema, and which
+ *   the walk could read as that keyword) is refused.
  */
 function refuseUnsupportedKeywords(root: unknown): void {
   const pointers = new Map<object, string>();
@@ -177,13 +179,20 @@ function refuseUnsupportedKeywords(root: unknown): void {
     }
   };
   collect(root, '');
-  const roles = assignRoles(root, node => {
-    const ref = node.$ref;
-    if (typeof ref !== 'string' || !isLocalPointerRef(ref)) {
-      return [];
-    }
-    return [ref === '#' ? root : resolveByPointer({ '': root }, ref)];
-  });
+  // The validator can read an object the walk only reaches as an unknown keyword's value (an
+  // object-valued `prefixItems` is read item by item through its `length`), so a `$ref` there is
+  // followed too: its target is checked as a schema.
+  const roles = assignRoles(
+    root,
+    node => {
+      const ref = node.$ref;
+      if (typeof ref !== 'string' || !isLocalPointerRef(ref)) {
+        return [];
+      }
+      return [ref === '#' ? root : resolveByPointer({ '': root }, ref)];
+    },
+    FOLLOW_REFS_FROM_SCHEMA_AND_WEAK,
+  );
   for (const [node, pointer] of pointers) {
     const set = roles.get(node);
     if (Array.isArray(node) || !set) {
@@ -192,8 +201,9 @@ function refuseUnsupportedKeywords(root: unknown): void {
     const strong = set.has('schema') || set.has('names') || set.has('data');
     const readAsSchema = set.has('schema') || (!strong && set.has('weak'));
     const walkedAsSchema = set.has('weak');
+    const nameMap = set.has('names') || set.has('weak-names');
     for (const [key, value] of Object.entries(node)) {
-      if (readAsSchema || (walkedAsSchema && !isPlainObject(value))) {
+      if (readAsSchema || ((walkedAsSchema || nameMap) && !isPlainObject(value))) {
         refuseUnsupportedKey(key, value, `${pointer}/${pointerToken(key)}`);
       }
     }
@@ -256,8 +266,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
-/** Returns the role of every object, reading the schema from its root and through its references. */
-function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) => unknown[]): Map<object, Set<Role>> {
+const FOLLOW_REFS_FROM_SCHEMA: ReadonlySet<Role> = new Set<Role>(['schema']);
+const FOLLOW_REFS_FROM_SCHEMA_AND_WEAK: ReadonlySet<Role> = new Set<Role>(['schema', 'weak']);
+
+/**
+ * Returns the role of every object, reading the schema from its root and through its references.
+ * References are followed from objects holding one of the `followRefsFrom` roles.
+ */
+function assignRoles(
+  root: unknown,
+  targetsOf: (node: Record<string, unknown>) => unknown[],
+  followRefsFrom: ReadonlySet<Role> = FOLLOW_REFS_FROM_SCHEMA,
+): Map<object, Set<Role>> {
   const roles = new Map<object, Set<Role>>();
   const pending: unknown[] = [];
   const mark = (node: object, role: Role): boolean => {
@@ -310,7 +330,7 @@ function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) =
         walk(value, 'weak');
       }
     }
-    if (role === 'schema') {
+    if (followRefsFrom.has(role)) {
       pending.push(...targetsOf(record));
     }
   };
