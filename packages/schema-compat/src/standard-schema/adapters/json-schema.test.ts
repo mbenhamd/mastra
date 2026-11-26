@@ -874,6 +874,26 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
+  it('refuses a $ref inside an object-valued prefixItems that the validator resolves elsewhere than its pointer', async () => {
+    const standardSchema = toStandardSchema({
+      type: 'array',
+      prefixItems: { length: 1, 0: { $ref: '#/default/a%zz' } },
+      default: { 'a%zz': { $recursiveAnchor: true, type: 'object' } },
+    } as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    for (const value of [[5], [{}]]) {
+      expect(await standardSchema['~standard'].validate(value)).toEqual({
+        issues: [
+          {
+            message:
+              'Schema validation error: a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
+          },
+        ],
+      });
+    }
+  });
+
   it.each([
     ['a property named $id', { properties: { $id: { type: 'string' } } }, { $id: 'abc' }],
     ['$id inside const', { const: { $id: 'k' } }, { $id: 'k' }],

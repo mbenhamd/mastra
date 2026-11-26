@@ -437,6 +437,27 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
       throw new Error(REF_PLACEMENT_MESSAGE);
     }
   }
+  // The same check for every other `$ref` the dereference resolved, such as one inside an
+  // object-valued `prefixItems`, which the validator reads but the roles above do not follow:
+  // its target, by the validator's URI, must be the object its JSON Pointer names (the one the
+  // keyword scan checked).
+  const seen = new Set<object>();
+  const visit = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    const record = node as Record<string, unknown>;
+    if (!predicted.has(node) && typeof record.$ref === 'string' && typeof record.__absolute_ref__ === 'string') {
+      const expected = record.$ref === '#' ? root : resolveByPointer({ '': root }, record.$ref);
+      const [actual] = referenceTargets(record, lookup);
+      if (!Object.is(actual, expected)) {
+        throw new Error(REF_PLACEMENT_MESSAGE);
+      }
+    }
+    Object.values(record).forEach(visit);
+  };
+  visit(root);
 }
 
 /**
