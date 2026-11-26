@@ -831,18 +831,10 @@ describe('json-schema standard-schema adapter', () => {
         { properties: { n: { $ref: '#lim' } }, examples: { a: { minimum: 5 } } },
         '$ref "#lim" at "/properties/n/$ref"',
       ],
-      ['a string $id under properties', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
-      ['$id inside const', { const: { $id: 'k' } }, '$id at "/const/$id"'],
-      ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, '$anchor at "/enum/1/$anchor"'],
       [
-        'a non-local $ref inside examples',
-        { examples: [{ $ref: 'http://x.test/a~b' }] },
-        '$ref "http://x.test/a~b" at "/examples/0/$ref"',
-      ],
-      [
-        '$recursiveRef inside default, under a key with / and ~',
-        { properties: { 'a/b~': { default: { $recursiveRef: '#' } } } },
-        '$recursiveRef at "/properties/a~1b~0/default/$recursiveRef"',
+        'a keyword under a name map that a $ref reads as a schema',
+        { $defs: { $recursiveAnchor: true }, $ref: '#/$defs' },
+        '$recursiveAnchor at "/$defs/$recursiveAnchor"',
       ],
       ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
       [
@@ -870,6 +862,31 @@ describe('json-schema standard-schema adapter', () => {
         });
       }
     });
+  });
+
+  it.each([
+    ['a property named $id', { properties: { $id: { type: 'string' } } }, { $id: 'abc' }],
+    ['$id inside const', { const: { $id: 'k' } }, { $id: 'k' }],
+    ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, { $anchor: 'k' }],
+    ['a non-local $ref inside examples', { examples: [{ $ref: 'http://x.test/a~b' }] }, 'x'],
+    [
+      '$recursiveRef inside default, under a key with / and ~',
+      { properties: { 'a/b~': { default: { $recursiveRef: '#' } } } },
+      {},
+    ],
+    [
+      'a property named $id in a component named properties',
+      {
+        $ref: '#/components/schemas/properties',
+        components: { schemas: { properties: { type: 'object', properties: { $id: { type: 'string' } } } } },
+      },
+      { $id: 'abc' },
+    ],
+  ])('accepts a schema with %s, which only names a property or holds data', async (_case, schema, value) => {
+    const standardSchema = toStandardSchema(schema as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate(value)).toEqual({ value });
   });
 
   it('reports an extra property once, and still reports a property declared false', async () => {

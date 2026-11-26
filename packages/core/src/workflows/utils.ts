@@ -199,7 +199,10 @@ export async function validateStepRequestContext({
   const requestContextSchema = step.requestContextSchema;
 
   if (requestContextSchema && validateInputs) {
-    // Get input-form values so transformed contexts can be forwarded safely.
+    // Read the context after the validator wait, so the values validated are
+    // the ones the step runs with. Input-form values let transformed contexts
+    // be forwarded safely.
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const contextValues = getRequestContextInputValues(requestContext);
     const validatedRequestContext = await validateWithStandardSchema(requestContextSchema, contextValues);
     if (!validatedRequestContext.success) {

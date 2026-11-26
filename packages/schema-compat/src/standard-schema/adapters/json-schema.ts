@@ -130,58 +130,73 @@ function pointerToken(key: string): string {
   return key.replace(/~/g, '~0').replace(/\//g, '~1');
 }
 
+/** Throws when `key` (holding `value`) at `at` is a keyword the adapter refuses. */
+function refuseUnsupportedKey(key: string, value: unknown, at: string): void {
+  if (UNSUPPORTED_KEYWORDS.has(key)) {
+    throw new Error(
+      `${key} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+    );
+  }
+  if (VALIDATOR_INTERNAL_KEYS.has(key)) {
+    throw new Error(`${key} at "${at}" is reserved for the validator, so the schema is refused`);
+  }
+  if (key === '$ref' && (typeof value !== 'string' || !isLocalPointerRef(value))) {
+    throw new Error(
+      `$ref ${typeof value === 'string' ? `"${value}"` : 'that is not a string'} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
+    );
+  }
+}
+
 /**
  * Refuses a schema that uses `$id`, `$anchor`, `$dynamicAnchor`, `$dynamicRef`,
  * `$recursiveAnchor` or `$recursiveRef`, a `$ref` other than a `#` or `#/...` string, or one of
- * the keys the validator writes while resolving references (`__absolute_ref__` and the like).
- * The error names the keyword and its JSON Pointer in the schema.
+ * the keys the validator writes while resolving references (`__absolute_ref__` and the like),
+ * wherever the validator can read the object holding it as a schema. The error names the
+ * keyword and its JSON Pointer in the schema.
  *
- * The scan covers every object at any depth, including literal data under
- * `const`, `enum`, `default` or `examples` and annotations such as `example`:
- * a `$ref` pointer can make the validator read any of them as a schema, and
- * failing closed there is preferred to telling data from schemas. The one
- * exception is a name map (`properties`, `$defs`, ...): its keys are names, so a
- * property named `$id` or `$ref` whose value is an object (its schema) is kept,
- * while a string value there is refused, because a `$ref` to the map would make
- * the validator read it as that keyword.
+ * What each object is comes from `assignRoles`, which reads the schema from its root and
+ * through every `#`/`#/...` reference, as the validator does:
+ * - an object read as a schema (`schema`), including a name map or literal data that a
+ *   `$ref` reaches, is checked for every key;
+ * - an object no reading reaches (`weak`, such as the value of `x-meta` or an unused
+ *   `components` entry) is checked too, because the validator's dereference still walks it;
+ * - a name map's own keys and literal data under `const`, `enum`, `default` or `examples` are
+ *   names and values, so a property named `$id` or a `const` holding `{ "$id": "k" }` is kept.
+ *   Where the dereference walk also reaches such an object as an unknown keyword's value, a key
+ *   whose value is not an object (which the walk could read as that keyword) is refused.
  */
-function refuseUnsupportedKeywords(node: unknown, pointer = '', isNameMap = false, seen = new Set<object>()): void {
-  if (typeof node !== 'object' || node === null || seen.has(node)) {
-    return;
-  }
-  seen.add(node);
-  if (Array.isArray(node)) {
-    node.forEach((item, index) => refuseUnsupportedKeywords(item, `${pointer}/${index}`, false, seen));
-    return;
-  }
-  const record = node as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
-    const value = record[key];
-    if (isNameMap && typeof value !== 'string') {
+function refuseUnsupportedKeywords(root: unknown): void {
+  const pointers = new Map<object, string>();
+  const collect = (node: unknown, pointer: string): void => {
+    if (typeof node !== 'object' || node === null || pointers.has(node)) {
+      return;
+    }
+    pointers.set(node, pointer);
+    for (const [key, value] of Object.entries(node)) {
+      collect(value, `${pointer}/${Array.isArray(node) ? key : pointerToken(key)}`);
+    }
+  };
+  collect(root, '');
+  const roles = assignRoles(root, node => {
+    const ref = node.$ref;
+    if (typeof ref !== 'string' || !isLocalPointerRef(ref)) {
+      return [];
+    }
+    return [ref === '#' ? root : resolveByPointer({ '': root }, ref)];
+  });
+  for (const [node, pointer] of pointers) {
+    const set = roles.get(node);
+    if (Array.isArray(node) || !set) {
       continue;
     }
-    const at = `${pointer}/${pointerToken(key)}`;
-    if (UNSUPPORTED_KEYWORDS.has(key)) {
-      throw new Error(
-        `${key} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
-      );
+    const strong = set.has('schema') || set.has('names') || set.has('data');
+    const readAsSchema = set.has('schema') || (!strong && set.has('weak'));
+    const walkedAsSchema = set.has('weak');
+    for (const [key, value] of Object.entries(node)) {
+      if (readAsSchema || (walkedAsSchema && !isPlainObject(value))) {
+        refuseUnsupportedKey(key, value, `${pointer}/${pointerToken(key)}`);
+      }
     }
-    if (VALIDATOR_INTERNAL_KEYS.has(key)) {
-      throw new Error(`${key} at "${at}" is reserved for the validator, so the schema is refused`);
-    }
-    if (key === '$ref' && (typeof value !== 'string' || !isLocalPointerRef(value))) {
-      throw new Error(
-        `$ref ${typeof value === 'string' ? `"${value}"` : 'that is not a string'} at "${at}" is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
-      );
-    }
-  }
-  for (const [key, value] of Object.entries(record)) {
-    refuseUnsupportedKeywords(
-      value,
-      `${pointer}/${pointerToken(key)}`,
-      !isNameMap && SCHEMA_MAP_KEYWORD_SET.has(key),
-      seen,
-    );
   }
 }
 
@@ -420,7 +435,9 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
  * subschema (see `normalizeSchemaObjects`).
  */
 function toValidationSchema(schema: JSONSchema7, dereference: (schema: Schema) => Lookup): Schema {
+  // The copy is checked, so the scan and the validator read the same snapshot.
   const copy = structuredClone(schema) as Schema;
+  refuseUnsupportedKeywords(copy);
   normalizeSchemaObjects(copy, dereference);
   return copy;
 }
@@ -654,8 +671,6 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
       if (!ValidatorClass || !dereferenceSchema) {
         throw new Error(`JSON Schema validator unavailable (${validatorUnavailableReason})`);
       }
-      // Checked on the original, before the copy is normalised.
-      refuseUnsupportedKeywords(this.#schema);
       const validationSchema = toValidationSchema(this.#schema, dereferenceSchema);
       this.#validator = new ValidatorClass(validationSchema, '2020-12', false);
     }
