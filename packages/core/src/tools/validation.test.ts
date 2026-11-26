@@ -2661,6 +2661,34 @@ describe('validateToolInputAsync - same outcome as validateToolInput', () => {
 
     expect(outcome(result)).toEqual({ refused: ['subtitle', 'layout'] });
   });
+
+  it('does not validate the same retry input again when that retry answers asynchronously', async () => {
+    // Refuses a null synchronously, refuses the first `{}` asynchronously and
+    // would accept a second `{}`. The earlier fallbacks try `{}` once and refuse.
+    const seen: unknown[] = [];
+    const jsonSchema = () => ({ type: 'object' as const, properties: { note: { type: 'string' } } });
+    const schema = {
+      '~standard': {
+        vendor: 'mock',
+        version: 1 as const,
+        validate: (value: unknown) => {
+          seen.push(structuredClone(value));
+          if ((value as { note?: unknown }).note === null) {
+            return { issues: [{ message: 'Expected string', path: ['note'] }] };
+          }
+          const issues = seen.length === 2 ? [{ message: 'Not yet', path: [] }] : undefined;
+          return Promise.resolve(issues ? { issues } : { value });
+        },
+        types: undefined,
+        jsonSchema: { input: jsonSchema, output: jsonSchema },
+      },
+    } as any;
+
+    const result = await validateToolInputAsync(schema, { note: null }, 'tool');
+
+    expect(result.error).toBeDefined();
+    expect(seen).toEqual([{ note: null }, {}]);
+  });
 });
 
 describe('validateToolInput - Errors After Null-Strip Retry (GitHub #24539)', () => {
