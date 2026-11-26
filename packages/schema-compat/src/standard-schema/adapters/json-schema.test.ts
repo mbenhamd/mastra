@@ -839,6 +839,14 @@ describe('json-schema standard-schema adapter', () => {
       ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
       ['a string $id in a name map', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
       [
+        'a keyword that a $ref inside an array-valued properties reaches',
+        (() => {
+          const entry = { $ref: '#/default' };
+          return { properties: [entry], 'x-entry': entry, default: { $recursiveAnchor: true, minimum: 5 } };
+        })(),
+        '$recursiveAnchor at "/default/$recursiveAnchor"',
+      ],
+      [
         'an object-valued $ref in data the dereference also walks',
         { $ref: '#/x/properties', x: { properties: { const: { example: { $ref: {} } } } } },
         '$ref that is not a string at "/x/properties/const/example/$ref"',
@@ -881,13 +889,13 @@ describe('json-schema standard-schema adapter', () => {
 
   it.each([
     [
-      'its pointer names an object the validator does not reach',
+      'its pointer names nothing (a malformed escape)',
       {
         type: 'array',
         prefixItems: { length: 1, 0: { $ref: '#/default/a%zz' } },
         default: { 'a%zz': { $recursiveAnchor: true, type: 'object' } },
       },
-      'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
+      '$ref "#/default/a%zz" at "/prefixItems/0/$ref" does not resolve within the schema, so the schema is refused',
     ],
     [
       'normalisation replaces its target',
@@ -914,6 +922,22 @@ describe('json-schema standard-schema adapter', () => {
     }
   });
 
+  it('refuses a schema whose reachable $ref points nowhere, and ignores one in an unused definition', async () => {
+    const dangling = toStandardSchema({ properties: { x: { $ref: '#/missing' } } } as JSONSchema7);
+    const unused = toStandardSchema({ type: 'object', $defs: { U: { $ref: '#/missing' } } } as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await dangling['~standard'].validate({})).toEqual({
+      issues: [
+        {
+          message:
+            'Schema validation error: $ref "#/missing" at "/properties/x/$ref" does not resolve within the schema, so the schema is refused',
+        },
+      ],
+    });
+    expect(await unused['~standard'].validate({})).toEqual({ value: {} });
+  });
+
   it('refuses a $ref to "#/", which the validator reads as the root\'s "" member', async () => {
     const standardSchema = toStandardSchema({
       type: 'object',
@@ -935,6 +959,12 @@ describe('json-schema standard-schema adapter', () => {
   it.each([
     ['a property named $id', { properties: { $id: { type: 'string' } } }, { $id: 'abc' }],
     ['a property named $id with a boolean schema', { properties: { $id: false } }, {}],
+    ['a dependency list under a property named $id', { dependencies: { $id: ['label'] } }, {}],
+    [
+      'a $ref under an object-valued prefixItems key the validator never reads',
+      { type: 'array', prefixItems: { length: 0, note: { $ref: '#/default' } }, default: { exclusiveMinimum: true } },
+      [],
+    ],
     ['$id inside const', { const: { $id: 'k' } }, { $id: 'k' }],
     ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, { $anchor: 'k' }],
     ['a non-local $ref inside examples', { examples: [{ $ref: 'http://x.test/a~b' }] }, 'x'],

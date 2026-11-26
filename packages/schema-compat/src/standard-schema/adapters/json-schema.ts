@@ -177,8 +177,8 @@ function refuseUnsupportedKey(key: string, value: unknown, at: string): void {
  *   `components` entry) is checked too, because the validator's dereference still walks it;
  * - a name map's own keys and literal data under `const`, `enum`, `default` or `examples` are
  *   names and values, so a property named `$id` or a `const` holding `{ "$id": "k" }` is kept.
- *   In a name map, a key whose value is neither an object nor a boolean (so no property schema)
- *   is refused. Where the dereference walk also reaches such an object as an unknown keyword's
+ *   In a name map, a key whose value is neither an object, a boolean nor an array (so no
+ *   property schema or dependency list) is refused. Where the dereference walk also reaches such an object as an unknown keyword's
  *   value, a key whose value is not an object (which the walk could read as that keyword), and
  *   a `$ref`, `$recursiveRef`, `$anchor` or validator-internal key with any value (the walk
  *   reads those on every object it visits), are refused.
@@ -215,7 +215,7 @@ function refuseUnsupportedKeywords(root: unknown): void {
       if (
         readAsSchema ||
         (walkedAsSchema && (!isPlainObject(value) || DEREFERENCE_READ_KEYS.has(key))) ||
-        (nameMap && !isPlainObject(value) && typeof value !== 'boolean')
+        (nameMap && !isPlainObject(value) && typeof value !== 'boolean' && !Array.isArray(value))
       ) {
         refuseUnsupportedKey(key, value, `${pointer}/${pointerToken(key)}`);
       }
@@ -279,6 +279,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
+/** The values the validator reads from an object-valued `prefixItems`: indices below `length`. */
+function prefixItemsRead(value: Record<string, unknown>): unknown[] {
+  const length = Number(value.length);
+  return Object.keys(value)
+    .filter(key => /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < length)
+    .map(key => value[key]);
+}
+
 /**
  * Returns the role of every object, reading the schema from its root and through its references.
  */
@@ -324,6 +332,10 @@ function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) =
     for (const [key, value] of Object.entries(record)) {
       if (DATA_KEYWORDS.has(key)) {
         walk(value, role === 'schema' ? 'data' : 'weak-data');
+      } else if (role === 'schema' && SCHEMA_MAP_KEYWORD_SET.has(key) && Array.isArray(value)) {
+        // The validator reads an array-valued name map item by item (`for...in`), so its items are
+        // schemas; the dereference skips it.
+        walk(value, 'schema');
       } else if (SCHEMA_MAP_KEYWORD_SET.has(key)) {
         walk(value, role === 'schema' ? 'names' : 'weak-names');
       } else if (
@@ -333,9 +345,9 @@ function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) =
         walk(value, 'schema');
       } else if (role === 'schema' && key === 'prefixItems' && isPlainObject(value)) {
         // The validator reads an object-valued `prefixItems` item by item through its `length`
-        // (`$prefixItems[i]`), so its values are schemas; the dereference walks the object itself
-        // as an unknown keyword's value.
-        Object.values(value).forEach(item => walk(item, 'schema'));
+        // (`$prefixItems[i]`), so the values at its indices below `length` are schemas; the
+        // dereference walks the object itself as an unknown keyword's value.
+        prefixItemsRead(value).forEach(item => walk(item, 'schema'));
         walk(value, 'weak');
       } else {
         walk(value, 'weak');
@@ -390,6 +402,56 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
   }
   const uri = typeof node.__absolute_ref__ === 'string' ? node.__absolute_ref__ : node.$ref;
   return [lookup[uri] ?? resolveByPointer(lookup, uri)];
+}
+
+/**
+ * Refuses a schema in which a `$ref` the validator can reach from the root, through its
+ * applicators and other references, points nowhere, as Ajv refused it when compiling. The
+ * validator would otherwise throw only for a value that reaches the reference. Definitions no
+ * reference uses are not read, as with Ajv.
+ */
+function refuseUnresolvedReferences(root: unknown): void {
+  const seen = new Set<object>();
+  const pending: Array<[unknown, string]> = [[root, '']];
+  while (pending.length > 0) {
+    const [node, pointer] = pending.pop()!;
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => pending.push([item, `${pointer}/${index}`]));
+      continue;
+    }
+    const record = node as Record<string, unknown>;
+    if (typeof record.$ref === 'string') {
+      const target = record.$ref === '#' ? root : resolveByPointer({ '': root }, record.$ref);
+      if (target === undefined) {
+        throw new Error(
+          `$ref "${record.$ref}" at "${pointer}/$ref" does not resolve within the schema, so the schema is refused`,
+        );
+      }
+      pending.push([target, record.$ref.slice(1)]);
+    }
+    for (const [key, value] of Object.entries(record)) {
+      const at = `${pointer}/${pointerToken(key)}`;
+      if (SUBSCHEMA_KEYWORDS.has(key) || (SUBSCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value))) {
+        pending.push([value, at]);
+      } else if (key === 'prefixItems' && isPlainObject(value)) {
+        pending.push([prefixItemsRead(value), at]);
+      } else if (SCHEMA_MAP_KEYWORD_SET.has(key) && key !== '$defs' && key !== 'definitions') {
+        if (Array.isArray(value)) {
+          pending.push([value, at]);
+        } else if (isPlainObject(value)) {
+          for (const [name, item] of Object.entries(value)) {
+            if (isPlainObject(item)) {
+              pending.push([item, `${at}/${pointerToken(name)}`]);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 /**
@@ -472,8 +534,9 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
     if (typeof record.__absolute_ref__ !== 'string') {
       continue;
     }
+    // A reference the validator could not resolve throws when the validator reads it.
     const [actual] = referenceTargets(record, lookup);
-    if (!Object.is(actual, expected)) {
+    if (actual !== undefined && !Object.is(actual, expected)) {
       throw new Error(REF_PLACEMENT_MESSAGE);
     }
   }
@@ -498,6 +561,7 @@ function toValidationSchema(schema: JSONSchema7, dereference: (schema: Schema) =
   // The copy is checked, so the scan and the validator read the same snapshot.
   const copy = structuredClone(schema) as Schema;
   refuseUnsupportedKeywords(copy);
+  refuseUnresolvedReferences(copy);
   normalizeSchemaObjects(copy, dereference);
   return copy;
 }
