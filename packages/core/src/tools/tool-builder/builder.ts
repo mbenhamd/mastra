@@ -66,6 +66,7 @@ import type {
   MastraToolInvocationOptions,
   NeedsApprovalFn,
   ToolAction,
+  ToolInputPreflightOptions,
   VercelTool,
   VercelToolV5,
 } from '../types';
@@ -1362,21 +1363,33 @@ export class CoreToolBuilder extends MastraBase {
     const inputValidationSchema = this.buildCompatValidationSchema(originalSchema, schemaCompatLayers);
     const sharedPreApprovalValidations = new WeakMap<
       object,
-      { snapshot: unknown; result: ReturnType<typeof validateToolInputAsync> }
+      {
+        snapshot: unknown;
+        backgroundRemoval: ToolInputPreflightOptions['backgroundRemoval'];
+        result: ReturnType<typeof validateToolInputAsync>;
+      }
     >();
-    const validateBeforeApproval = async (nativeSchema: StandardSchemaWithJSON, params: unknown) => {
+    const validateBeforeApproval = async (
+      nativeSchema: StandardSchemaWithJSON,
+      params: unknown,
+      backgroundRemoval: ToolInputPreflightOptions['backgroundRemoval'],
+    ) => {
       if (inputValidationSchema) {
-        // The loops remove a truthy top-level `_background` before execute()
-        // validates, so the compat check sees the arguments without it. The
-        // native check below still sees it, as before.
-        const executeParams =
+        // The calling loop removes a top-level `_background` before execute()
+        // validates, by its own rule: the standard loop when the value is
+        // truthy, the durable loop whenever the key is present. The compat
+        // check sees the arguments as execute() will. The native check below
+        // still sees them as given, as before.
+        const removedByLoop =
           params !== null &&
           typeof params === 'object' &&
           !Array.isArray(params) &&
           Object.hasOwn(params, '_background') &&
-          (params as Record<string, unknown>)._background
-            ? (({ _background: _removedByLoop, ...rest }) => rest)(params as Record<string, unknown>)
-            : params;
+          (backgroundRemoval === 'present' ||
+            (backgroundRemoval === 'truthy' && Boolean((params as Record<string, unknown>)._background)));
+        const executeParams = removedByLoop
+          ? (({ _background: _removedByLoop, ...rest }) => rest)(params as Record<string, unknown>)
+          : params;
         const executeValidation = await validateToolInputAsync(inputValidationSchema, executeParams, this.options.name);
         if (executeValidation.error !== undefined) {
           return executeValidation;
@@ -1534,7 +1547,8 @@ export class CoreToolBuilder extends MastraBase {
       // when a layer applies, so the approval check runs that validator too: a
       // call the user approves must not then fail execute() on its input. The
       // native check still runs after it for constraints the compat schema drops.
-      validateInput: async (params: unknown) => {
+      validateInput: async (params: unknown, options?: ToolInputPreflightOptions) => {
+        const backgroundRemoval = options?.backgroundRemoval;
         if (!approvalInputValidationSchema) {
           return validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name);
         }
@@ -1548,10 +1562,12 @@ export class CoreToolBuilder extends MastraBase {
           const shared = sharedPreApprovalValidations.get(params);
           if (shared) {
             sharedPreApprovalValidations.delete(params);
-            if (isSamePlainValue(shared.snapshot, params)) return shared.result;
+            if (shared.backgroundRemoval === backgroundRemoval && isSamePlainValue(shared.snapshot, params)) {
+              return shared.result;
+            }
           }
         }
-        const result = validateBeforeApproval(approvalInputValidationSchema, params);
+        const result = validateBeforeApproval(approvalInputValidationSchema, params, backgroundRemoval);
         if (shareable) {
           let snapshot: unknown;
           try {
@@ -1559,7 +1575,7 @@ export class CoreToolBuilder extends MastraBase {
           } catch {
             return result;
           }
-          sharedPreApprovalValidations.set(params, { snapshot, result });
+          sharedPreApprovalValidations.set(params, { snapshot, backgroundRemoval, result });
         }
         return result;
       },
