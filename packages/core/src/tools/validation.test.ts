@@ -2649,6 +2649,18 @@ describe('validateToolInputAsync - same outcome as validateToolInput', () => {
     const async = await validateToolInputAsync(caseSchema, structuredClone(input), 'tool');
     expect(outcome(async)).toEqual(outcome(sync));
   });
+
+  it('keeps the earlier fallbacks for a schema that answers asynchronously', async () => {
+    // A validator that answers with a promise keeps the fallbacks agent tool
+    // calls had before: the null retry does not build on the coercion, and the
+    // refusal lists the first attempt's issues.
+    const asyncSchema = schema.refine(async () => true);
+    const input = { title: 'A', layout: '{"columns":2}', subtitle: null, content: { body: 'b' } };
+
+    const result = await validateToolInputAsync(asyncSchema, structuredClone(input), 'tool');
+
+    expect(outcome(result)).toEqual({ refused: ['subtitle', 'layout'] });
+  });
 });
 
 describe('validateToolInput - Errors After Null-Strip Retry (GitHub #24539)', () => {
