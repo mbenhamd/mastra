@@ -839,6 +839,11 @@ describe('json-schema standard-schema adapter', () => {
       ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
       ['a string $id in a name map', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
       [
+        'an object-valued $ref in data the dereference also walks',
+        { $ref: '#/x/properties', x: { properties: { const: { example: { $ref: {} } } } } },
+        '$ref that is not a string at "/x/properties/const/example/$ref"',
+      ],
+      [
         'a keyword that a $ref inside an object-valued prefixItems reaches',
         {
           type: 'array',
@@ -874,28 +879,62 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
-  it('refuses a $ref inside an object-valued prefixItems that the validator resolves elsewhere than its pointer', async () => {
-    const standardSchema = toStandardSchema({
-      type: 'array',
-      prefixItems: { length: 1, 0: { $ref: '#/default/a%zz' } },
-      default: { 'a%zz': { $recursiveAnchor: true, type: 'object' } },
-    } as unknown as JSONSchema7);
+  it.each([
+    [
+      'its pointer names an object the validator does not reach',
+      {
+        type: 'array',
+        prefixItems: { length: 1, 0: { $ref: '#/default/a%zz' } },
+        default: { 'a%zz': { $recursiveAnchor: true, type: 'object' } },
+      },
+      'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
+    ],
+    [
+      'normalisation replaces its target',
+      { type: 'array', nullable: true, prefixItems: { length: 1, 0: { $ref: '#/type' } } },
+      'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
+    ],
+    [
+      'its target is also literal data with a boolean bound',
+      {
+        type: 'array',
+        prefixItems: { length: 1, 0: { $ref: '#/default' } },
+        default: { minimum: 5, exclusiveMinimum: true },
+      },
+      'a $ref target that the schema also uses as a name map or as literal data holds a boolean exclusiveMinimum or exclusiveMaximum, which cannot be read both ways, so the schema is refused',
+    ],
+  ])('refuses a $ref inside an object-valued prefixItems when %s', async (_case, schema, refused) => {
+    const standardSchema = toStandardSchema(schema as unknown as JSONSchema7);
     if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
     for (const value of [[5], [{}]]) {
       expect(await standardSchema['~standard'].validate(value)).toEqual({
-        issues: [
-          {
-            message:
-              'Schema validation error: a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
-          },
-        ],
+        issues: [{ message: `Schema validation error: ${refused}` }],
       });
     }
   });
 
+  it('refuses a $ref to "#/", which the validator reads as the root\'s "" member', async () => {
+    const standardSchema = toStandardSchema({
+      type: 'object',
+      properties: { child: { $ref: '#/' } },
+      '': true,
+    } as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate({ child: 1 })).toEqual({
+      issues: [
+        {
+          message:
+            'Schema validation error: $ref "#/" at "/properties/child/$ref" is not supported: the validator reads it as the root\'s "" member, not as the root, so the schema is refused; write "#" for the root',
+        },
+      ],
+    });
+  });
+
   it.each([
     ['a property named $id', { properties: { $id: { type: 'string' } } }, { $id: 'abc' }],
+    ['a property named $id with a boolean schema', { properties: { $id: false } }, {}],
     ['$id inside const', { const: { $id: 'k' } }, { $id: 'k' }],
     ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, { $anchor: 'k' }],
     ['a non-local $ref inside examples', { examples: [{ $ref: 'http://x.test/a~b' }] }, 'x'],

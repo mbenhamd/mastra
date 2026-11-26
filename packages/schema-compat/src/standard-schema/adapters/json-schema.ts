@@ -121,6 +121,16 @@ const UNSUPPORTED_KEYWORDS = new Set<string>([
 /** Keys the validator writes into a schema while resolving references; a schema must not bring its own. */
 const VALIDATOR_INTERNAL_KEYS = new Set<string>(['__absolute_recursive_ref__', '__absolute_ref__', '__absolute_uri__']);
 
+/** Keys the validator's dereference reads on every object it walks, whatever their value. */
+const DEREFERENCE_READ_KEYS = new Set<string>([
+  '$ref',
+  '$recursiveRef',
+  '$anchor',
+  '__absolute_recursive_ref__',
+  '__absolute_ref__',
+  '__absolute_uri__',
+]);
+
 /** A `$ref` the adapter resolves: the whole schema (`#`) or a JSON Pointer into it (`#/...`). */
 function isLocalPointerRef(ref: string): boolean {
   return ref === '#' || ref.startsWith('#/');
@@ -139,6 +149,11 @@ function refuseUnsupportedKey(key: string, value: unknown, at: string): void {
   }
   if (VALIDATOR_INTERNAL_KEYS.has(key)) {
     throw new Error(`${key} at "${at}" is reserved for the validator, so the schema is refused`);
+  }
+  if (key === '$ref' && value === '#/') {
+    throw new Error(
+      `$ref "#/" at "${at}" is not supported: the validator reads it as the root's "" member, not as the root, so the schema is refused; write "#" for the root`,
+    );
   }
   if (key === '$ref' && (typeof value !== 'string' || !isLocalPointerRef(value))) {
     throw new Error(
@@ -159,13 +174,14 @@ function refuseUnsupportedKey(key: string, value: unknown, at: string): void {
  * - an object read as a schema (`schema`), including a name map or literal data that a
  *   `$ref` reaches, is checked for every key;
  * - an object no reading reaches (`weak`, such as the value of `x-meta` or an unused
- *   `components` entry) is checked too, because the validator's dereference still walks it,
- *   and its `$ref` targets are read as schemas;
+ *   `components` entry) is checked too, because the validator's dereference still walks it;
  * - a name map's own keys and literal data under `const`, `enum`, `default` or `examples` are
  *   names and values, so a property named `$id` or a `const` holding `{ "$id": "k" }` is kept.
- *   In a name map, or where the dereference walk also reaches such an object as an unknown
- *   keyword's value, a key whose value is not an object (which is no property schema, and which
- *   the walk could read as that keyword) is refused.
+ *   In a name map, a key whose value is neither an object nor a boolean (so no property schema)
+ *   is refused. Where the dereference walk also reaches such an object as an unknown keyword's
+ *   value, a key whose value is not an object (which the walk could read as that keyword), and
+ *   a `$ref`, `$recursiveRef`, `$anchor` or validator-internal key with any value (the walk
+ *   reads those on every object it visits), are refused.
  */
 function refuseUnsupportedKeywords(root: unknown): void {
   const pointers = new Map<object, string>();
@@ -179,20 +195,13 @@ function refuseUnsupportedKeywords(root: unknown): void {
     }
   };
   collect(root, '');
-  // The validator can read an object the walk only reaches as an unknown keyword's value (an
-  // object-valued `prefixItems` is read item by item through its `length`), so a `$ref` there is
-  // followed too: its target is checked as a schema.
-  const roles = assignRoles(
-    root,
-    node => {
-      const ref = node.$ref;
-      if (typeof ref !== 'string' || !isLocalPointerRef(ref)) {
-        return [];
-      }
-      return [ref === '#' ? root : resolveByPointer({ '': root }, ref)];
-    },
-    FOLLOW_REFS_FROM_SCHEMA_AND_WEAK,
-  );
+  const roles = assignRoles(root, node => {
+    const ref = node.$ref;
+    if (typeof ref !== 'string' || !isLocalPointerRef(ref)) {
+      return [];
+    }
+    return [ref === '#' ? root : resolveByPointer({ '': root }, ref)];
+  });
   for (const [node, pointer] of pointers) {
     const set = roles.get(node);
     if (Array.isArray(node) || !set) {
@@ -203,7 +212,11 @@ function refuseUnsupportedKeywords(root: unknown): void {
     const walkedAsSchema = set.has('weak');
     const nameMap = set.has('names') || set.has('weak-names');
     for (const [key, value] of Object.entries(node)) {
-      if (readAsSchema || ((walkedAsSchema || nameMap) && !isPlainObject(value))) {
+      if (
+        readAsSchema ||
+        (walkedAsSchema && (!isPlainObject(value) || DEREFERENCE_READ_KEYS.has(key))) ||
+        (nameMap && !isPlainObject(value) && typeof value !== 'boolean')
+      ) {
         refuseUnsupportedKey(key, value, `${pointer}/${pointerToken(key)}`);
       }
     }
@@ -266,18 +279,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
-const FOLLOW_REFS_FROM_SCHEMA: ReadonlySet<Role> = new Set<Role>(['schema']);
-const FOLLOW_REFS_FROM_SCHEMA_AND_WEAK: ReadonlySet<Role> = new Set<Role>(['schema', 'weak']);
-
 /**
  * Returns the role of every object, reading the schema from its root and through its references.
- * References are followed from objects holding one of the `followRefsFrom` roles.
  */
-function assignRoles(
-  root: unknown,
-  targetsOf: (node: Record<string, unknown>) => unknown[],
-  followRefsFrom: ReadonlySet<Role> = FOLLOW_REFS_FROM_SCHEMA,
-): Map<object, Set<Role>> {
+function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) => unknown[]): Map<object, Set<Role>> {
   const roles = new Map<object, Set<Role>>();
   const pending: unknown[] = [];
   const mark = (node: object, role: Role): boolean => {
@@ -326,11 +331,17 @@ function assignRoles(
         (SUBSCHEMA_KEYWORDS.has(key) || (SUBSCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)))
       ) {
         walk(value, 'schema');
+      } else if (role === 'schema' && key === 'prefixItems' && isPlainObject(value)) {
+        // The validator reads an object-valued `prefixItems` item by item through its `length`
+        // (`$prefixItems[i]`), so its values are schemas; the dereference walks the object itself
+        // as an unknown keyword's value.
+        Object.values(value).forEach(item => walk(item, 'schema'));
+        walk(value, 'weak');
       } else {
         walk(value, 'weak');
       }
     }
-    if (followRefsFrom.has(role)) {
+    if (role === 'schema') {
       pending.push(...targetsOf(record));
     }
   };
@@ -402,6 +413,22 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
     return targets;
   };
   const roles = assignRoles(root, targetsOf);
+  // Every other `$ref` string in the schema, with the target its JSON Pointer names before
+  // normalisation changes the schema (see the check after `dereference` below).
+  const pointerTargets = new Map<object, unknown>();
+  const seen = new Set<object>();
+  const collect = (node: unknown): void => {
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    const record = node as Record<string, unknown>;
+    if (!predicted.has(node) && typeof record.$ref === 'string') {
+      pointerTargets.set(node, record.$ref === '#' ? root : resolveByPointer({ '': root }, record.$ref));
+    }
+    Object.values(record).forEach(collect);
+  };
+  collect(root);
   for (const [node, set] of roles) {
     if (Array.isArray(node)) {
       continue;
@@ -437,27 +464,19 @@ function normalizeSchemaObjects(root: Schema, dereference: (schema: Schema) => L
       throw new Error(REF_PLACEMENT_MESSAGE);
     }
   }
-  // The same check for every other `$ref` the dereference resolved, such as one inside an
-  // object-valued `prefixItems`, which the validator reads but the roles above do not follow:
-  // its target, by the validator's URI, must be the object its JSON Pointer names (the one the
-  // keyword scan checked).
-  const seen = new Set<object>();
-  const visit = (node: unknown): void => {
-    if (typeof node !== 'object' || node === null || seen.has(node)) {
-      return;
-    }
-    seen.add(node);
+  // The same check for every other `$ref` the dereference resolved: its target, by the
+  // validator's URI, must be the object its JSON Pointer named before normalisation (the one
+  // the keyword scan checked).
+  for (const [node, expected] of pointerTargets) {
     const record = node as Record<string, unknown>;
-    if (!predicted.has(node) && typeof record.$ref === 'string' && typeof record.__absolute_ref__ === 'string') {
-      const expected = record.$ref === '#' ? root : resolveByPointer({ '': root }, record.$ref);
-      const [actual] = referenceTargets(record, lookup);
-      if (!Object.is(actual, expected)) {
-        throw new Error(REF_PLACEMENT_MESSAGE);
-      }
+    if (typeof record.__absolute_ref__ !== 'string') {
+      continue;
     }
-    Object.values(record).forEach(visit);
-  };
-  visit(root);
+    const [actual] = referenceTargets(record, lookup);
+    if (!Object.is(actual, expected)) {
+      throw new Error(REF_PLACEMENT_MESSAGE);
+    }
+  }
 }
 
 /**
