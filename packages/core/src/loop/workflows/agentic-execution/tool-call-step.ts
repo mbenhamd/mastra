@@ -38,7 +38,7 @@ import {
 } from '../../../tools/payload-transform';
 import { findProviderToolByName } from '../../../tools/provider-tool-utils';
 import { getToolTitle } from '../../../tools/tool-title';
-import type { MastraToolInvocationOptions, RequireToolApproval } from '../../../tools/types';
+import type { CoreTool, MastraToolInvocationOptions, RequireToolApproval } from '../../../tools/types';
 import { resolveToolOutputValidationSchema, validateToolOutput } from '../../../tools/validation';
 import { ensureSerializable } from '../../../utils';
 import type { InnerOutput, SuspendOptions } from '../../../workflows/step';
@@ -1247,9 +1247,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         const validateInput = (
           tool as {
-            validateInput?: (
-              params: unknown,
-            ) => { data?: unknown; error?: unknown } | Promise<{ data?: unknown; error?: unknown }>;
+            validateInput?: CoreTool['validateInput'];
           }
         ).validateInput;
         const supportsEditedApprovalArgs =
@@ -1271,7 +1269,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           const editedArgs = { ...baseArgs, ...approvalDecision.editedArgs };
           let validation;
           try {
-            validation = await validateInput(editedArgs);
+            validation = await validateInput(editedArgs, { backgroundRemoval: 'truthy' });
           } finally {
             await removeToolMetadata({ toolCallId: metadataToolCallId, toolName: inputData.toolName }, 'approval');
           }
@@ -1484,7 +1482,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // authority and do not reuse transformed data here: transforms are not
         // guaranteed to be idempotent.
         if (toolRequiresApproval && resumeData === undefined && typeof validateInput === 'function') {
-          const preflightValidation = await validateInput(args);
+          const preflightValidation = await validateInput(args, { backgroundRemoval: 'truthy' });
           if (preflightValidation.error !== undefined) {
             return {
               result:
@@ -1744,6 +1742,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             const rejection = await runBeforeApprovalChecks({
               tool,
               input: args,
+              backgroundRemoval: 'truthy',
               context: {
                 toolCallId: inputData.toolCallId,
                 toolName: inputData.toolName,

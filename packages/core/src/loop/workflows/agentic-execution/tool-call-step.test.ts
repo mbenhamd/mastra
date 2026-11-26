@@ -2609,7 +2609,7 @@ describe('createToolCallStep tool approval workflow', () => {
 
     const result = await toolCallStep.execute(makeExecuteParams());
 
-    expect(tools['test-tool'].validateInput).toHaveBeenCalledWith({ param: 'test' });
+    expect(tools['test-tool'].validateInput).toHaveBeenCalledWith({ param: 'test' }, { backgroundRemoval: 'truthy' });
     expect(suspend).not.toHaveBeenCalled();
     expectNoToolExecution();
     expect(result).toEqual({

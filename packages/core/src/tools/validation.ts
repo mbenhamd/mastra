@@ -349,7 +349,7 @@ function normalizeNullishInput(schema: StandardSchemaWithJSON<any>, input: unkno
  * @returns true if the value is a plain object
  */
 /** Primitives, arrays and plain objects with the same contents; anything else only when identical. */
-function isSamePlainValue(a: unknown, b: unknown): boolean {
+export function isSamePlainValue(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((item, index) => isSamePlainValue(item, b[index]));

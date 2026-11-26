@@ -594,6 +594,14 @@ export interface MCPToolProperties {
 }
 
 /**
+ * @internal How the calling agent loop removes a top-level `_background` from a
+ * call's arguments before `execute()` validates them: `'truthy'` (the standard
+ * loop) or `'present'` (the durable loop). Without it the arguments are checked
+ * as given.
+ */
+export type ToolInputPreflightOptions = { backgroundRemoval?: 'truthy' | 'present' };
+
+/**
  * CoreTool is the AI SDK-compatible tool format used when passing tools to the AI SDK.
  * This matches the AI SDK's Tool interface.
  *
@@ -614,6 +622,7 @@ export type CoreTool = {
   /** @internal Runtime input preflight used before an approval-gated call is shown to a user. */
   validateInput?: (
     params: unknown,
+    options?: ToolInputPreflightOptions,
   ) => { data?: unknown; error?: unknown } | Promise<{ data?: unknown; error?: unknown }>;
   /** @internal Present only for object input schemas with an executable Standard Schema validator. */
   approvalInputEditing?: 'object';

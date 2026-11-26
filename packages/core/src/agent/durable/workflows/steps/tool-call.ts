@@ -1609,7 +1609,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // immediately before side effects; transformed preflight data is not
       // reused because schema transforms need not be idempotent.
       if (requiresApproval && !isAuthenticatedResume && typeof tool.validateInput === 'function') {
-        const preflightValidation = await tool.validateInput(args);
+        const preflightValidation = await tool.validateInput(args, { backgroundRemoval: 'present' });
         if (preflightValidation.error !== undefined) {
           return {
             ...typedInput,
@@ -1629,6 +1629,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         const rejection = await runBeforeApprovalChecks({
           tool,
           input: args,
+          backgroundRemoval: 'present',
           context: { toolCallId, toolName, requestContext: approvalRequestContext, workspace, actor },
           logger: logger as any,
         });
