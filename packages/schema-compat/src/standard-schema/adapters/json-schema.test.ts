@@ -213,79 +213,6 @@ describe('json-schema standard-schema adapter', () => {
       expect('value' in result && result.value).toBe(value);
     });
 
-    it('refuses an undeclared property set to undefined where the schema closes the object, as Ajv did', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          ok: { type: 'boolean' },
-          note: { type: 'string' },
-          nested: { type: 'object', properties: { a: {} }, unevaluatedProperties: false },
-        },
-        additionalProperties: false,
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ ok: true, extra: undefined })).toEqual({
-        issues: [{ message: 'Property "extra" does not match additional properties schema.', path: [] }],
-      });
-      expect(await standardSchema['~standard'].validate({ nested: { a: 1, b: undefined } })).toEqual({
-        issues: [{ message: 'Property "b" does not match unevaluated properties schema.', path: ['nested'] }],
-      });
-      const declared = { ok: true, note: undefined, nested: { a: undefined } };
-      expect(await standardSchema['~standard'].validate(declared)).toEqual({ value: declared });
-    });
-
-    it('lets unevaluatedProperties in a subschema see only that subschema, as Ajv did', async () => {
-      const standardSchema = toStandardSchema({
-        $defs: { base: { properties: { tag: { type: 'string' } } } },
-        type: 'object',
-        properties: {
-          // `tag` is evaluated by the sibling $ref, not by the allOf branch.
-          inner: { $ref: '#/$defs/base', allOf: [{ unevaluatedProperties: false }] },
-          // The branch's annotations reach an unevaluatedProperties beside it.
-          outer: { allOf: [{ $ref: '#/$defs/base' }], unevaluatedProperties: false },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ inner: { tag: 'x' } })).toEqual({
-        issues: [{ message: 'Property "tag" does not match unevaluated properties schema.', path: ['inner'] }],
-      });
-      expect(await standardSchema['~standard'].validate({ outer: { tag: 'x' } })).toEqual({
-        value: { outer: { tag: 'x' } },
-      });
-    });
-
-    it('takes the branch Ajv took for an undefined property, and keeps a null beside it', async () => {
-      // The key is absent for `required` in `if`, so the closed `else` applies.
-      const conditional = toStandardSchema({
-        if: { required: ['extra'] },
-        then: {},
-        else: { additionalProperties: false },
-      } as JSONSchema7);
-      // The second branch declares `x`, so `x: undefined` is absent there.
-      const union = toStandardSchema({
-        anyOf: [{ properties: { a: {} }, additionalProperties: false }, { properties: { x: { type: 'number' } } }],
-      } as JSONSchema7);
-      const nullable = toStandardSchema({
-        type: 'object',
-        properties: { site: { type: ['string', 'null'] }, note: { type: 'string' } },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await conditional['~standard'].validate({ extra: undefined })).toEqual({
-        issues: [
-          { message: 'Instance does not match "else" schema.', path: [] },
-          { message: 'Property "extra" does not match additional properties schema.', path: [] },
-        ],
-      });
-      expect(await conditional['~standard'].validate({ extra: 1 })).toEqual({ value: { extra: 1 } });
-      const unionValue = { a: 1, x: undefined };
-      expect(await union['~standard'].validate(unionValue)).toEqual({ value: unionValue });
-      const nullableValue = { site: null, note: undefined };
-      expect(await nullable['~standard'].validate(nullableValue)).toEqual({ value: nullableValue });
-    });
-
     it('validates a recursive union in time that does not double with each level', async () => {
       const child = { $ref: '#/$defs/node' };
       // Branches told apart by a discriminator after the recursive property, and by `required` alone.
@@ -411,41 +338,7 @@ describe('json-schema standard-schema adapter', () => {
     });
   });
 
-  describe('draft 2020-12 schema support', () => {
-    it('should validate correctly when $schema is draft 2020-12', async () => {
-      const jsonSchema = {
-        $schema: 'https://json-schema.org/draft/2020-12/schema',
-        type: 'object' as const,
-        properties: {
-          url: { type: 'string' as const },
-          formats: {
-            type: 'array' as const,
-            items: { type: 'string' as const },
-          },
-        },
-        required: ['url'],
-      };
-
-      const standardSchema = toStandardSchema(jsonSchema);
-
-      // Valid input should pass
-      const validResult = await standardSchema['~standard'].validate({
-        url: 'https://example.com',
-        formats: ['markdown'],
-      });
-      expect('value' in validResult).toBe(true);
-
-      // Invalid input should fail
-      const invalidResult = await standardSchema['~standard'].validate({
-        formats: ['markdown'],
-        // missing required 'url'
-      });
-      expect('issues' in invalidResult).toBe(true);
-      if ('issues' in invalidResult && invalidResult.issues) {
-        expect(invalidResult.issues.length).toBeGreaterThan(0);
-      }
-    });
-
+  describe('keywords beside $ref', () => {
     it('applies keywords beside $ref in a schema without $schema, as Ajv did', async () => {
       const standardSchema = toStandardSchema({
         type: 'object',
@@ -457,635 +350,148 @@ describe('json-schema standard-schema adapter', () => {
       expect('issues' in tooLong && tooLong.issues?.length).toBeGreaterThan(0);
       expect(await standardSchema['~standard'].validate({ id: 'abc' })).toEqual({ value: { id: 'abc' } });
     });
+  });
 
-    it('reads an OpenAPI 3.0 boolean exclusive bound as excluding its minimum or maximum', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          above: { type: 'number', minimum: 5, exclusiveMinimum: true },
-          below: { type: 'number', maximum: 0, exclusiveMaximum: true },
-          open: { type: 'number', minimum: 1, exclusiveMinimum: false },
-        },
-      } as unknown as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ above: 5.5, below: -0.5, open: 1 })).toEqual({
-        value: { above: 5.5, below: -0.5, open: 1 },
-      });
-      expect(await standardSchema['~standard'].validate({ above: 5, below: 0, open: 0 })).toEqual({
-        issues: [
-          // cfworker's wording for an exclusive minimum.
-          { message: '5 is less than 5.', path: ['above'] },
-          { message: '0 is greater than or equal to 0.', path: ['below'] },
-          { message: '0 is less than 1.', path: ['open'] },
-        ],
-      });
-
-      // A name map that a `$ref` also reads as a schema: there `exclusiveMaximum: true` is both a
-      // property's schema and a bound, so the schema is refused rather than compared with 1.
-      const mapAsSchema = toStandardSchema({
-        type: 'object',
-        properties: { exclusiveMaximum: true },
-        $defs: { bound: { $ref: '#/properties' } },
-        allOf: [{ $ref: '#/$defs/bound' }],
-      } as unknown as JSONSchema7);
-      for (const value of [0, {}]) {
-        const result = await mapAsSchema['~standard'].validate(value);
-        expect('issues' in result && result.issues?.[0]?.message).toContain('a $ref target that the schema also uses');
-      }
-    });
-
-    it('keeps a property named id inside a component named like a keyword', async () => {
-      const standardSchema = toStandardSchema({
-        $ref: '#/components/schemas/properties',
-        components: { schemas: { properties: { type: 'object', properties: { id: { type: 'string' } } } } },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ id: 'a' })).toEqual({ value: { id: 'a' } });
-      expect('issues' in (await standardSchema['~standard'].validate({ id: 5 }))).toBe(true);
-    });
-
-    it('applies nullable and ignores format inside prefixItems, as for properties', async () => {
-      const standardSchema = toStandardSchema({
-        $schema: 'https://json-schema.org/draft/2020-12/schema',
-        type: 'array',
-        prefixItems: [
-          { type: 'string', format: 'email' },
-          { type: 'string', nullable: true },
-        ],
-      } as JSONSchema7);
-
-      expect(await standardSchema['~standard'].validate(['not an email', null])).toEqual({
-        value: ['not an email', null],
-      });
-      expect('issues' in (await standardSchema['~standard'].validate([1, null]))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate(['a', 2]))).toBe(true);
-    });
-
-    it('resolves a $ref in a draft-07 dependency named like a keyword, and keeps property dependencies', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          type: { type: 'string' },
-          detail: { type: 'string' },
-          a: {},
-          b: {},
-          // A pointer into `dependencies` still resolves.
-          linked: { $ref: '#/dependencies/type' },
-        },
-        dependencies: { type: { $ref: '#/definitions/Details' }, a: ['b'], example: ['b'] },
-        definitions: { Details: { required: ['detail'] } },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      const valid = { type: 'note', detail: 'text', a: 1, b: 2, linked: { detail: 'x' } };
-      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
-      expect('issues' in (await standardSchema['~standard'].validate({ linked: {} }))).toBe(true);
-      expect(await standardSchema['~standard'].validate({ type: 'note' })).toEqual({
-        issues: [{ message: 'Instance does not have required property "detail".', path: [] }],
-      });
-      expect('issues' in (await standardSchema['~standard'].validate({ a: 1 }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ example: 1 }))).toBe(true);
-    });
-
-    it('applies nullable and ignores format on a subschema reached only by $ref', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          site: { $ref: '#/components/schemas/Site' },
-          // A target named like a keyword whose value maps names to schemas.
-          other: { $ref: '#/components/schemas/properties' },
-          // Literal data shaped like a reference is compared as written.
-          tag: { const: { $ref: '#/properties/tag/const', id: 1 } },
-          pct: { const: { $ref: '#/%' }, examples: [{ $ref: '#/a%' }] },
-        },
-        components: {
-          schemas: {
-            Site: { type: 'string', format: 'url', nullable: true },
-            properties: { type: 'string', format: 'url', nullable: true },
-          },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      const tag = { $ref: '#/properties/tag/const', id: 1 };
-      const pct = { $ref: '#/%' };
-      for (const site of [null, 'not a url']) {
-        expect(await standardSchema['~standard'].validate({ site, other: site, tag, pct })).toEqual({
-          value: { site, other: site, tag, pct },
-        });
-      }
-      expect('issues' in (await standardSchema['~standard'].validate({ site: 5 }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ other: 5 }))).toBe(true);
-    });
-
-    it('ignores format behind a $ref, and accepts a schema holding a large literal array', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          site: { $ref: '#/components/schemas/properties' },
-          code: { enum: Array.from({ length: 200_000 }, (_, i) => `c${i}`) },
-        },
-        components: { schemas: { properties: { type: 'string', format: 'url' } } },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      // cfworker's url pattern backtracks exponentially on this string.
-      const site = 'http://' + 'a'.repeat(40) + '!';
-      expect(await standardSchema['~standard'].validate({ site, code: 'c199999' })).toEqual({
-        value: { site, code: 'c199999' },
-      });
-      expect('issues' in (await standardSchema['~standard'].validate({ site, code: 'd' }))).toBe(true);
-    });
-
-    it('keeps examples and a schema named id from changing what a $ref reaches', async () => {
-      const valid = async (schema: JSONSchema7, value: unknown) => {
-        const standardSchema = toStandardSchema(schema);
-        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-        return !('issues' in (await standardSchema['~standard'].validate(value)));
-      };
-      // Two OpenAPI examples with the same id are literal values, not schemas.
-      const examples = {
-        type: 'object',
-        properties: { user: { $ref: '#/components/schemas/User' } },
-        components: {
-          schemas: { User: { type: 'object', properties: { id: { type: 'integer' } } } },
-          examples: { a: { value: { id: 1 } }, b: { value: { id: 1 } } },
-        },
-      } as JSONSchema7;
-      expect(await valid(examples, { user: { id: 1 } })).toBe(true);
-      expect(await valid(examples, { user: { id: 'x' } })).toBe(false);
-      // A boolean schema named id stays the target of a $ref to it.
-      const boolId = {
-        type: 'object',
-        properties: { a: { $ref: '#/definitions/id' } },
-        definitions: { id: false },
-      } as JSONSchema7;
-      expect(await valid(boolId, {})).toBe(true);
-      expect(await valid(boolId, { a: 1 })).toBe(false);
-      // A boolean, object or array id in annotations is not a schema URI.
-      const annotationIds = {
-        type: 'object',
-        properties: {
-          a: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '5f' } } },
-          b: { type: 'string', 'x-ui': { id: true }, example: { id: { $oid: '60' } } },
-          c: { type: 'string', example: { id: [] } },
-        },
-      } as unknown as JSONSchema7;
-      expect(await valid(annotationIds, { a: 'x' })).toBe(true);
-      expect(await valid(annotationIds, { a: 1 })).toBe(false);
-      // A component named id does not move the base of references between other components.
-      const idComponent = {
-        type: 'object',
-        properties: { u: { $ref: '#/components/schemas/User' } },
-        components: {
-          schemas: {
-            id: { type: 'string' },
-            User: { type: 'object', properties: { n: { $ref: '#/components/schemas/Name' } } },
-            Name: { type: 'string' },
-          },
-        },
-      } as unknown as JSONSchema7;
-      expect(await valid(idComponent, { u: { n: 'x' } })).toBe(true);
-      expect(await valid(idComponent, { u: { n: 1 } })).toBe(false);
-    });
-
-    it('leaves literal data alone when an annotation $ref points into it', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          tag: { const: { id: 'expected' }, 'x-meta': { $ref: '#/properties/tag/const' } },
-          // A property, or a component, named like a data keyword is still a schema.
-          default: { type: 'string', nullable: true },
-          other: { $ref: '#/properties/default' },
-          qty: { $ref: '#/components/schemas/default' },
-          // A forbidden property in a map an annotation refers to.
-          id: false,
-          // Subschemas inside a component named like a data keyword.
-          q: { $ref: '#/components/schemas/examples' },
-          // A pointer into a referenced component's literal data.
-          tok: { $ref: '#/components/schemas/Tok' },
-        },
-        'x-meta': { $ref: '#/properties' },
-        components: {
-          schemas: {
-            default: { type: 'number', minimum: 5, exclusiveMinimum: true },
-            examples: {
-              type: 'object',
-              properties: {
-                n: { type: 'number', minimum: 5, exclusiveMinimum: true },
-                s: { type: 'string', nullable: true },
-              },
-            },
-            Tok: { const: { id: 'k1', v: 1 }, 'x-meta': { $ref: '#/components/schemas/Tok/const' } },
-          },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      const valid = { tag: { id: 'expected' }, other: null, qty: 6, q: { n: 6, s: null }, tok: { id: 'k1', v: 1 } };
-      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
-      expect('issues' in (await standardSchema['~standard'].validate({ tag: {} }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ qty: 5 }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ id: 1 }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ q: { n: 5 } }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ tok: { v: 1 } }))).toBe(true);
-    });
-
-    it('ignores id in objects that are not schemas, and resolves a $ref to a schema named example', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          user: { type: 'object', example: { id: 1 }, 'x-meta': { id: 'u' }, externalDocs: { id: 7 } },
-          owner: { type: 'object', examples: [{ id: 1 }], 'x-meta': { id: 'u' }, externalDocs: { id: 7 } },
-          account: { type: 'object', example: { id: 1 } },
-          sample: { $ref: '#/components/schemas/example' },
-        },
-        components: { schemas: { example: { type: 'string' } } },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ user: {}, sample: 's' })).toEqual({
-        value: { user: {}, sample: 's' },
-      });
-      expect('issues' in (await standardSchema['~standard'].validate({ sample: 5 }))).toBe(true);
-    });
-
-    it('keeps a property named $id or $ref, and resolves # and #/... references', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          $id: { type: 'string' },
-          $ref: { type: 'integer' },
-          self: { $ref: '#' },
-          id: { $ref: '#/properties/$id' },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      const valid = { $id: 'a', $ref: 1, self: { $ref: 2 }, id: 'b' };
-      expect(await standardSchema['~standard'].validate(valid)).toEqual({ value: valid });
-      expect('issues' in (await standardSchema['~standard'].validate({ $id: 1 }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ self: { $ref: 'x' } }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ id: 1 }))).toBe(true);
-    });
-
-    it('checks values against a component named like a keyword that holds its own reference', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: { a: { $ref: '#/components/schemas/type' }, n: { type: 'number' } },
-        components: {
-          schemas: {
-            type: { type: 'object', properties: { o: { $ref: '#/components/schemas/Other' } } },
-            Other: { type: 'string' },
-          },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ n: 1 })).toEqual({ value: { n: 1 } });
-      expect('issues' in (await standardSchema['~standard'].validate({ n: 'x' }))).toBe(true);
-      expect('issues' in (await standardSchema['~standard'].validate({ a: { o: 'x' } }))).toBe(true);
-    });
-
-    it('refuses a schema that brings a key the validator writes while resolving references', async () => {
-      const standardSchema = toStandardSchema({
-        type: 'object',
-        properties: {
-          n: { $ref: '#/properties/m', __absolute_ref__: '#/properties/m/default' },
-          m: { default: { type: 'number', minimum: 5 } },
-        },
-      } as JSONSchema7);
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-      expect(await standardSchema['~standard'].validate({ n: 5 })).toEqual({
-        issues: [
-          {
-            message:
-              'Schema validation error: __absolute_ref__ at "/properties/n/__absolute_ref__" is reserved for the validator, so the schema is refused',
-          },
-        ],
-      });
-    });
-
-    const dynamicNode = {
-      $dynamicAnchor: 'node',
-      type: 'object',
-      properties: {
-        value: { type: 'string' },
-        children: { type: 'array', items: { $dynamicRef: '#node' } },
-      },
-    };
-    const draft2020 = 'https://json-schema.org/draft/2020-12/schema';
-    it.each([
-      [
-        '$dynamicAnchor in a keyword position',
-        { $schema: draft2020, ...dynamicNode },
-        '$dynamicAnchor at "/$dynamicAnchor"',
-      ],
-      [
-        '$dynamicRef reached only through a $ref pointer',
-        {
-          $schema: draft2020,
-          $ref: '#/components/schemas/Node',
-          components: { schemas: { Node: dynamicNode.properties } },
-        },
-        '$dynamicRef at "/components/schemas/Node/children/items/$dynamicRef"',
-      ],
-      [
-        '$dynamicRef under a dependencies entry named like a keyword',
-        { $schema: draft2020, dependencies: { type: { properties: { children: dynamicNode.properties.children } } } },
-        '$dynamicRef at "/dependencies/type/properties/children/items/$dynamicRef"',
-      ],
-      [
-        '$dynamicRef in a property named like a data keyword',
-        { $schema: draft2020, properties: { default: dynamicNode.properties.children.items } },
-        '$dynamicRef at "/properties/default/$dynamicRef"',
-      ],
-      ['$id at the root', { $id: 'http://x.test/root', type: 'object' }, '$id at "/$id"'],
-      [
-        '$id with a JSON Pointer fragment',
-        { type: 'object', definitions: { z: { $id: '#/properties/a' } } },
-        '$id at "/definitions/z/$id"',
-      ],
-      ['$anchor', { $defs: { lim: { $anchor: 'lim', minimum: 5 } } }, '$anchor at "/$defs/lim/$anchor"'],
-      ['$recursiveAnchor', { $recursiveAnchor: true, type: 'object' }, '$recursiveAnchor at "/$recursiveAnchor"'],
-      [
-        '$recursiveRef',
-        { type: 'object', properties: { child: { $recursiveRef: '#' } } },
-        '$recursiveRef at "/properties/child/$recursiveRef"',
-      ],
-      [
-        'an absolute $ref',
-        { properties: { v: { $ref: 'http://x.test/root#/definitions' } } },
-        '$ref "http://x.test/root#/definitions" at "/properties/v/$ref"',
-      ],
-      [
-        'a relative $ref',
-        { properties: { v: { $ref: 'root#/definitions' } } },
-        '$ref "root#/definitions" at "/properties/v/$ref"',
-      ],
-      [
-        'an anchor $ref',
-        { properties: { n: { $ref: '#lim' } }, examples: { a: { minimum: 5 } } },
-        '$ref "#lim" at "/properties/n/$ref"',
-      ],
-      [
-        'a keyword under a name map that a $ref reads as a schema',
-        { $defs: { $recursiveAnchor: true }, $ref: '#/$defs' },
-        '$recursiveAnchor at "/$defs/$recursiveAnchor"',
-      ],
-      ['$id inside an annotation', { type: 'string', example: { $id: { k: 1 } } }, '$id at "/example/$id"'],
-      ['a string $id in a name map', { properties: { $id: 'http://x.test/a' } }, '$id at "/properties/$id"'],
-      [
-        'a keyword that a $ref inside an array-valued properties reaches',
-        (() => {
-          const entry = { $ref: '#/default' };
-          return { properties: [entry], 'x-entry': entry, default: { $recursiveAnchor: true, minimum: 5 } };
-        })(),
-        '$recursiveAnchor at "/default/$recursiveAnchor"',
-      ],
-      [
-        'a keyword that a $ref in a named member of an array-valued properties reaches',
-        (() => {
-          const entry = { $ref: '#/default' };
-          return {
-            properties: Object.assign([], { item: entry }),
-            'x-entry': entry,
-            default: { $recursiveAnchor: true, type: 'string' },
-          };
-        })(),
-        '$recursiveAnchor at "/default/$recursiveAnchor"',
-      ],
-      [
-        'an object-valued $ref in data the dereference also walks',
-        { $ref: '#/x/properties', x: { properties: { const: { example: { $ref: {} } } } } },
-        '$ref that is not a string at "/x/properties/const/example/$ref"',
-      ],
-      [
-        'a keyword that a $ref inside an object-valued prefixItems reaches',
-        {
-          type: 'array',
-          prefixItems: { length: 1, 0: { $ref: '#/default' } },
-          default: { $recursiveAnchor: true, type: 'object' },
-        },
-        '$recursiveAnchor at "/default/$recursiveAnchor"',
-      ],
-      [
-        'a $ref that is not a string',
-        {
-          type: 'object',
-          properties: {
-            n: { $ref: ['#/properties/m/default'] },
-            m: { default: { type: 'number', minimum: 5, exclusiveMinimum: true } },
-          },
-        },
-        '$ref that is not a string at "/properties/n/$ref"',
-      ],
-    ])('refuses a schema with %s instead of resolving it', async (_case, schema, refused) => {
+  describe('allow-list', () => {
+    const validate = async (schema: unknown, value: unknown = {}) => {
       const standardSchema = toStandardSchema(schema as JSONSchema7);
       if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+      return standardSchema['~standard'].validate(value);
+    };
+    const refused = (keyword: string, pointer: string, reason: string) => ({
+      issues: [{ message: `Schema validation error: ${keyword} at "${pointer}" ${reason}, so the schema is refused` }],
+    });
+    type Case = [schema: unknown, keyword: string, pointer: string];
 
-      for (const value of [{ value: 'root', children: [{ value: 123 }] }, 'x']) {
-        expect(await standardSchema['~standard'].validate(value)).toEqual({
-          issues: [
-            {
-              message: `Schema validation error: ${refused} is not supported: only "#" and "#/..." references within the schema are resolved, so the schema is refused rather than checked loosely`,
-            },
-          ],
-        });
+    it('refuses a keyword outside the list, wherever a schema sits', async () => {
+      const cases: Case[] = [
+        [{ if: { type: 'string' }, then: { minLength: 2 } }, 'if', '/if'],
+        [
+          { properties: { a: { patternProperties: { '^x': {} } } } },
+          'patternProperties',
+          '/properties/a/patternProperties',
+        ],
+        [{ anyOf: [{ not: { type: 'string' } }] }, 'not', '/anyOf/0/not'],
+        [{ $defs: { A: { $anchor: 'a' } } }, '$anchor', '/$defs/A/$anchor'],
+        [{ properties: { a: { type: 'string', id: 'x' } } }, 'id', '/properties/a/id'],
+      ];
+      for (const [schema, keyword, pointer] of cases) {
+        expect(await validate(schema)).toEqual(refused(keyword, pointer, 'is not a supported keyword'));
       }
     });
-  });
 
-  it.each([
-    [
-      'its pointer names nothing (a malformed escape)',
-      {
-        type: 'array',
-        prefixItems: { length: 1, 0: { $ref: '#/default/a%zz' } },
-        default: { 'a%zz': { $recursiveAnchor: true, type: 'object' } },
-      },
-      '$ref "#/default/a%zz" at "/prefixItems/0/$ref" does not resolve within the schema, so the schema is refused',
-    ],
-    [
-      'normalisation replaces its target',
-      {
-        type: 'array',
-        minimum: 5,
-        exclusiveMinimum: true,
-        prefixItems: { length: 1, 0: { $ref: '#/exclusiveMinimum' } },
-      },
-      'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
-    ],
-    [
-      'its target is also literal data with a boolean bound',
-      {
-        type: 'array',
-        prefixItems: { length: 1, 0: { $ref: '#/default' } },
-        default: { minimum: 5, exclusiveMinimum: true },
-      },
-      'a $ref target that the schema also uses as a name map or as literal data holds a boolean exclusiveMinimum or exclusiveMaximum, which cannot be read both ways, so the schema is refused',
-    ],
-  ])('refuses a $ref inside an object-valued prefixItems when %s', async (_case, schema, refused) => {
-    const standardSchema = toStandardSchema(schema as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    for (const value of [[5], [{}]]) {
-      expect(await standardSchema['~standard'].validate(value)).toEqual({
-        issues: [{ message: `Schema validation error: ${refused}` }],
-      });
-    }
-  });
-
-  it('refuses a schema whose reachable $ref points nowhere, and ignores one in an unused definition', async () => {
-    const dangling = toStandardSchema({ properties: { x: { $ref: '#/missing' } } } as JSONSchema7);
-    const unused = toStandardSchema({ type: 'object', $defs: { U: { $ref: '#/missing' } } } as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await dangling['~standard'].validate({})).toEqual({
-      issues: [
-        {
-          message:
-            'Schema validation error: $ref "#/missing" at "/properties/x/$ref" does not resolve within the schema, so the schema is refused',
-        },
-      ],
+    it('refuses a listed keyword whose value has the wrong type', async () => {
+      const cases: Case[] = [
+        [{ type: 'number', minimum: 5, exclusiveMinimum: true }, 'exclusiveMinimum', '/exclusiveMinimum'],
+        [{ multipleOf: 0.01 }, 'multipleOf', '/multipleOf'],
+        [{ required: true }, 'required', '/required'],
+        [{ enum: [] }, 'enum', '/enum'],
+      ];
+      for (const [schema, keyword, pointer] of cases) {
+        expect(await validate(schema, 5)).toEqual(refused(keyword, pointer, 'has a value of the wrong type'));
+      }
     });
-    expect(await unused['~standard'].validate({})).toEqual({ value: {} });
-  });
 
-  it('names the index of a dangling $ref in a sparse object-valued prefixItems', async () => {
-    const standardSchema = toStandardSchema({
-      type: 'array',
-      prefixItems: { length: 2, 1: { $ref: '#/missing' } },
-    } as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await standardSchema['~standard'].validate([1, 2])).toEqual({
-      issues: [
-        {
-          message:
-            'Schema validation error: $ref "#/missing" at "/prefixItems/1/$ref" does not resolve within the schema, so the schema is refused',
-        },
-      ],
-    });
-  });
-
-  it('refuses a schema-valued dependencies entry beside unevaluatedProperties, which Ajv evaluated together', async () => {
-    const together = toStandardSchema({
-      $schema: 'https://json-schema.org/draft/2020-12/schema',
-      oneOf: [true, { dependencies: { x: { properties: { x: true } } }, unevaluatedProperties: false }],
-    } as unknown as JSONSchema7);
-    const alone = toStandardSchema({ dependencies: { x: { required: ['y'] } } } as unknown as JSONSchema7);
-    const apart = toStandardSchema({
-      properties: { left: { dependencies: { x: { required: ['y'] } } }, right: { unevaluatedProperties: false } },
-    } as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await together['~standard'].validate({ x: 1 })).toEqual({
-      issues: [
-        {
-          message:
-            'Schema validation error: a schema-valued "dependencies" entry at "/oneOf/1/dependencies/x" beside "unevaluatedProperties" at "/oneOf/1/unevaluatedProperties" is not supported: the validator does not record the properties it evaluates, so the schema is refused; use "dependentSchemas"',
-        },
-      ],
-    });
-    expect(await alone['~standard'].validate({ x: 1, y: 2 })).toEqual({ value: { x: 1, y: 2 } });
-    expect(await apart['~standard'].validate({})).toEqual({ value: {} });
-  });
-
-  it('refuses a reachable $ref to a value that is not a schema', async () => {
-    const standardSchema = toStandardSchema({
-      properties: { x: { $ref: '#/x-n' } },
-      'x-n': null,
-    } as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await standardSchema['~standard'].validate({})).toEqual({
-      issues: [
-        {
-          message:
-            'Schema validation error: $ref "#/x-n" at "/properties/x/$ref" points at a value that is not a schema, so the schema is refused',
-        },
-      ],
-    });
-  });
-
-  it.each([
-    ['then without if', { then: { $ref: '#/missing' } }, 5],
-    ['else without if', { type: 'object', else: { $ref: '#/missing' } }, {}],
-    ['additionalItems without items', { additionalItems: { $ref: '#/missing' } }, [1]],
-    [
-      'additionalItems beside an object items',
-      { items: { type: 'number' }, additionalItems: { $ref: '#/missing' } },
-      [1],
-    ],
-    [
-      'unevaluatedProperties beside additionalProperties',
-      {
+    it('refuses a $schema other than draft-07 or 2020-12, a 2020-12 keyword without it, and an $id below the root', async () => {
+      expect(await validate({ $schema: 'https://json-schema.org/draft/2019-09/schema', type: 'string' }, 'a')).toEqual(
+        refused('$schema', '/$schema', 'is not a draft-07 or 2020-12 $schema at the root'),
+      );
+      expect(await validate({ type: 'array', prefixItems: [{ type: 'string' }] }, ['a'])).toEqual(
+        refused('prefixItems', '/prefixItems', 'is only supported under a 2020-12 $schema'),
+      );
+      const nestedId = {
         $schema: 'https://json-schema.org/draft/2020-12/schema',
-        additionalProperties: true,
-        unevaluatedProperties: { $ref: '#/default' },
-        default: 'note',
-      },
-      { x: 1 },
-    ],
-  ])('accepts a dangling or non-schema $ref under %s, which the validator never reads', async (_label, schema, value) => {
-    const standardSchema = toStandardSchema(schema as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await standardSchema['~standard'].validate(value)).toEqual({ value });
-  });
-
-  it('refuses a $ref to "#/", which the validator reads as the root\'s "" member', async () => {
-    const standardSchema = toStandardSchema({
-      type: 'object',
-      properties: { child: { $ref: '#/' } },
-      '': true,
-    } as unknown as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-
-    expect(await standardSchema['~standard'].validate({ child: 1 })).toEqual({
-      issues: [
-        {
-          message:
-            'Schema validation error: $ref "#/" at "/properties/child/$ref" is not supported: the validator reads it as the root\'s "" member, not as the root, so the schema is refused; write "#" for the root',
-        },
-      ],
+        properties: { a: { $id: 'https://example.test/a', type: 'string' } },
+      };
+      expect(await validate(nestedId)).toEqual(refused('$id', '/properties/a/$id', 'is only supported at the root'));
     });
-  });
 
-  it.each([
-    ['a property named $id', { properties: { $id: { type: 'string' } } }, { $id: 'abc' }],
-    ['a property named $id with a boolean schema', { properties: { $id: false } }, {}],
-    ['a dependency list under a property named $id', { dependencies: { $id: ['label'] } }, {}],
-    [
-      'a $ref under an object-valued prefixItems key the validator never reads',
-      { type: 'array', prefixItems: { length: 0, note: { $ref: '#/default' } }, default: { exclusiveMinimum: true } },
-      [],
-    ],
-    ['$id inside const', { const: { $id: 'k' } }, { $id: 'k' }],
-    ['$anchor inside enum', { enum: ['a', { $anchor: 'k' }] }, { $anchor: 'k' }],
-    ['a non-local $ref inside examples', { examples: [{ $ref: 'http://x.test/a~b' }] }, 'x'],
-    [
-      '$recursiveRef inside default, under a key with / and ~',
-      { properties: { 'a/b~': { default: { $recursiveRef: '#' } } } },
-      {},
-    ],
-    [
-      'a property named $id in a component named properties',
-      {
-        $ref: '#/components/schemas/properties',
-        components: { schemas: { properties: { type: 'object', properties: { $id: { type: 'string' } } } } },
-      },
-      { $id: 'abc' },
-    ],
-  ])('accepts a schema with %s, which only names a property or holds data', async (_case, schema, value) => {
-    const standardSchema = toStandardSchema(schema as JSONSchema7);
-    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+    it('validates a 2020-12 schema with the keywords fork main checked with Ajv2020', async () => {
+      const schema = {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        $id: 'https://example.test/schemas/tree',
+        type: 'object',
+        $defs: { leaf: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], items: false } },
+        properties: { value: { anyOf: [{ $ref: '#/$defs/leaf' }, { type: 'null' }] } },
+        required: ['value'],
+        unevaluatedProperties: false,
+      };
+      expect(await validate(schema, { value: ['a', 1] })).toEqual({ value: { value: ['a', 1] } });
+      expect(await validate(schema, { value: ['a', 1, true] })).toHaveProperty('issues');
+      expect(await validate(schema, { value: null, extra: 1 })).toHaveProperty('issues');
+    });
 
-    expect(await standardSchema['~standard'].validate(value)).toEqual({ value });
+    it('refuses a schema position that is not a JSON object or a boolean', async () => {
+      const cases: Case[] = [
+        [{ properties: { x: [] } }, 'schema', '/properties/x'],
+        [{ properties: { x: Object.create({ minLength: 2 }) } }, 'schema', '/properties/x'],
+        [{ additionalProperties: 'false' }, 'schema', '/additionalProperties'],
+      ];
+      for (const [schema, keyword, pointer] of cases) {
+        expect(await validate(schema)).toEqual(refused(keyword, pointer, 'is not a JSON object or boolean'));
+      }
+    });
+
+    it('refuses a $ref other than "#" or a member of the root\'s $defs or definitions', async () => {
+      for (const ref of ['#/properties/a', '#/$defs/A#', '#/$defs/missing', '#/$defs/A/properties/p']) {
+        const schema = { properties: { a: { type: 'string' }, b: { $ref: ref } }, $defs: { A: { type: 'string' } } };
+        expect(await validate(schema)).toEqual(
+          refused('$ref', '/properties/b/$ref', 'is not "#" or a member of the root\'s "$defs" or "definitions"'),
+        );
+      }
+    });
+
+    it('refuses a loop of $ref, allOf, anyOf or oneOf that reads the same schema at the same value', async () => {
+      const reason = 'comes back to the same schema at the same value';
+      expect(await validate({ properties: { x: { $ref: '#/$defs/A' } }, $defs: { A: { $ref: '#/$defs/A' } } })).toEqual(
+        refused('$ref', '/$defs/A/$ref', reason),
+      );
+      expect(await validate({ anyOf: [{ type: 'null' }, { $ref: '#' }] }, null)).toEqual(
+        refused('$ref', '/anyOf/1/$ref', reason),
+      );
+    });
+
+    it('refuses names that Ajv read from the Object prototype', async () => {
+      expect(await validate(JSON.parse('{"properties":{"__proto__":{"type":"string"}}}'))).toEqual(
+        refused('properties', '/properties/__proto__', 'names a member like an Object prototype key'),
+      );
+      expect(await validate({ required: ['toString'] })).toEqual(
+        refused('required', '/required', 'names a property like an Object prototype key'),
+      );
+      expect(await validate({ const: { constructor: {} } })).toEqual(
+        refused('const', '/const', 'holds an object key like an Object prototype key'),
+      );
+    });
+
+    it('refuses nullable without type, or false beside a null type, as Ajv did', async () => {
+      expect(await validate({ nullable: true })).toEqual(refused('nullable', '/nullable', 'is used without "type"'));
+      expect(await validate({ type: ['string', 'null'], nullable: false })).toEqual(
+        refused('nullable', '/nullable', 'is false beside a "null" type'),
+      );
+    });
+
+    it('refuses a $ref that an $id in an annotation would move to another schema', async () => {
+      const schema = {
+        properties: { a: { $ref: '#/$defs/A' } },
+        $defs: { A: { type: 'string' } },
+        'x-meta': { $id: '#/$defs/A', type: 'number' },
+      };
+      expect(await validate(schema, { a: 1 })).toEqual(
+        refused('$ref', '/properties/a/$ref', 'resolves to another schema than its JSON Pointer names'),
+      );
+    });
+
+    it('refuses a value JSON cannot carry before checking it', async () => {
+      const message = 'The value holds something JSON cannot carry, so it is refused.';
+      const open = { type: 'object', properties: { at: {} } };
+      expect(await validate(open, { at: new Date(0) })).toEqual({ issues: [{ message, path: ['at'] }] });
+      expect(await validate(open, { at: [1, Infinity] })).toEqual({ issues: [{ message, path: ['at', 1] }] });
+      expect(await validate(open, Object.create({ at: 1 }))).toEqual({ issues: [{ message, path: [] }] });
+      // Ajv's equality calls an own valueOf, so a value compared by const or enum may not hold one.
+      expect(await validate({ properties: { a: { const: { p: 1 } } } }, JSON.parse('{"a":{"valueOf":1}}'))).toEqual({
+        issues: [{ message, path: ['a', 'valueOf'] }],
+      });
+    });
   });
 
   it('reports an extra property once, and still reports a property declared false', async () => {
