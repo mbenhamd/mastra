@@ -6384,6 +6384,106 @@ run_validator_self_tests() {
       exit 1
     fi
     rm -f "$fixture_repo/agent-sdks/openai/src/generated.test.ts"
+
+    # A changed SDK file outside src (here its Vitest configuration) refuses.
+    local sdk_config_head
+    sdk_config_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "export default { test: { include: ['../../**/*.test.ts'] } };" \
+        > agent-sdks/openai/vitest.config.ts
+      git add .
+      git commit -q -m 'widen the openai vitest include'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-config.log"
+    if run_fixture "$sdk_config_head" "$output" BASE_SHA="$owned_base"; then
+      echo 'A changed Agent SDK Vitest configuration unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai files outside src are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/vitest.config.ts' || {
+      echo 'The SDK configuration refusal did not name agent-sdks/openai/vitest.config.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a changed configuration.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # A tracked source the build rewrites refuses before the suite runs.
+    local rewriting_pnpm_bin="$test_root/rewriting-pnpm-bin"
+    mkdir -p "$rewriting_pnpm_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
+      "  printf '%s\\n' 'export const utils = 4;' > agent-sdks/openai/src/utils.ts" \
+      'fi' \
+      "exec '$mock_bin/pnpm' \"\$@\"" > "$rewriting_pnpm_bin/pnpm"
+    chmod +x "$rewriting_pnpm_bin/pnpm"
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-rewritten-source.log"
+    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$rewriting_pnpm_bin:$mock_bin:$PATH"; then
+      echo 'A source rewritten by the Agent SDK build unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The agent-sdks/openai sources differ from HEAD_SHA after the build, so its suite does not run.' "$output"
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a rewritten source.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+
+    # A changed SDK test also runs on its own, with the provider keys cleared.
+    local sdk_test_head
+    sdk_test_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('utils', () => {});" \
+        > agent-sdks/openai/src/utils.test.ts
+      git add .
+      git commit -q -m 'add an openai unit test'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$command_environment_log"
+    output="$test_root/pf9666-sdk-test-env.log"
+    if ! run_fixture "$sdk_test_head" "$output" BASE_SHA="$owned_base" OPENAI_API_KEY=ambient-fixture-key; then
+      echo 'An ordinary Agent SDK unit test did not pass validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'Running changed test file in full: agent-sdks/openai/src/utils.test.ts' "$output"
+    if ! grep -Fq $'OPENAI_API_KEY=\t--dir agent-sdks/openai exec vitest run --reporter=dot --reporter=json' \
+      "$command_environment_log" ||
+      grep -F 'ambient-fixture-key' "$command_environment_log" | grep -F 'agent-sdks/openai' | grep -Fq 'vitest'; then
+      echo 'An Agent SDK test ran with an ambient provider key.' >&2
+      cat "$command_environment_log" >&2
+      exit 1
+    fi
+
+    # A failed scan of the changed workspace manifests refuses.
+    local failing_scan_bin="$test_root/failing-scan-bin" real_scan_grep
+    real_scan_grep="$(command -v grep)"
+    mkdir -p "$failing_scan_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'case "$*" in *client-sdks/client-js*) exit 2 ;; esac' \
+      "exec '$real_scan_grep' \"\$@\"" > "$failing_scan_bin/grep"
+    chmod +x "$failing_scan_bin/grep"
+    : > "$command_log"
+    output="$test_root/pf9666-manifest-scan-error.log"
+    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$failing_scan_bin:$mock_bin:$PATH"; then
+      echo 'A failed manifest scan unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'changed workspace manifests (scan failed)' "$output"
     git -C "$fixture_repo" reset -q --hard "$base_sha"
     echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
   }
@@ -15796,9 +15896,14 @@ while IFS= read -r path; do
   fi
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
+  scan_status=0
   grep -E \
     '^(agent-sdks/(claude|openai)|client-sdks/client-js|mastracode/(factory|sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
-    "$changed_files" || true
+    "$changed_files" || scan_status=$?
+  # A read error refuses through an entry no exception admits.
+  if (( scan_status > 1 )); then
+    printf '%s\n' 'changed workspace manifests (scan failed)'
+  fi
 )
 
 inngest_index_test_changed=false
@@ -16875,6 +16980,20 @@ agent_sdk_untracked_sources() {
 }
 for agent_sdk in agent-sdks/claude agent-sdks/openai; do
   if workspace_changed "$agent_sdk"; then
+    # Only sources and the pinned manifest may change: a changed Vitest or
+    # TypeScript configuration could collect tests the inventory never saw.
+    sdk_scan_status=0
+    agent_sdk_config_changes="$(LC_ALL=C grep -E "^$agent_sdk/" "$changed_files" |
+      LC_ALL=C grep -Ev "^$agent_sdk/(src/|package\\.json\$)")" || sdk_scan_status=$?
+    if (( sdk_scan_status > 1 )); then
+      echo "The $agent_sdk changed-file scan failed, so fork PR validation stops." >&2
+      exit 1
+    fi
+    if [[ -n "$agent_sdk_config_changes" ]]; then
+      echo "These $agent_sdk files outside src are not supported by fork PR validation:" >&2
+      printf '%s\n' "$agent_sdk_config_changes" >&2
+      exit 1
+    fi
     if ! agent_sdk_refused_tests="$(agent_sdk_unsupported_tests "$agent_sdk")"; then
       echo "The $agent_sdk file inventory could not be read, so fork PR validation stops." >&2
       exit 1
@@ -16894,6 +17013,11 @@ for agent_sdk in agent-sdks/claude agent-sdks/openai; do
     if [[ -n "$agent_sdk_untracked" ]]; then
       echo "These $agent_sdk source entries are not tracked by Git, so its suite does not run:" >&2
       printf '%s\n' "$agent_sdk_untracked" >&2
+      exit 1
+    fi
+    # Tracked sources must still be the inspected HEAD_SHA content and types.
+    if ! git diff --quiet "$HEAD_SHA" -- "$agent_sdk/src"; then
+      echo "The $agent_sdk sources differ from HEAD_SHA after the build, so its suite does not run." >&2
       exit 1
     fi
     run_with_validation_budget 900 \
@@ -18931,6 +19055,9 @@ while IFS= read -r file; do
     # The frozen provider subtree remains skipped even if the runner happens to
     # carry an ambient OpenAI credential.
     vitest_environment=(env OPENAI_API_KEY=)
+  elif [[ "$file" == agent-sdks/claude/* || "$file" == agent-sdks/openai/* ]]; then
+    # The same cleared provider keys as the whole-suite Agent SDK run.
+    vitest_environment=(env OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY=)
   elif is_pf3553_reviewed_server_test "$file"; then
     # Keep accidental hosted-runner provider credentials out of these exact
     # local Server suites even though the reviewed tests do not call providers.
