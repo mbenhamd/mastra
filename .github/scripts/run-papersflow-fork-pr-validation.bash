@@ -1818,9 +1818,16 @@ verify_pf9666_patched_cfworker_graph() (
   fi
   tr '\0' '\n' < "$actual_paths.z" > "$actual_paths"
   # In a UTF-8 locale grep drops a line holding an invalid byte; read bytes.
+  # No match (status 1) is an empty set; a read error refuses.
+  local graph_status=0
   LC_ALL=C grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|^patches/' \
-    "$actual_paths" | LC_ALL=C sort -u > "$actual_paths.graph" || true
-  mv "$actual_paths.graph" "$actual_paths"
+    "$actual_paths" > "$actual_paths.graph" || graph_status=$?
+  if (( graph_status > 1 )) || ! LC_ALL=C sort -u -o "$actual_paths" "$actual_paths.graph"; then
+    rm -f "$actual_paths.graph"
+    echo 'PF-9666 could not filter the changed paths.' >&2
+    return 1
+  fi
+  rm -f "$actual_paths.graph"
   if ! cmp -s "$expected_paths" "$actual_paths"; then
     echo 'PF-9666 changed dependency-graph files are outside the exact reviewed set:' >&2
     diff -u "$expected_paths" "$actual_paths" >&2 || true
@@ -3068,6 +3075,23 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     return 1
   fi
   grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+
+  # A grep read error while filtering the changed paths refuses.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  head_sha="$reviewed_head"
+  local failing_grep_bin="$test_root/failing-grep-bin" real_grep
+  real_grep="$(command -v grep)"
+  mkdir -p "$failing_grep_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *pnpmfile*) echo "grep: read error" >&2; exit 2 ;; esac' \
+    "exec '$real_grep' \"\$@\"" > "$failing_grep_bin/grep"
+  chmod +x "$failing_grep_bin/grep"
+  output="$test_root/graph-filter-error.log"
+  if run_fixture_admission "$output" PATH="$failing_grep_bin:$PATH"; then
+    echo 'A failed PF-9666 path filter unexpectedly passed admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 could not filter the changed paths.' "$output"
 
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
   head_sha="$reviewed_head"
@@ -6251,6 +6275,57 @@ run_validator_self_tests() {
     }
     if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
       echo 'The Agent SDK suite ran with a test symlink.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # Vitest follows a directory symlink to tests Git does not list.
+    local sdk_dir_symlink_head
+    sdk_dir_symlink_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      ln -s ../../../elsewhere agent-sdks/openai/src/linked
+      git add .
+      git commit -q -m 'add an openai directory symlink'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-dir-symlink.log"
+    if run_fixture "$sdk_dir_symlink_head" "$output" BASE_SHA="$owned_base"; then
+      echo 'An Agent SDK directory symlink unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/linked' || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a directory symlink.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # A failed SDK file inventory stops validation before the suite runs.
+    local failing_git_bin="$test_root/failing-git-bin" real_git
+    real_git="$(command -v git)"
+    mkdir -p "$failing_git_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "${1-}" == ls-files && "${4-}" == agent-sdks/openai ]]; then exit 128; fi' \
+      "exec '$real_git' \"\$@\"" > "$failing_git_bin/git"
+    chmod +x "$failing_git_bin/git"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-inventory-error.log"
+    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$failing_git_bin:$mock_bin:$PATH"; then
+      echo 'A failed Agent SDK file inventory unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The agent-sdks/openai file inventory could not be read, so fork PR validation stops.' "$output"
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran after a failed file inventory.' >&2
       cat "$command_log" >&2
       exit 1
     fi
@@ -16691,15 +16766,25 @@ fi
 # with mocked provider SDKs; provider credentials are cleared regardless.
 # Their Vitest configs collect every src/**/*.test.ts, so a test file the test
 # classification refuses (end-to-end, integration or Playwright) would run in
-# the whole-suite command. Refuse such a file, one that is not a regular Git
-# blob, or one that cannot be read, before anything runs.
+# the whole-suite command. Refuse such a file, or one that cannot be read, and
+# any tracked entry that is not a regular Git blob whatever its name (Vitest
+# follows a directory symlink to tests Git does not list), before anything
+# runs. A failed inventory returns non-zero.
 agent_sdk_unsupported_tests() {
-  local file playwright_status
+  local file playwright_status inventory
+  inventory="$(mktemp)"
+  if ! git ls-files -z -- "$1" > "$inventory"; then
+    rm -f "$inventory"
+    return 1
+  fi
   while IFS= read -r -d '' file; do
+    if ! git_regular_file_at_head "$file"; then
+      printf '%s\n' "$file"
+      continue
+    fi
     [[ "$file" =~ \.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || continue
     if [[ "$file" == */integration-tests/* || "$file" == *$'\n'* || \
-      "$file" =~ \.e2e\.(test|spec)\. || "$file" =~ integration\.(test|spec)\. ]] ||
-      ! git_regular_file_at_head "$file"; then
+      "$file" =~ \.e2e\.(test|spec)\. || "$file" =~ integration\.(test|spec)\. ]]; then
       printf '%s\n' "$file"
       continue
     fi
@@ -16708,11 +16793,15 @@ agent_sdk_unsupported_tests() {
     if (( playwright_status != 1 )); then
       printf '%s\n' "$file"
     fi
-  done < <(git ls-files -z -- "$1")
+  done < "$inventory"
+  rm -f "$inventory"
 }
 for agent_sdk in agent-sdks/claude agent-sdks/openai; do
   if workspace_changed "$agent_sdk"; then
-    agent_sdk_refused_tests="$(agent_sdk_unsupported_tests "$agent_sdk")"
+    if ! agent_sdk_refused_tests="$(agent_sdk_unsupported_tests "$agent_sdk")"; then
+      echo "The $agent_sdk file inventory could not be read, so fork PR validation stops." >&2
+      exit 1
+    fi
     if [[ -n "$agent_sdk_refused_tests" ]]; then
       echo "These $agent_sdk test files are not supported by fork PR validation:" >&2
       printf '%s\n' "$agent_sdk_refused_tests" >&2
