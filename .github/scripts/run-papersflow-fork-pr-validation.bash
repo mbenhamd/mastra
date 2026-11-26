@@ -16838,19 +16838,19 @@ agent_sdk_unsupported_tests() {
   while IFS= read -r -d '' file; do
     read_count=$((read_count + 1))
     if ! git_regular_file_at_head "$file"; then
-      printf '%s\n' "$file"
+      printf '%s\n' "$file" || { rm -f "$inventory"; return 1; }
       continue
     fi
     [[ "$file" =~ \.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || continue
     if [[ "$file" == */integration-tests/* || "$file" == *$'\n'* || \
       "$file" =~ \.e2e\.(test|spec)\. || "$file" =~ integration\.(test|spec)\. ]]; then
-      printf '%s\n' "$file"
+      printf '%s\n' "$file" || { rm -f "$inventory"; return 1; }
       continue
     fi
     playwright_status=0
     grep -Eq "['\"]@playwright/test['\"]" "$file" || playwright_status=$?
     if (( playwright_status != 1 )); then
-      printf '%s\n' "$file"
+      printf '%s\n' "$file" || { rm -f "$inventory"; return 1; }
     fi
   done < "$inventory" || {
     rm -f "$inventory"
