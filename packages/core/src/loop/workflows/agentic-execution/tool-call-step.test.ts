@@ -2637,6 +2637,52 @@ describe('createToolCallStep tool approval workflow', () => {
     });
   });
 
+  it('refuses null arguments to a gated all-optional tool before approval, and still asks for {}', async () => {
+    const execute = vi.fn();
+    const builtTool = new CoreToolBuilder({
+      originalTool: {
+        id: 'test-tool',
+        description: 'Gated tool whose fields are all optional',
+        requireApproval: true,
+        inputSchema: z.object({ note: z.string().optional() }),
+        execute,
+      } as any,
+      options: {
+        name: 'test-tool',
+        description: 'Gated tool whose fields are all optional',
+        requireApproval: true,
+        requestContext: new RequestContext(),
+        logger: { debug: vi.fn(), warn: vi.fn(), error: vi.fn(), trackException: vi.fn() } as any,
+      },
+    }).build();
+    const step = createToolCallStep({
+      tools: { 'test-tool': builtTool },
+      messageList,
+      controller,
+      runId: 'test-run',
+      streamState,
+    } as any);
+
+    // A regression suspends; resolve it so the assertions below fail instead of the test hanging.
+    suspend.mockResolvedValueOnce('suspended');
+    const refused = await step.execute(makeExecuteParams({ inputData: { ...makeInputData(), args: null } }));
+
+    expect(suspend).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(refused).toEqual({
+      error: expect.objectContaining({
+        message:
+          'Tool "test-tool" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.',
+      }),
+      ...makeInputData(),
+      args: null,
+    });
+
+    void step.execute(makeExecuteParams({ inputData: { ...makeInputData(), args: {} } }));
+    await vi.waitFor(() => expect(suspend).toHaveBeenCalledOnce());
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('normalizes evidence-free null resume placeholders on a fresh tool call', async () => {
     const resultValue = { success: true };
     tools['test-tool'].requireApproval = false;
@@ -4598,7 +4644,7 @@ describe('createToolCallStep tool approval workflow', () => {
 
     const { resumeSchema: optionalObjectSchema } = await approvalSchemaFor(
       z.object({ note: z.string().optional() }),
-      null,
+      {},
     );
     expect(optionalObjectSchema.properties.editedArgs).toBeDefined();
 

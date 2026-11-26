@@ -134,10 +134,7 @@ describeForAllEngines('AIMock scenario: tool call with arguments that are not va
     expect(first.chunks?.some(chunk => chunk.type === 'tool-error')).toBe(true);
   });
 
-  // Normal/fs check for unparsed arguments after beforeApproval. Moving that guard is
-  // outside the durable/evented follow-up's scope and awaits separate approval.
-  const itFailsOnNormalEngines = engine === 'normal' || engine === 'fs' ? it.fails : it;
-  itFailsOnNormalEngines('returns malformed arguments to the model without asking for approval', async () => {
+  it('returns malformed arguments to the model without asking for approval', async () => {
     const { first, tool } = await sendToolCall({ requireApproval: true });
 
     expect(tool.executions).toBe(0);
