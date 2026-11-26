@@ -1650,6 +1650,47 @@ pf9666_config() {
   PF9666_CFWORKER_PATCH_SHA256="${PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256:-589ef99fb1f202232af277a479b493e3d38fdcc5818dee2563db959dcc970059}"
   PF9666_CLAUDE_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256:-e90382bf1195648c4dcb9e450b02ce59c40cb7c2d7868cc7a0d4a91bfff44492}"
   PF9666_OPENAI_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256:-e02ccfb96bcb3fe17ebfd76899a0c9ac7cb976fe0389629d3a4a84527f03c097}"
+  # Base blobs (path, TAB, sha256) at PR 631's merge base 1819f397a1, so the
+  # reviewed head blobs are admitted only as the reviewed delta from them.
+  PF9666_BASE_BLOBS="${PAPERSFLOW_PF9666_BASE_BLOBS:-pnpm-lock.yaml	e8c8890ae48709efaa920bb8489f278474cb175feebaafe26279fc15b27e1f7f
+pnpm-workspace.yaml	844f8a5cfbf00a42f4bb01656917d5c22f26e918bfc96ca0772109aaefa696aa
+agent-sdks/claude/package.json	7a4e5ba53073af4078287a1f1022ac031c41e5fbfda305a3692a3a6481818dcb
+agent-sdks/openai/package.json	62e843ad37a84a77bfec057050be0c61a3712414fde595cd7c7489bc48298397
+agent-sdks/claude/src/utils.ts	bc5bfb526dfbdb20cb111ba01cce64ae6e8cf3a052c3a5b27e37c201fb9ab843
+agent-sdks/openai/src/utils.ts	ec7a239bb1902b86b37382816958790a1ac07be54ed93840eed12233127b055d
+mastracode/factory/src/routes/projects.ts	2582235d5f6d07c67a621b7ecbcb6bebe6cccded3a82ddaffc570d1b0e5d8f3f}"
+  # PR 631's only Agent SDK and Factory changes besides the two SDK manifests
+  # (path, TAB, head sha256). No other path under those workspaces may change.
+  PF9666_OWNED_SOURCE_BLOBS="${PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS:-agent-sdks/claude/src/utils.ts	8aab34c97e79154e60eba2a56c8e94be95d6c5df2b48f3f3bf8cc6d553daf375
+agent-sdks/openai/src/utils.ts	692b92047e36572cda8264e1ff419071de5ec407fee8f9cc9ff28ee3193a3a53
+mastracode/factory/src/routes/projects.ts	23eca000d74e8247fbe647f00fe4ff8a9b5c759bbbf52de09c1cb7af2b86cd7b}"
+}
+
+# Compares each listed blob at $1 with its pinned sha256. $2 names the side in
+# messages; the list ($3) holds one "path<TAB>sha256" line per blob.
+verify_pf9666_pinned_blobs() {
+  local revision="$1" side="$2" path expected_hash actual_hash
+  while IFS=$'\t' read -r path expected_hash; do
+    [[ -n "$path" ]] || continue
+    if ! git_regular_file_at_revision "$revision" "$path"; then
+      echo "PF-9666 reviewed $side file is not a regular blob: $path" >&2
+      return 1
+    fi
+    if ! actual_hash="$(git_blob_sha256 "$revision" "$path")" || [[ "$actual_hash" != "$expected_hash" ]]; then
+      echo "PF-9666 reviewed $side file hash changed: $path" >&2
+      return 1
+    fi
+  done <<< "$3"
+}
+
+# Self-test helper: prints a "path<TAB>sha256" line for each path ($2...) at
+# revision $1 of the repository in the current directory.
+pf9666_fixture_blob_table() {
+  local revision="$1" path
+  shift
+  for path in "$@"; do
+    printf '%s\t%s\n' "$path" "$(git_blob_sha256 "$revision" "$path")"
+  done
 }
 
 pf9666_metadata_matches() {
@@ -1831,7 +1872,8 @@ verify_pf9666_patched_cfworker_graph() (
   # In a UTF-8 locale grep drops a line holding an invalid byte; read bytes.
   # No match (status 1) is an empty set; a read error refuses.
   local graph_status=0
-  LC_ALL=C grep -E '(^|/)(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.cjs)$|(^|/)patches/' \
+  # pnpm 11 also loads .pnpmfile.mjs and reads package.yaml and package.json5 manifests.
+  LC_ALL=C grep -E '(^|/)(package\.(json|json5|yaml|yml)|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|\.?pnpmfile\.[cm]?[jt]s)$|(^|/)patches/' \
     "$actual_paths" > "$actual_paths.graph" || graph_status=$?
   if (( graph_status > 1 )) || ! LC_ALL=C sort -u -o "$actual_paths" "$actual_paths.graph"; then
     rm -f "$actual_paths.graph"
@@ -1905,14 +1947,40 @@ NODE
     return 1
   fi
 
+  # The base side: the head blobs above are admitted only as the reviewed
+  # delta from these base blobs, and the patch is new.
+  if git cat-file -e "$base_sha:$patch_path" 2> /dev/null; then
+    echo "PF-9666 reviewed base already has $patch_path." >&2
+    return 1
+  fi
+  verify_pf9666_pinned_blobs "$base_sha" base "$PF9666_BASE_BLOBS" || return 1
+
+  # The Agent SDK and Factory workspaces change only by PR 631's reviewed
+  # blobs: the two manifests pinned above and the owned sources below.
+  if ! git diff --no-renames --name-only -z "$base_sha" "$head_sha" -- \
+    agent-sdks/claude agent-sdks/openai mastracode/factory > "$actual_paths.z" ||
+    ! tr '\0' '\n' < "$actual_paths.z" | LC_ALL=C sort > "$actual_paths" ||
+    ! { printf '%s\n' agent-sdks/claude/package.json agent-sdks/openai/package.json &&
+      printf '%s\n' "$PF9666_OWNED_SOURCE_BLOBS" | cut -f1; } | LC_ALL=C sort -u > "$expected_paths"; then
+    echo 'PF-9666 could not list the Agent SDK and Factory changes.' >&2
+    return 1
+  fi
+  if ! cmp -s "$expected_paths" "$actual_paths"; then
+    echo 'PF-9666 Agent SDK and Factory changes are outside the exact reviewed set:' >&2
+    diff -u "$expected_paths" "$actual_paths" >&2 || true
+    return 1
+  fi
+  verify_pf9666_pinned_blobs "$head_sha" head "$PF9666_OWNED_SOURCE_BLOBS" || return 1
+
   verify_pf9666_schema_compat_manifest_delta "$base_sha" "$head_sha" || return 1
 )
 
 # The install classifier's watched dependency-graph paths, also recomputed by
 # the main validator for the PF-9666 planning admission.
 list_watched_dependency_graph_changes() {
-  git diff --no-renames --name-only "${1}...${2}" -- \
-    .npmrc .pnpmfile.cjs pnpmfile.cjs package.json pnpm-workspace.yaml \
+  git -c core.quotePath=false diff --no-renames --name-only "${1}...${2}" -- \
+    .npmrc .pnpmfile.cjs pnpmfile.cjs .pnpmfile.mjs pnpmfile.mjs \
+    package.json package.yaml package.json5 pnpm-workspace.yaml \
     patches packages/server/package.json server-adapters/fastify/package.json \
     packages/_types-builder/package.json packages/agent-builder/package.json |
     sort -u
@@ -2955,8 +3023,10 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     exit "$status"
   }
   trap pf9666_fixture_cleanup EXIT
-  mkdir -p "$fixture_repo/packages/schema-compat" "$fixture_repo/agent-sdks/claude" \
-    "$fixture_repo/agent-sdks/openai" "$fixture_repo/patches"
+  mkdir -p "$fixture_repo/packages/schema-compat" "$fixture_repo/agent-sdks/claude/src" \
+    "$fixture_repo/agent-sdks/openai/src" "$fixture_repo/mastracode/factory/src/routes" "$fixture_repo/patches"
+  local -a owned_sources=(agent-sdks/claude/src/utils.ts agent-sdks/openai/src/utils.ts
+    mastracode/factory/src/routes/projects.ts)
 
   # Writes the fixture lockfile; $1 is the cfworker patch_hash (empty: base).
   write_fixture_lockfile() {
@@ -2981,6 +3051,10 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     > "$fixture_repo/packages/schema-compat/package.json"
   printf '{"name":"@mastra/claude"}\n' > "$fixture_repo/agent-sdks/claude/package.json"
   printf '{"name":"@mastra/openai"}\n' > "$fixture_repo/agent-sdks/openai/package.json"
+  local owned_source
+  for owned_source in "${owned_sources[@]}"; do
+    printf 'export const reviewed = 1;\n' > "$fixture_repo/$owned_source"
+  done
   printf 'body-parser patch\n' > "$fixture_repo/patches/body-parser@2.3.0.patch"
   printf '%s\n' 'packages:' '  - packages/*' '' 'patchedDependencies:' \
     '  body-parser@2.3.0: patches/body-parser@2.3.0.patch' > "$fixture_repo/pnpm-workspace.yaml"
@@ -2999,6 +3073,9 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     > "$fixture_repo/agent-sdks/claude/package.json"
   printf '{"name":"@mastra/openai","dependencies":{"@mastra/schema-compat":"workspace:*"}}\n' \
     > "$fixture_repo/agent-sdks/openai/package.json"
+  for owned_source in "${owned_sources[@]}"; do
+    printf 'export const reviewed = 2;\n' > "$fixture_repo/$owned_source"
+  done
   git -C "$fixture_repo" add .
   git -C "$fixture_repo" commit -q -m reviewed
   reviewed_head="$(git -C "$fixture_repo" rev-parse HEAD)"
@@ -3014,6 +3091,10 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     PAPERSFLOW_PF9666_WORKSPACE_SHA256="$(fixture_pin pnpm-workspace.yaml)"
     PAPERSFLOW_PF9666_LOCKFILE_SHA256="$(fixture_pin pnpm-lock.yaml)"
     PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256="$patch_hash"
+    PAPERSFLOW_PF9666_BASE_BLOBS="$(cd "$fixture_repo" && pf9666_fixture_blob_table "$base_sha" pnpm-lock.yaml \
+      pnpm-workspace.yaml agent-sdks/claude/package.json agent-sdks/openai/package.json "${owned_sources[@]}")"
+    PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(cd "$fixture_repo" &&
+      pf9666_fixture_blob_table "$reviewed_head" "${owned_sources[@]}")"
   )
 
   run_fixture_admission() {
@@ -3100,6 +3181,62 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     return 1
   fi
   grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+
+  # pnpm 11 loads .pnpmfile.mjs: a seventh graph file.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  printf 'export const hooks = {};\n' > "$fixture_repo/.pnpmfile.mjs"
+  git -C "$fixture_repo" add .pnpmfile.mjs
+  git -C "$fixture_repo" commit -q -m 'add an ESM pnpmfile'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/pnpmfile-mjs.log"
+  if run_fixture_admission "$output"; then
+    echo 'An ESM pnpmfile unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 watched dependency-graph paths are outside the exact reviewed set' "$output"
+
+  # pnpm 11 also reads a workspace manifest named package.yaml.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  printf 'name: unreviewed\n' > "$fixture_repo/agent-sdks/openai/package.yaml"
+  git -C "$fixture_repo" add agent-sdks/openai/package.yaml
+  git -C "$fixture_repo" commit -q -m 'add a YAML workspace manifest'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/package-yaml.log"
+  if run_fixture_admission "$output"; then
+    echo 'A YAML workspace manifest unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+
+  # The reviewed head blobs over a different base (one that changed an SDK
+  # manifest) would undo that change; the base pins refuse it.
+  git -C "$fixture_repo" reset -q --hard "$base_sha"
+  printf '{"name":"@mastra/claude","private":true}\n' > "$fixture_repo/agent-sdks/claude/package.json"
+  git -C "$fixture_repo" commit -q -am 'change the claude manifest on main'
+  local moved_base
+  moved_base="$(git -C "$fixture_repo" rev-parse HEAD)"
+  git -C "$fixture_repo" checkout -q "$reviewed_head" -- .
+  git -C "$fixture_repo" commit -q -m 'reviewed blobs over the moved base'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/moved-base.log"
+  if run_fixture_admission "$output" BASE_SHA="$moved_base"; then
+    echo 'The reviewed head blobs over a different base unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 reviewed base file hash changed: agent-sdks/claude/package.json' "$output"
+
+  # Any other Agent SDK or Factory change than PR 631's own is refused.
+  git -C "$fixture_repo" reset -q --hard "$reviewed_head"
+  printf 'export const extra = 1;\n' > "$fixture_repo/agent-sdks/openai/src/extra.ts"
+  git -C "$fixture_repo" add agent-sdks/openai/src/extra.ts
+  git -C "$fixture_repo" commit -q -m 'add an unreviewed SDK source'
+  head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
+  output="$test_root/extra-sdk-source.log"
+  if run_fixture_admission "$output"; then
+    echo 'An unreviewed Agent SDK source unexpectedly passed PF-9666 admission.' >&2
+    return 1
+  fi
+  grep -Fq 'PF-9666 Agent SDK and Factory changes are outside the exact reviewed set' "$output"
 
   # A grep read error while filtering the changed paths refuses.
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
@@ -6135,7 +6272,7 @@ run_validator_self_tests() {
 
   assert_package_contract_rejected() {
     : > "$command_log"
-    if run_fixture "$1" "$3" BASE_SHA="$2"; then
+    if run_fixture "$1" "$3" BASE_SHA="$2" "${@:4}"; then
       echo 'An unsupported package contract change unexpectedly passed.' >&2
       cat "$3" >&2
       exit 1
@@ -6147,355 +6284,55 @@ run_validator_self_tests() {
     fi
   }
 
-  # Adds the two Agent SDK workspaces and the Factory projects route pair on
-  # top of $1 and prints the new commit.
-  commit_pf9666_owned_workspaces() (
+  # Gives $base_sha a schema-compat importer and cfworker 4.1.1 (as MCP pins it)
+  # and prints the new commit.
+  commit_pf9666_cfworker_base() (
     cd "$fixture_repo"
-    git reset -q --hard "$1"
-    mkdir -p agent-sdks/claude/src agent-sdks/openai/src mastracode/factory/src/routes
-    local sdk
-    for sdk in claude openai; do
-      printf '{"name":"@mastra/%s"}\n' "$sdk" > "agent-sdks/$sdk/package.json"
-      printf '%s\n' 'export default {};' > "agent-sdks/$sdk/vitest.config.ts"
-      printf '%s\n' 'export const utils = 1;' > "agent-sdks/$sdk/src/utils.ts"
-    done
-    printf '%s\n' '{"name":"@mastra/factory"}' > mastracode/factory/package.json
-    printf '%s\n' 'export default {};' > mastracode/factory/vitest.config.ts
-    printf '%s\n' 'export const projects = 1;' > mastracode/factory/src/routes/projects.ts
-    printf '%s\n' "import { it } from 'vitest';" "it('project settings', () => {});" \
-      > mastracode/factory/src/routes/projects.test.ts
-    git add .
-    git commit -q -m 'add agent SDK and factory workspaces'
+    git reset -q --hard "$base_sha"
+    node - <<'NODE'
+const fs = require('node:fs');
+const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8').split('\n');
+const insertAfter = (marker, added) => {
+  const at = lines.indexOf(marker);
+  if (at < 0) throw new Error(`fixture lockfile is missing ${marker}`);
+  lines.splice(at + 1, 0, ...added);
+};
+insertAfter('importers:', ['', '  packages/schema-compat:', '    devDependencies:',
+  '      vitest:', '        specifier: ^4.1.0', '        version: 4.1.0']);
+insertAfter('packages:', ['', "  '@cfworker/json-schema@4.1.1':",
+  '    resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}']);
+insertAfter('  vitest@4.1.0: {}', ["  '@cfworker/json-schema@4.1.1': {}"]);
+fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
+NODE
+    git add pnpm-lock.yaml
+    git commit -q -m 'resolve cfworker through an existing importer'
     git rev-parse HEAD
   )
 
-  # Changes one source file under each workspace on top of $1.
-  commit_pf9666_owned_workspace_sources() (
-    cd "$fixture_repo"
-    printf '%s\n' 'export const utils = 2;' > agent-sdks/claude/src/utils.ts
-    printf '%s\n' 'export const utils = 2;' > agent-sdks/openai/src/utils.ts
-    printf '%s\n' 'export const projects = 2;' > mastracode/factory/src/routes/projects.ts
-    git add .
-    git commit -q -m 'change owned workspace sources'
-    git rev-parse HEAD
-  )
+  pf9666_owned_sources=(agent-sdks/claude/src/utils.ts agent-sdks/openai/src/utils.ts
+    mastracode/factory/src/routes/projects.ts)
 
-  assert_pf9666_owned_workspace_targets() {
-    local sdk
-    for sdk in claude openai; do
-      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match build" "$command_log"
-      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match exec tsc --noEmit" "$command_log"
-      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match lint" "$command_log"
-      assert_line_count 1 "--dir agent-sdks/$sdk exec vitest run --reporter=dot" "$command_log"
-    done
-    assert_line_count 1 'turbo build --filter ./mastracode/factory' "$command_log"
-    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match check' "$command_log"
-    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match build:lib' "$command_log"
-    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match lint' "$command_log"
-    assert_line_matches '^--dir mastracode/factory exec vitest run .* src/routes/projects\.test\.ts$' "$command_log"
+  # The reviewed-source table for head $1: every path changed under the Agent
+  # SDK and Factory workspaces since $graph_base, except the two SDK manifests.
+  pf9666_owned_source_table() {
+    local path
+    local -a paths=()
+    while IFS= read -r path; do
+      [[ "$path" == agent-sdks/claude/package.json || "$path" == agent-sdks/openai/package.json ]] ||
+        paths+=("$path")
+    done < <(git -C "$fixture_repo" diff --no-renames --name-only "$graph_base" "$1" -- \
+      agent-sdks/claude agent-sdks/openai mastracode/factory)
+    (cd "$fixture_repo" && pf9666_fixture_blob_table "$1" "${paths[@]}")
   }
 
-  # Permanent owned targets: an ordinary PR changing a source file under each
-  # workspace plans that workspace's build, typecheck, lint and suites.
-  run_pf9666_owned_agent_sdk_and_factory_target_fixtures() {
-    local owned_base owned_head
-    owned_base="$(commit_pf9666_owned_workspaces "$base_sha")"
-    owned_head="$(commit_pf9666_owned_workspace_sources)"
-    : > "$command_log"
-    output="$test_root/pf9666-owned-targets.log"
-    if ! run_fixture "$owned_head" "$output" BASE_SHA="$owned_base"; then
-      cat "$output" >&2
-      exit 1
-    fi
-    assert_pf9666_owned_workspace_targets
-    assert_not_contains 'PF-9666 exact patched cfworker dependency graph' "$output"
-
-    local factory_manifest_head
-    factory_manifest_head="$(
-      cd "$fixture_repo"
-      printf '%s\n' '{"name":"@mastra/factory","scripts":{"check":"true","build:lib":"true","lint":"true"}}' \
-        > mastracode/factory/package.json
-      printf '%s\n' 'export const projects = 3;' > mastracode/factory/src/routes/projects.ts
-      git add .
-      git commit -q -m 'redefine factory scripts'
-      git rev-parse HEAD
-    )"
-    assert_package_contract_rejected "$factory_manifest_head" "$owned_base" "$test_root/pf9666-factory-manifest.log"
-    grep -Fq 'mastracode/factory/package.json' "$test_root/pf9666-factory-manifest.log" || {
-      echo 'The factory manifest refusal did not name mastracode/factory/package.json.' >&2
-      cat "$test_root/pf9666-factory-manifest.log" >&2
-      exit 1
-    }
-
-    local sdk_manifest_head
-    sdk_manifest_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      printf '%s\n' '{"name":"@mastra/openai","scripts":{"build":"true","lint":"true"}}' \
-        > agent-sdks/openai/package.json
-      printf '%s\n' 'export const utils = 3;' > agent-sdks/openai/src/utils.ts
-      git add .
-      git commit -q -m 'redefine openai scripts'
-      git rev-parse HEAD
-    )"
-    assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log"
-    grep -A1 -F 'require dedicated validation' "$test_root/pf9666-sdk-manifest.log" |
-      grep -Fxq 'agent-sdks/openai/package.json' || {
-      echo 'The Agent SDK manifest refusal did not name agent-sdks/openai/package.json.' >&2
-      cat "$test_root/pf9666-sdk-manifest.log" >&2
-      exit 1
-    }
-
-    local sdk_e2e_head
-    sdk_e2e_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      printf '%s\n' "import { it } from 'vitest';" "it('calls the provider', () => {});" \
-        > agent-sdks/openai/src/provider.e2e.test.ts
-      git add .
-      git commit -q -m 'add an openai e2e test'
-      git rev-parse HEAD
-    )"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-e2e.log"
-    if run_fixture "$sdk_e2e_head" "$output" BASE_SHA="$owned_base"; then
-      echo 'An Agent SDK end-to-end test unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
-      grep -Fxq 'agent-sdks/openai/src/provider.e2e.test.ts' || {
-      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/provider.e2e.test.ts.' >&2
-      cat "$output" >&2
-      exit 1
-    }
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with an unsupported test file.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-
-    local sdk_symlink_head
-    sdk_symlink_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      printf '%s\n' "import { it } from 'vitest';" "it('runs', () => {});" > agent-sdks/openai/src/real.ts
-      ln -s real.ts agent-sdks/openai/src/linked.test.ts
-      git add .
-      git commit -q -m 'add an openai test symlink'
-      git rev-parse HEAD
-    )"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-symlink.log"
-    if run_fixture "$sdk_symlink_head" "$output" BASE_SHA="$owned_base"; then
-      echo 'An Agent SDK test symlink unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
-      grep -Fxq 'agent-sdks/openai/src/linked.test.ts' || {
-      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.test.ts.' >&2
-      cat "$output" >&2
-      exit 1
-    }
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with a test symlink.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-
-    # Vitest follows a directory symlink to tests Git does not list.
-    local sdk_dir_symlink_head
-    sdk_dir_symlink_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      ln -s ../../../elsewhere agent-sdks/openai/src/linked
-      git add .
-      git commit -q -m 'add an openai directory symlink'
-      git rev-parse HEAD
-    )"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-dir-symlink.log"
-    if run_fixture "$sdk_dir_symlink_head" "$output" BASE_SHA="$owned_base"; then
-      echo 'An Agent SDK directory symlink unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
-      grep -Fxq 'agent-sdks/openai/src/linked' || {
-      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.' >&2
-      cat "$output" >&2
-      exit 1
-    }
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with a directory symlink.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-
-    # A failed SDK file inventory stops validation before the suite runs.
-    local failing_git_bin="$test_root/failing-git-bin" real_git
-    real_git="$(command -v git)"
-    mkdir -p "$failing_git_bin"
-    printf '%s\n' '#!/usr/bin/env bash' \
-      'if [[ "${1-}" == ls-files && "${4-}" == agent-sdks/openai ]]; then exit 128; fi' \
-      "exec '$real_git' \"\$@\"" > "$failing_git_bin/git"
-    chmod +x "$failing_git_bin/git"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-inventory-error.log"
-    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$failing_git_bin:$mock_bin:$PATH"; then
-      echo 'A failed Agent SDK file inventory unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    assert_contains 'The agent-sdks/openai file inventory could not be read, so fork PR validation stops.' "$output"
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran after a failed file inventory.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-
-    # A test file the build writes under src is refused before the suite runs.
-    local generating_pnpm_bin="$test_root/generating-pnpm-bin"
-    mkdir -p "$generating_pnpm_bin"
-    printf '%s\n' '#!/usr/bin/env bash' \
-      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
-      "  printf '%s\\n' \"it('generated', () => {});\" > agent-sdks/openai/src/generated.test.ts" \
-      'fi' \
-      "exec '$mock_bin/pnpm' \"\$@\"" > "$generating_pnpm_bin/pnpm"
-    chmod +x "$generating_pnpm_bin/pnpm"
-    git -C "$fixture_repo" reset -q --hard "$owned_head"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-generated-test.log"
-    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$generating_pnpm_bin:$mock_bin:$PATH"; then
-      echo 'A test file written by the Agent SDK build unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    grep -A1 -F 'agent-sdks/openai source entries are not tracked by Git' "$output" |
-      grep -Fxq 'agent-sdks/openai/src/generated.test.ts' || {
-      echo 'The untracked-source refusal did not name agent-sdks/openai/src/generated.test.ts.' >&2
-      cat "$output" >&2
-      exit 1
-    }
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with a test file the build wrote.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-    rm -f "$fixture_repo/agent-sdks/openai/src/generated.test.ts"
-
-    # A changed SDK file outside src (here its Vitest configuration) refuses.
-    local sdk_config_head
-    sdk_config_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      printf '%s\n' "export default { test: { include: ['../../**/*.test.ts'] } };" \
-        > agent-sdks/openai/vitest.config.ts
-      git add .
-      git commit -q -m 'widen the openai vitest include'
-      git rev-parse HEAD
-    )"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-config.log"
-    if run_fixture "$sdk_config_head" "$output" BASE_SHA="$owned_base"; then
-      echo 'A changed Agent SDK Vitest configuration unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    grep -A1 -F 'agent-sdks/openai files outside src are not supported by fork PR validation' "$output" |
-      grep -Fxq 'agent-sdks/openai/vitest.config.ts' || {
-      echo 'The SDK configuration refusal did not name agent-sdks/openai/vitest.config.ts.' >&2
-      cat "$output" >&2
-      exit 1
-    }
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with a changed configuration.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-
-    # A tracked source the build rewrites refuses before the suite runs.
-    local rewriting_pnpm_bin="$test_root/rewriting-pnpm-bin"
-    mkdir -p "$rewriting_pnpm_bin"
-    printf '%s\n' '#!/usr/bin/env bash' \
-      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
-      "  printf '%s\\n' 'export const utils = 4;' > agent-sdks/openai/src/utils.ts" \
-      'fi' \
-      "exec '$mock_bin/pnpm' \"\$@\"" > "$rewriting_pnpm_bin/pnpm"
-    chmod +x "$rewriting_pnpm_bin/pnpm"
-    git -C "$fixture_repo" reset -q --hard "$owned_head"
-    : > "$command_log"
-    output="$test_root/pf9666-sdk-rewritten-source.log"
-    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$rewriting_pnpm_bin:$mock_bin:$PATH"; then
-      echo 'A source rewritten by the Agent SDK build unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    assert_contains 'The agent-sdks/openai sources differ from HEAD_SHA after the build, so its suite does not run.' "$output"
-    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
-      echo 'The Agent SDK suite ran with a rewritten source.' >&2
-      cat "$command_log" >&2
-      exit 1
-    fi
-    git -C "$fixture_repo" reset -q --hard "$owned_head"
-
-    # A changed SDK test also runs on its own, with the provider keys cleared.
-    local sdk_test_head
-    sdk_test_head="$(
-      cd "$fixture_repo"
-      git reset -q --hard "$owned_head"
-      printf '%s\n' "import { it } from 'vitest';" "it('utils', () => {});" \
-        > agent-sdks/openai/src/utils.test.ts
-      git add .
-      git commit -q -m 'add an openai unit test'
-      git rev-parse HEAD
-    )"
-    : > "$command_log"
-    : > "$command_environment_log"
-    output="$test_root/pf9666-sdk-test-env.log"
-    if ! run_fixture "$sdk_test_head" "$output" BASE_SHA="$owned_base" OPENAI_API_KEY=ambient-fixture-key; then
-      echo 'An ordinary Agent SDK unit test did not pass validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    assert_contains 'Running changed test file in full: agent-sdks/openai/src/utils.test.ts' "$output"
-    if ! grep -Fq $'OPENAI_API_KEY=\t--dir agent-sdks/openai exec vitest run --reporter=dot --reporter=json' \
-      "$command_environment_log" ||
-      grep -F 'ambient-fixture-key' "$command_environment_log" | grep -F 'agent-sdks/openai' | grep -Fq 'vitest'; then
-      echo 'An Agent SDK test ran with an ambient provider key.' >&2
-      cat "$command_environment_log" >&2
-      exit 1
-    fi
-
-    # A failed scan of the changed workspace manifests refuses.
-    local failing_scan_bin="$test_root/failing-scan-bin" real_scan_grep
-    real_scan_grep="$(command -v grep)"
-    mkdir -p "$failing_scan_bin"
-    printf '%s\n' '#!/usr/bin/env bash' \
-      'case "$*" in *client-sdks/client-js*) exit 2 ;; esac' \
-      "exec '$real_scan_grep' \"\$@\"" > "$failing_scan_bin/grep"
-    chmod +x "$failing_scan_bin/grep"
-    : > "$command_log"
-    output="$test_root/pf9666-manifest-scan-error.log"
-    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$failing_scan_bin:$mock_bin:$PATH"; then
-      echo 'A failed manifest scan unexpectedly passed validation.' >&2
-      cat "$output" >&2
-      exit 1
-    fi
-    assert_contains 'changed workspace manifests (scan failed)' "$output"
-    git -C "$fixture_repo" reset -q --hard "$base_sha"
-    echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
-  }
-
-  # PF-9666 planning admission at PR 631's shape: the patch, workspace line,
-  # patched lockfile (with a peer-variant re-key in an importer whose manifest
-  # does not change), the three manifests and source edits in each workspace.
-  run_pf9666_patched_cfworker_planning_fixtures() {
-    local graph_base graph_head patch_hash patch_path='patches/@cfworker__json-schema@4.1.6.patch'
-    local -a graph_env
+  # PR 631's shape on top of $1: the patch, workspace line, patched lockfile
+  # (with a peer-variant re-key in an importer whose manifest does not change),
+  # the three manifests and source edits in each workspace. Sets graph_base,
+  # graph_head and graph_env in the caller's scope.
+  build_pf9666_graph_fixture() {
+    local patch_path='patches/@cfworker__json-schema@4.1.6.patch'
     graph_base="$(
-      commit_pf9666_owned_workspaces "$pf9666_base_sha" > /dev/null
+      commit_pf9666_owned_workspaces "$1" > /dev/null
       cd "$fixture_repo"
       printf '%s\n' 'packages:' "  - '*'" > pnpm-workspace.yaml
       node - <<'NODE'
@@ -6561,7 +6398,404 @@ NODE
       PAPERSFLOW_PF9666_WORKSPACE_SHA256="$(pf9666_graph_pin pnpm-workspace.yaml)"
       PAPERSFLOW_PF9666_LOCKFILE_SHA256="$(pf9666_graph_pin pnpm-lock.yaml)"
       PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256="$(pf9666_graph_pin "$patch_path")"
+      PAPERSFLOW_PF9666_BASE_BLOBS="$(cd "$fixture_repo" && pf9666_fixture_blob_table "$graph_base" pnpm-lock.yaml \
+        pnpm-workspace.yaml agent-sdks/claude/package.json agent-sdks/openai/package.json "${pf9666_owned_sources[@]}")"
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$graph_head")"
     )
+
+  }
+
+  # Adds the two Agent SDK workspaces and the Factory projects route pair on
+  # top of $1 and prints the new commit.
+  commit_pf9666_owned_workspaces() (
+    cd "$fixture_repo"
+    git reset -q --hard "$1"
+    mkdir -p agent-sdks/claude/src agent-sdks/openai/src mastracode/factory/src/routes
+    local sdk
+    for sdk in claude openai; do
+      printf '{"name":"@mastra/%s"}\n' "$sdk" > "agent-sdks/$sdk/package.json"
+      printf '%s\n' 'export default {};' > "agent-sdks/$sdk/vitest.config.ts"
+      printf '%s\n' 'export const utils = 1;' > "agent-sdks/$sdk/src/utils.ts"
+    done
+    printf '%s\n' '{"name":"@mastra/factory"}' > mastracode/factory/package.json
+    printf '%s\n' 'export default {};' > mastracode/factory/vitest.config.ts
+    printf '%s\n' 'export const projects = 1;' > mastracode/factory/src/routes/projects.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('project settings', () => {});" \
+      > mastracode/factory/src/routes/projects.test.ts
+    git add .
+    git commit -q -m 'add agent SDK and factory workspaces'
+    git rev-parse HEAD
+  )
+
+  # Changes one source file under each workspace on top of $1.
+  commit_pf9666_owned_workspace_sources() (
+    cd "$fixture_repo"
+    printf '%s\n' 'export const utils = 2;' > agent-sdks/claude/src/utils.ts
+    printf '%s\n' 'export const utils = 2;' > agent-sdks/openai/src/utils.ts
+    printf '%s\n' 'export const projects = 2;' > mastracode/factory/src/routes/projects.ts
+    git add .
+    git commit -q -m 'change owned workspace sources'
+    git rev-parse HEAD
+  )
+
+  assert_pf9666_owned_workspace_targets() {
+    local sdk
+    for sdk in claude openai; do
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match build" "$command_log"
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match exec tsc --noEmit" "$command_log"
+      assert_line_count 1 "--filter ./agent-sdks/$sdk --fail-if-no-match lint" "$command_log"
+      assert_line_count 1 "--dir agent-sdks/$sdk exec vitest run --reporter=dot" "$command_log"
+    done
+    assert_line_count 1 'turbo build --filter ./mastracode/factory' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match check' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match build:lib' "$command_log"
+    assert_line_count 1 '--filter ./mastracode/factory --fail-if-no-match lint' "$command_log"
+    assert_line_matches '^--dir mastracode/factory exec vitest run .* src/routes/projects\.test\.ts$' "$command_log"
+  }
+
+  # Permanent owned targets: an ordinary PR changing a source file under each
+  # workspace plans that workspace's build, typecheck, lint and suites.
+  run_pf9666_owned_agent_sdk_and_factory_target_fixtures() {
+    local owned_base owned_head graph_base graph_head
+    local -a graph_env
+    owned_base="$(commit_pf9666_owned_workspaces "$base_sha")"
+    owned_head="$(commit_pf9666_owned_workspace_sources)"
+    # Without PR 631's exact graph a source-only change in these workspaces is
+    # refused before any package command, as on fork main.
+    output="$test_root/pf9666-owned-without-graph.log"
+    assert_package_contract_rejected "$owned_head" "$owned_base" "$output"
+    assert_contains 'These changed workspaces do not have an owned fork-safe validation target:' "$output"
+    assert_contains 'agent-sdks/openai' "$output"
+
+    # The fixtures below run on PR 631's exact graph; each declares its head's
+    # Agent SDK and Factory changes as the reviewed sources, so the checks after
+    # admission are what they exercise.
+    build_pf9666_graph_fixture "$(commit_pf9666_cfworker_base)"
+    owned_base="$graph_base"
+    owned_head="$graph_head"
+    : > "$command_log"
+    output="$test_root/pf9666-owned-targets.log"
+    if ! run_fixture "$owned_head" "$output" "${graph_env[@]}"; then
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_pf9666_owned_workspace_targets
+    assert_contains 'PF-9666 exact patched cfworker dependency graph admitted to planning' "$output"
+
+    local factory_manifest_head
+    factory_manifest_head="$(
+      cd "$fixture_repo"
+      printf '%s\n' '{"name":"@mastra/factory","scripts":{"check":"true","build:lib":"true","lint":"true"}}' \
+        > mastracode/factory/package.json
+      printf '%s\n' 'export const projects = 3;' > mastracode/factory/src/routes/projects.ts
+      git add .
+      git commit -q -m 'redefine factory scripts'
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$factory_manifest_head" "$owned_base" "$test_root/pf9666-factory-manifest.log" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$factory_manifest_head")"
+    grep -Fq 'mastracode/factory/package.json' "$test_root/pf9666-factory-manifest.log" || {
+      echo 'The factory manifest refusal did not name mastracode/factory/package.json.' >&2
+      cat "$test_root/pf9666-factory-manifest.log" >&2
+      exit 1
+    }
+
+    local sdk_manifest_head
+    sdk_manifest_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' '{"name":"@mastra/openai","scripts":{"build":"true","lint":"true"}}' \
+        > agent-sdks/openai/package.json
+      printf '%s\n' 'export const utils = 3;' > agent-sdks/openai/src/utils.ts
+      git add .
+      git commit -q -m 'redefine openai scripts'
+      git rev-parse HEAD
+    )"
+    assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_manifest_head")"
+    grep -Fxq 'PF-9666 reviewed dependency file hash changed: agent-sdks/openai/package.json' \
+      "$test_root/pf9666-sdk-manifest.log" || {
+      echo 'The Agent SDK manifest refusal did not name agent-sdks/openai/package.json.' >&2
+      cat "$test_root/pf9666-sdk-manifest.log" >&2
+      exit 1
+    }
+
+    local sdk_e2e_head
+    sdk_e2e_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('calls the provider', () => {});" \
+        > agent-sdks/openai/src/provider.e2e.test.ts
+      git add .
+      git commit -q -m 'add an openai e2e test'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-e2e.log"
+    if run_fixture "$sdk_e2e_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_e2e_head")"; then
+      echo 'An Agent SDK end-to-end test unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai test files are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/provider.e2e.test.ts' || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/provider.e2e.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with an unsupported test file.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    local sdk_symlink_head
+    sdk_symlink_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('runs', () => {});" > agent-sdks/openai/src/real.ts
+      ln -s real.ts agent-sdks/openai/src/linked.test.ts
+      git add .
+      git commit -q -m 'add an openai test symlink'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-symlink.log"
+    if run_fixture "$sdk_symlink_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_symlink_head")"; then
+      echo 'An Agent SDK test symlink unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    # The owned-source pins refuse a symlink before the SDK inventory reads it.
+    grep -Fxq 'PF-9666 reviewed head file is not a regular blob: agent-sdks/openai/src/linked.test.ts' "$output" || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a test symlink.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # Vitest follows a directory symlink to tests Git does not list.
+    local sdk_dir_symlink_head
+    sdk_dir_symlink_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      ln -s ../../../elsewhere agent-sdks/openai/src/linked
+      git add .
+      git commit -q -m 'add an openai directory symlink'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-dir-symlink.log"
+    if run_fixture "$sdk_dir_symlink_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_dir_symlink_head")"; then
+      echo 'An Agent SDK directory symlink unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    # The owned-source pins refuse a symlink before the SDK inventory reads it.
+    grep -Fxq 'PF-9666 reviewed head file is not a regular blob: agent-sdks/openai/src/linked' "$output" || {
+      echo 'The Agent SDK refusal did not name agent-sdks/openai/src/linked.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a directory symlink.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # A failed SDK file inventory stops validation before the suite runs.
+    local failing_git_bin="$test_root/failing-git-bin" real_git
+    real_git="$(command -v git)"
+    mkdir -p "$failing_git_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "${1-}" == ls-files && "${4-}" == agent-sdks/openai ]]; then exit 128; fi' \
+      "exec '$real_git' \"\$@\"" > "$failing_git_bin/git"
+    chmod +x "$failing_git_bin/git"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-inventory-error.log"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$failing_git_bin:$mock_bin:$PATH"; then
+      echo 'A failed Agent SDK file inventory unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The agent-sdks/openai file inventory could not be read, so fork PR validation stops.' "$output"
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran after a failed file inventory.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # A test file the build writes under src is refused before the suite runs.
+    local generating_pnpm_bin="$test_root/generating-pnpm-bin"
+    mkdir -p "$generating_pnpm_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
+      "  printf '%s\\n' \"it('generated', () => {});\" > agent-sdks/openai/src/generated.test.ts" \
+      'fi' \
+      "exec '$mock_bin/pnpm' \"\$@\"" > "$generating_pnpm_bin/pnpm"
+    chmod +x "$generating_pnpm_bin/pnpm"
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-generated-test.log"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$generating_pnpm_bin:$mock_bin:$PATH"; then
+      echo 'A test file written by the Agent SDK build unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai source entries are not tracked by Git' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/generated.test.ts' || {
+      echo 'The untracked-source refusal did not name agent-sdks/openai/src/generated.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a test file the build wrote.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+    rm -f "$fixture_repo/agent-sdks/openai/src/generated.test.ts"
+
+    # A changed SDK file outside src (here its Vitest configuration) refuses.
+    local sdk_config_head
+    sdk_config_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "export default { test: { include: ['../../**/*.test.ts'] } };" \
+        > agent-sdks/openai/vitest.config.ts
+      git add .
+      git commit -q -m 'widen the openai vitest include'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-config.log"
+    if run_fixture "$sdk_config_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_config_head")"; then
+      echo 'A changed Agent SDK Vitest configuration unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai files outside src are not supported by fork PR validation' "$output" |
+      grep -Fxq 'agent-sdks/openai/vitest.config.ts' || {
+      echo 'The SDK configuration refusal did not name agent-sdks/openai/vitest.config.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a changed configuration.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+
+    # A tracked source the build rewrites refuses before the suite runs.
+    local rewriting_pnpm_bin="$test_root/rewriting-pnpm-bin"
+    mkdir -p "$rewriting_pnpm_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
+      "  printf '%s\\n' 'export const utils = 4;' > agent-sdks/openai/src/utils.ts" \
+      'fi' \
+      "exec '$mock_bin/pnpm' \"\$@\"" > "$rewriting_pnpm_bin/pnpm"
+    chmod +x "$rewriting_pnpm_bin/pnpm"
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-rewritten-source.log"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$rewriting_pnpm_bin:$mock_bin:$PATH"; then
+      echo 'A source rewritten by the Agent SDK build unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The agent-sdks/openai sources differ from HEAD_SHA after the build, so its suite does not run.' "$output"
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a rewritten source.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+
+    # A changed SDK test also runs on its own, with the provider keys cleared.
+    local sdk_test_head
+    sdk_test_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$owned_head"
+      printf '%s\n' "import { it } from 'vitest';" "it('utils', () => {});" \
+        > agent-sdks/openai/src/utils.test.ts
+      git add .
+      git commit -q -m 'add an openai unit test'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$command_environment_log"
+    output="$test_root/pf9666-sdk-test-env.log"
+    if ! run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_test_head")" OPENAI_API_KEY=ambient-fixture-key; then
+      echo 'An ordinary Agent SDK unit test did not pass validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'Running changed test file in full: agent-sdks/openai/src/utils.test.ts' "$output"
+    if ! grep -Fq $'OPENAI_API_KEY=\t--dir agent-sdks/openai exec vitest run --reporter=dot --reporter=json' \
+      "$command_environment_log" ||
+      grep -F 'ambient-fixture-key' "$command_environment_log" | grep -F 'agent-sdks/openai' | grep -Fq 'vitest'; then
+      echo 'An Agent SDK test ran with an ambient provider key.' >&2
+      cat "$command_environment_log" >&2
+      exit 1
+    fi
+
+    # A failed scan of the changed workspace manifests refuses.
+    local failing_scan_bin="$test_root/failing-scan-bin" real_scan_grep
+    real_scan_grep="$(command -v grep)"
+    mkdir -p "$failing_scan_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'case "$*" in *client-sdks/client-js*) exit 2 ;; esac' \
+      "exec '$real_scan_grep' \"\$@\"" > "$failing_scan_bin/grep"
+    chmod +x "$failing_scan_bin/grep"
+    : > "$command_log"
+    output="$test_root/pf9666-manifest-scan-error.log"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$failing_scan_bin:$mock_bin:$PATH"; then
+      echo 'A failed manifest scan unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'changed workspace manifests (scan failed)' "$output"
+
+    # A failed first scan of an Agent SDK's changed files refuses, even though
+    # the filter after it sees no input.
+    local failing_sdk_scan_bin="$test_root/failing-sdk-scan-bin"
+    mkdir -p "$failing_sdk_scan_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'case "$*" in "-E ^agent-sdks/openai/ "*) exit 2 ;; esac' \
+      "exec '$real_scan_grep' \"\$@\"" > "$failing_sdk_scan_bin/grep"
+    chmod +x "$failing_sdk_scan_bin/grep"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-scan-error.log"
+    if run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" \
+      PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_test_head")" PATH="$failing_sdk_scan_bin:$mock_bin:$PATH"; then
+      echo 'A failed Agent SDK changed-file scan unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'The agent-sdks/openai changed-file scan failed, so fork PR validation stops.' "$output"
+    git -C "$fixture_repo" reset -q --hard "$base_sha"
+    echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
+  }
+
+  # PF-9666 planning admission at PR 631's shape: the patch, workspace line,
+  # patched lockfile (with a peer-variant re-key in an importer whose manifest
+  # does not change), the three manifests and source edits in each workspace.
+  run_pf9666_patched_cfworker_planning_fixtures() {
+    local graph_base graph_head patch_path='patches/@cfworker__json-schema@4.1.6.patch'
+    local -a graph_env
+    build_pf9666_graph_fixture "$pf9666_base_sha"
 
     : > "$command_log"
     output="$test_root/pf9666-graph-planning.log"
@@ -9280,28 +9514,7 @@ NODE
   # fixture base gains a schema-compat importer and cfworker 4.1.1 (as MCP pins
   # it); the head adds only the manifest key, its three importer lines and the
   # 4.1.6 package and snapshot.
-  pf9666_base_sha="$(
-    cd "$fixture_repo"
-    git reset -q --hard "$base_sha"
-    node - <<'NODE'
-const fs = require('node:fs');
-const lines = fs.readFileSync('pnpm-lock.yaml', 'utf8').split('\n');
-const insertAfter = (marker, added) => {
-  const at = lines.indexOf(marker);
-  if (at < 0) throw new Error(`fixture lockfile is missing ${marker}`);
-  lines.splice(at + 1, 0, ...added);
-};
-insertAfter('importers:', ['', '  packages/schema-compat:', '    devDependencies:',
-  '      vitest:', '        specifier: ^4.1.0', '        version: 4.1.0']);
-insertAfter('packages:', ['', "  '@cfworker/json-schema@4.1.1':",
-  '    resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}']);
-insertAfter('  vitest@4.1.0: {}', ["  '@cfworker/json-schema@4.1.1': {}"]);
-fs.writeFileSync('pnpm-lock.yaml', lines.join('\n'));
-NODE
-    git add pnpm-lock.yaml
-    git commit -q -m 'resolve cfworker through an existing importer'
-    git rev-parse HEAD
-  )"
+  pf9666_base_sha="$(commit_pf9666_cfworker_base)"
   head_sha="$(
     cd "$fixture_repo"
     printf '%s\n' '{"devDependencies":{"@cfworker/json-schema":"^4.1.6"}}' \
@@ -15574,7 +15787,13 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    agent-sdks/claude | agent-sdks/openai | auth/okta | browser/stagehand | code-mode/quickjs | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/factory | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | code-mode/quickjs | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    agent-sdks/claude | agent-sdks/openai | mastracode/factory)
+      # Admitted only with PR 631's exact reviewed graph and owned sources.
+      if [[ "$pf9666_patched_cfworker_graph" == false ]]; then
+        printf '%s\n' "$workspace" >> "$unsupported_workspaces"
+      fi
+      ;;
     packages/memory/integration-tests)
       # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
       # separately locked package. Its manifest, lockfile, Vitest config,
@@ -16982,9 +17201,14 @@ for agent_sdk in agent-sdks/claude agent-sdks/openai; do
   if workspace_changed "$agent_sdk"; then
     # Only sources and the pinned manifest may change: a changed Vitest or
     # TypeScript configuration could collect tests the inventory never saw.
+    # Each scan's status is checked on its own: a pipeline reports only one.
     sdk_scan_status=0
-    agent_sdk_config_changes="$(LC_ALL=C grep -E "^$agent_sdk/" "$changed_files" |
-      LC_ALL=C grep -Ev "^$agent_sdk/(src/|package\\.json\$)")" || sdk_scan_status=$?
+    agent_sdk_changed="$(LC_ALL=C grep -E "^$agent_sdk/" "$changed_files")" || sdk_scan_status=$?
+    agent_sdk_config_changes=""
+    if (( sdk_scan_status <= 1 )) && [[ -n "$agent_sdk_changed" ]]; then
+      agent_sdk_config_changes="$(printf '%s\n' "$agent_sdk_changed" |
+        LC_ALL=C grep -Ev "^$agent_sdk/(src/|package\\.json\$)")" || sdk_scan_status=$?
+    fi
     if (( sdk_scan_status > 1 )); then
       echo "The $agent_sdk changed-file scan failed, so fork PR validation stops." >&2
       exit 1
