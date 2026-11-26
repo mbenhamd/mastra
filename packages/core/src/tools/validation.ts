@@ -348,6 +348,20 @@ function normalizeNullishInput(schema: StandardSchemaWithJSON<any>, input: unkno
  * @param value The value to check
  * @returns true if the value is a plain object
  */
+/** Primitives, arrays and plain objects with the same contents; anything else only when identical. */
+function isSamePlainValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, index) => isSamePlainValue(item, b[index]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keys = Object.keys(a);
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every(key => Object.prototype.hasOwnProperty.call(b, key) && isSamePlainValue(a[key], b[key]))
+  );
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') {
     return false;
@@ -617,7 +631,12 @@ export async function validateToolInputAsync<T = unknown>(
     const validation = await safeValidateAsync(schema, normalizedInput, answered);
     if ('value' in validation) return { data: validation.value };
     const standardSchema = schema;
-    const asAsyncSchema = () => validateAsyncSchemaRetries(standardSchema, input, normalizedInput, validation, toolId);
+    // Attempts already made after the first and the coerced one. When a later
+    // attempt answers with a promise, the earlier fallbacks run from here; an
+    // attempt with the same input is reused, never sent to the validator again.
+    const made: Array<{ input: unknown; result: Awaited<ReturnType<typeof safeValidateAsync<T>>> }> = [];
+    const asAsyncSchema = () =>
+      validateAsyncSchemaRetries(standardSchema, input, normalizedInput, validation, toolId, made);
 
     let currentInput = normalizedInput;
     let currentIssues = validation.issues;
@@ -647,6 +666,7 @@ export async function validateToolInputAsync<T = unknown>(
         : stripNullishValues(coercedInput !== normalizedInput ? coercedInput : input);
     const normalizedStripped = normalizeNullishInput(schema, strippedInput);
     const retryValidation = await safeValidateAsync(schema, normalizedStripped, answered);
+    made.push({ input: normalizedStripped, result: retryValidation });
     if (answered.asynchronously) return await asAsyncSchema();
     if ('value' in retryValidation) return { data: retryValidation.value };
     if (failingNullPaths.size > 0) currentInput = normalizedStripped;
@@ -667,7 +687,9 @@ export async function validateToolInputAsync<T = unknown>(
       if (obj.prompt == null) {
         const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
         if (alias !== undefined) {
-          const promptValidation = await safeValidateAsync(schema, { ...obj, prompt: alias }, answered);
+          const promptInput = { ...obj, prompt: alias };
+          const promptValidation = await safeValidateAsync(schema, promptInput, answered);
+          made.push({ input: promptInput, result: promptValidation });
           if (answered.asynchronously) return await asAsyncSchema();
           if ('value' in promptValidation) return { data: promptValidation.value };
           aliasIssues = promptValidation.issues;
@@ -698,15 +720,19 @@ export async function validateToolInputAsync<T = unknown>(
  * The null-strip and prompt-alias retries for a schema whose validator answers
  * with a promise: nulls are located from the first attempt's issues, stripped
  * from the raw input, and the alias is tried on the first normalized input.
- * A refusal lists the first attempt's issues.
+ * A refusal lists the first attempt's issues. An attempt in `made` whose input
+ * is the same plain value is reused instead of being validated again.
  */
 async function validateAsyncSchemaRetries<T>(
   schema: StandardSchemaWithJSON<T>,
   input: unknown,
   normalizedInput: unknown,
   validation: { issues: readonly StandardSchemaIssue[] },
-  toolId?: string,
+  toolId: string | undefined,
+  made: ReadonlyArray<{ input: unknown; result: { value: T } | { issues: readonly StandardSchemaIssue[] } }>,
 ): Promise<{ data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> }> {
+  const attempt = (candidate: unknown) =>
+    made.find(entry => isSamePlainValue(entry.input, candidate))?.result ?? safeValidateAsync(schema, candidate);
   const failingNullPaths = new Set(
     validation.issues
       .filter(issue => {
@@ -719,7 +745,7 @@ async function validateAsyncSchemaRetries<T>(
   );
   const strippedInput =
     failingNullPaths.size > 0 ? stripNullishValuesAtPaths(input, failingNullPaths) : stripNullishValues(input);
-  const retryValidation = await safeValidateAsync(schema, normalizeNullishInput(schema, strippedInput));
+  const retryValidation = await attempt(normalizeNullishInput(schema, strippedInput));
   if ('value' in retryValidation) return { data: retryValidation.value };
 
   const promptJsonSchema = standardSchemaToJSONSchema(schema, { io: 'input' });
@@ -735,7 +761,7 @@ async function validateAsyncSchemaRetries<T>(
     if (obj.prompt == null) {
       const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
       if (alias !== undefined) {
-        const promptValidation = await safeValidateAsync(schema, { ...obj, prompt: alias });
+        const promptValidation = await attempt({ ...obj, prompt: alias });
         if ('value' in promptValidation) return { data: promptValidation.value };
       }
     }
