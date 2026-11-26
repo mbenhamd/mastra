@@ -23,11 +23,15 @@ class SettingsSandbox extends FactorySandbox<{ cpuCount?: number; memoryMb?: num
       memoryMb: { type: 'integer', minimum: 512 },
     },
     additionalProperties: false,
-    // Each patch can be valid on its own but invalid when combined.
-    not: {
-      required: ['cpuCount', 'memoryMb'],
-      properties: { cpuCount: { const: 8 }, memoryMb: { const: 512 } },
-    },
+    // Each patch can be valid on its own but invalid when combined: both branches match only
+    // cpuCount 8 with memoryMb 512, which fails `oneOf` with one issue at the root.
+    oneOf: [
+      true,
+      {
+        required: ['cpuCount', 'memoryMb'],
+        properties: { cpuCount: { const: 8 }, memoryMb: { const: 512 } },
+      },
+    ],
   } as const;
   create(_ctx: FactorySandboxContext) {
     throw new Error('not constructed in route tests');

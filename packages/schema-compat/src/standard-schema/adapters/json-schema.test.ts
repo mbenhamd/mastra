@@ -371,8 +371,8 @@ describe('json-schema standard-schema adapter', () => {
           'patternProperties',
           '/properties/a/patternProperties',
         ],
-        // The subschema under `not` is held to the same list.
-        [{ anyOf: [{ not: { else: {} } }] }, 'else', '/anyOf/0/not/else'],
+        // Fork main's Ajv checked `not` without `allErrors`, which lost a required "" there.
+        [{ anyOf: [{ not: { type: 'string' } }] }, 'not', '/anyOf/0/not'],
         [{ $defs: { A: { $anchor: 'a' } } }, '$anchor', '/$defs/A/$anchor'],
         [{ properties: { a: { type: 'string', id: 'x' } } }, 'id', '/properties/a/id'],
         // Fork main's Ajv compared these differently: a float step, and duplicates of "__proto__".
@@ -427,49 +427,67 @@ describe('json-schema standard-schema adapter', () => {
       expect(await validate(nestedId)).toEqual(refused('$id', '/properties/a/$id', 'is only supported at the root'));
     });
 
-    it('refuses what fork main\'s Ajv threw on while compiling a listed keyword', async () => {
+    it("refuses what fork main's Ajv threw on while compiling a listed keyword", async () => {
       const s2020 = 'https://json-schema.org/draft/2020-12/schema';
       expect(await validate({ $schema: s2020, $id: s2020 })).toEqual(
         refused('$id', '/$id', "names a schema fork main's Ajv had already registered"),
       );
-      expect(await validate({ enum: [{ a: 1, b: 2 }, { b: 2, a: 1 }] })).toEqual(
-        refused('enum', '/enum', 'repeats a member, which the draft-07 metaschema refuses'),
-      );
-      expect(await validate({ $schema: s2020, enum: [0, 0] }, 0)).toEqual({ value: 0 });
-      expect(await validate({ 'x-a': { $anchor: '!' } })).toEqual(
-        refused('$anchor', '/x-a/$anchor', "is not an anchor fork main's Ajv accepted"),
-      );
       expect(
-        await validate({ 'x-a': { $id: 'https://example.test/s' }, example: { $id: 'https://example.test/s' } }),
-      ).toEqual(refused('$id', '/example/$id', "names an ID or anchor fork main's Ajv had already seen"));
-      // Each dialect's Ajv had registered its own metaschema IDs, and only those.
-      expect(await validate({ $schema: s2020, 'x-a': { $id: `${s2020}#` } })).toEqual(
-        refused('$id', '/x-a/$id', "names an ID or anchor fork main's Ajv had already seen"),
+        await validate({
+          enum: [
+            { a: 1, b: 2 },
+            { b: 2, a: 1 },
+          ],
+        }),
+      ).toEqual(refused('enum', '/enum', 'repeats a member, which the draft-07 metaschema refuses'));
+      expect(await validate({ $schema: s2020, enum: [0, 0] }, 0)).toEqual({ value: 0 });
+      const nested = (keyword: string, pointer: string) =>
+        refused(keyword, pointer, 'is below the root; nested IDs and anchors are not supported');
+      // Ajv registered every ID and anchor its reference walk entered below the root, in
+      // annotations too; none is accepted here, whether or not Ajv threw on it.
+      expect(await validate({ 'x-a': { $anchor: '!' } })).toEqual(nested('$anchor', '/x-a/$anchor'));
+      expect(await validate({ 'x-a': { $anchor: 'a' } })).toEqual(nested('$anchor', '/x-a/$anchor'));
+      expect(await validate({ $schema: s2020, 'x-a': { $dynamicAnchor: 'a' } })).toEqual(
+        nested('$dynamicAnchor', '/x-a/$dynamicAnchor'),
       );
-      expect(await validate({ 'x-a': { $id: 'http://json-schema.org/draft-07/schema' } })).toEqual(
-        refused('$id', '/x-a/$id', "names an ID or anchor fork main's Ajv had already seen"),
-      );
-      expect(await validate({ 'x-a': { $id: s2020 } })).toEqual({ value: {} });
+      expect(await validate({ 'x-a': { $id: s2020 } })).toEqual(nested('$id', '/x-a/$id'));
       expect(await validate({ $defs: { $id: true, A: true }, $ref: '#/$defs/A' })).toEqual(
-        refused('$defs', '/$defs/$id', 'names a member "$id", which fork main\'s Ajv read as the scope of a "$ref" into "$defs"'),
+        refused(
+          '$defs',
+          '/$defs/$id',
+          'names a member "$id", which fork main\'s Ajv read as the scope of a "$ref" into "$defs"',
+        ),
       );
-      // Ajv walked no annotation under a skipped keyword, and no valid anchor that appears once.
-      expect(await validate({ default: { $anchor: '!' }, 'x-a': { $anchor: 'a' } })).toEqual({ value: {} });
+      // Ajv walked no annotation under a skipped keyword.
+      expect(await validate({ default: { $anchor: '!', $id: 'https://example.test/s' } })).toEqual({ value: {} });
     });
 
-    it('applies not in both dialects and refuses a loop through it', async () => {
-      const combined = {
-        type: 'object',
-        properties: { cpuCount: { type: 'integer' }, memoryMb: { type: 'integer' } },
-        not: { required: ['cpuCount', 'memoryMb'], properties: { cpuCount: { const: 8 }, memoryMb: { const: 512 } } },
-      };
-      for (const schema of [combined, { $schema: 'https://json-schema.org/draft/2020-12/schema', ...combined }]) {
-        expect(await validate(schema, { cpuCount: 8, memoryMb: 2048 })).toEqual({ value: { cpuCount: 8, memoryMb: 2048 } });
-        expect(await validate(schema, { cpuCount: 8, memoryMb: 512 })).toHaveProperty('issues');
-      }
-      expect(await validate({ $defs: { A: { not: { $ref: '#/$defs/A' } } }, $ref: '#/$defs/A' })).toEqual(
-        refused('$ref', '/$defs/A/not/$ref', 'comes back to the same schema at the same value'),
+    it('refuses schemas fork main refused or threw on, and accepts what it never compiled', async () => {
+      const s2020 = 'https://json-schema.org/draft/2020-12/schema';
+      const wrongType = (keyword: string, pointer: string) =>
+        refused(keyword, pointer, 'has a value of the wrong type');
+      expect(await validate({ $schema: s2020, $id: 'urn:x' })).toEqual(wrongType('$id', '/$id'));
+      expect(await validate({ $schema: s2020, $id: 'urn:example:x' })).toEqual({ value: {} });
+      expect(await validate({ required: Array(1) })).toEqual(wrongType('required', '/required'));
+      expect(await validate({ anyOf: [true, undefined] })).toEqual(wrongType('anyOf', '/anyOf'));
+      expect(await validate({ enum: [1, undefined] }, 1)).toEqual(wrongType('enum', '/enum'));
+      expect(await validate({ type: Object.freeze(['string']), nullable: true }, null)).toEqual(
+        refused('nullable', '/nullable', 'is true beside a "type" list that cannot be extended'),
       );
+      // A keyword whose value is `undefined` is absent, as Ajv read it.
+      expect(await validate({ type: 'string', maxLength: undefined }, 'abc')).toEqual({ value: 'abc' });
+      // Ajv's reference walk entered an array under a name Object.prototype holds.
+      expect(await validate({ example: { toString: [{ $anchor: 'a' }] } })).toEqual(
+        refused(
+          '$anchor',
+          '/example/toString/0/$anchor',
+          'is below the root; nested IDs and anchors are not supported',
+        ),
+      );
+      expect(await validate({ example: { toString: { $anchor: 'a' } } })).toEqual({ value: {} });
+      // Fork main's Ajv never compiled a definition nothing reaches.
+      expect(await validate({ $defs: { A: { anyOf: [{ $ref: '#/$defs/A' }] } } })).toEqual({ value: {} });
+      expect(await validate({ $defs: { $id: true, A: { $ref: '#/$defs/B' }, B: true } })).toEqual({ value: {} });
     });
 
     it('validates a draft-07 tuple and ignores a nested $schema, as fork main did', async () => {
@@ -566,14 +584,14 @@ describe('json-schema standard-schema adapter', () => {
       );
     });
 
-    it('refuses a $ref that an $id in an annotation would move to another schema', async () => {
+    it('refuses an $id in an annotation that would move a $ref to another schema', async () => {
       const schema = {
         properties: { a: { $ref: '#/$defs/A' } },
         $defs: { A: { type: 'string' } },
         'x-meta': { $id: '#/$defs/A', type: 'number' },
       };
       expect(await validate(schema, { a: 1 })).toEqual(
-        refused('$ref', '/properties/a/$ref', 'resolves to another schema than its JSON Pointer names'),
+        refused('$id', '/x-meta/$id', 'is below the root; nested IDs and anchors are not supported'),
       );
     });
 
@@ -587,6 +605,39 @@ describe('json-schema standard-schema adapter', () => {
       expect(await validate({ properties: { a: { const: { p: 1 } } } }, JSON.parse('{"a":{"valueOf":1}}'))).toEqual({
         issues: [{ message, path: ['a', 'valueOf'] }],
       });
+      expect(await validate(open, { at: new Proxy({}, {}) })).toEqual({ issues: [{ message, path: ['at'] }] });
+      expect(await validate(open, { at: Object.defineProperty({}, 'b', { get: () => 1, enumerable: true }) })).toEqual({
+        issues: [{ message, path: ['at'] }],
+      });
+      // Ajv's equality compared constructors: a null-prototype object or an array subclass is refused only
+      // where a value is compared, and accepted elsewhere.
+      const compared = { properties: { a: { enum: [{ b: 1 }, [1]] } } };
+      expect(await validate(compared, { a: Object.assign(Object.create(null), { b: 1 }) })).toEqual({
+        issues: [{ message, path: ['a'] }],
+      });
+      expect(await validate(compared, { a: Object.setPrototypeOf([1], class extends Array {}.prototype) })).toEqual({
+        issues: [{ message, path: ['a'] }],
+      });
+      const nullPrototype = { at: Object.assign(Object.create(null), { b: 1 }) };
+      expect(await validate(open, nullPrototype)).toEqual({ value: nullPrototype });
+    });
+
+    it('refuses a schema that Ajv and this validator would read differently', async () => {
+      const notPlain = 'holds an object that is not a plain object or array';
+      expect(await validate(new Proxy({ type: 'string' }, {}), 'a')).toEqual(refused('$schema', '', 'is a Proxy'));
+      expect(await validate({ properties: { a: { [Symbol('s')]: 1 } } })).toEqual(
+        refused('a', '/properties/a/Symbol(s)', 'has a key that is not enumerable or is a symbol'),
+      );
+      expect(await validate(Object.defineProperty({}, 'type', { value: 'string', enumerable: false }), 1)).toEqual(
+        refused('$schema', '/type', 'has a key that is not enumerable or is a symbol'),
+      );
+      expect(
+        await validate({ properties: Object.defineProperty({}, 'a', { get: () => ({}), enumerable: true }) }),
+      ).toEqual(refused('a', '/properties/a', 'is read through a getter or setter'));
+      expect(await validate({ const: new Date(0) })).toEqual(refused('const', '/const', notPlain));
+      expect(await validate({ enum: [Object.create(null)] })).toEqual(refused('0', '/enum/0', notPlain));
+      // A null-prototype object is a plain schema outside const and enum data.
+      expect(await validate(Object.assign(Object.create(null), { type: 'string' }), 'a')).toEqual({ value: 'a' });
     });
   });
 

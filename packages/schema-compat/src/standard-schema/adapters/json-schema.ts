@@ -94,8 +94,25 @@ const isNonNegativeInteger = (value: unknown): boolean => Number.isInteger(value
 const isString = (value: unknown): boolean => typeof value === 'string';
 const isAny = (): boolean => true;
 
+// `filter` skips holes, so a sparse list fails as fork main's metaschema failed it.
 const isUniqueStringList = (value: unknown): boolean =>
-  Array.isArray(value) && value.every(isString) && new Set(value).size === value.length;
+  Array.isArray(value) && value.filter(isString).length === value.length && new Set(value).size === value.length;
+
+/** Whether an array has a hole or an `undefined` member, which fork main's Ajv refused or threw on. */
+function hasHoleOrUndefined(list: unknown[]): boolean {
+  for (let index = 0; index < list.length; index++) {
+    if (!(index in list) || list[index] === undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * fast-uri 3.1.8's URN grammar, which fork main's Ajv used to serialize a root `$id`: a `urn:`
+ * ID whose path does not match made it throw `URN without nid cannot be serialized`.
+ */
+const AJV_URN_PATH = /^([\da-z][\d\-a-z]{0,31}):((?:[\w!$'()*+,\-./:;=@]|%[\da-f]{2})+)$/iu;
 
 /** An absolute URI without a fragment, as a root `$id` names the schema. */
 function isAbsoluteUriWithoutFragment(value: unknown): boolean {
@@ -104,10 +121,11 @@ function isAbsoluteUriWithoutFragment(value: unknown): boolean {
   }
   try {
     new URL(value);
-    return true;
   } catch {
     return false;
   }
+  const urn = /^urn:([^?]*)/i.exec(value);
+  return urn === null || AJV_URN_PATH.test(urn[1]!);
 }
 
 /**
@@ -143,7 +161,6 @@ const ALLOWED_KEYWORDS = new Map<string, Allowed>([
   ['allOf', { valid: v => Array.isArray(v) && v.length > 0, reading: 'schema-list' }],
   ['anyOf', { valid: v => Array.isArray(v) && v.length > 0, reading: 'schema-list' }],
   ['oneOf', { valid: v => Array.isArray(v) && v.length > 0, reading: 'schema-list' }],
-  ['not', { valid: isAny, reading: 'schema' }],
   ['enum', { valid: v => Array.isArray(v) && v.length > 0, reading: 'data' }],
   ['const', { valid: isAny, reading: 'data' }],
   ['minimum', { valid: isFiniteNumber, reading: 'none' }],
@@ -232,17 +249,29 @@ const AJV_2020_REGISTERED_IDS = new Set([
   'http://json-schema.org/schema',
 ]);
 
-/** The schema IDs fork main's draft-07 `Ajv` had registered: its metaschema and the same alias. */
-const AJV_DRAFT_07_REGISTERED_IDS = new Set(['http://json-schema.org/draft-07/schema', 'http://json-schema.org/schema']);
-
-/** Ajv's anchor grammar; Ajv threw on any other `$anchor` or `$dynamicAnchor` string it walked. */
-const AJV_ANCHOR = /^[a-z_][-a-z0-9._]*$/i;
+/** Ajv's `loopEnum` default: a shorter `enum` was compiled member by member, and threw on `undefined`. */
+const AJV_LOOP_ENUM = 200;
 
 /** Keywords whose values Ajv's reference walk (json-schema-traverse with `allKeys`) did not enter. */
 const AJV_TRAVERSE_SKIPPED = new Set([
-  'default', 'enum', 'const', 'required', 'maximum', 'minimum', 'exclusiveMaximum', 'exclusiveMinimum',
-  'multipleOf', 'maxLength', 'minLength', 'pattern', 'format', 'maxItems', 'minItems', 'uniqueItems',
-  'maxProperties', 'minProperties',
+  'default',
+  'enum',
+  'const',
+  'required',
+  'maximum',
+  'minimum',
+  'exclusiveMaximum',
+  'exclusiveMinimum',
+  'multipleOf',
+  'maxLength',
+  'minLength',
+  'pattern',
+  'format',
+  'maxItems',
+  'minItems',
+  'uniqueItems',
+  'maxProperties',
+  'minProperties',
 ]);
 const AJV_TRAVERSE_ARRAYS = new Set(['items', 'allOf', 'anyOf', 'oneOf']);
 const AJV_TRAVERSE_MAPS = new Set(['$defs', 'definitions', 'properties', 'patternProperties', 'dependencies']);
@@ -277,19 +306,22 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
  * - a property, required or `dependentRequired` name that a plain object inherits, a
  *   definition named `__proto__`, `constructor`, `toString` or `valueOf`, and such a key in
  *   `const` or `enum` data;
- * - a `$defs` member named `$id` that Ajv read as a reference scope, and an anchor or ID that
- *   Ajv's reference walk threw on (see {@link refuseAjvReferenceConflicts});
- * - a loop of `$ref`, `allOf`, `anyOf`, `oneOf` or `not` that comes back to the same schema at the
+ * - a `$defs` member named `$id` that Ajv read as a reference scope, and a string `$id`,
+ *   `$anchor` or `$dynamicAnchor` below the root in any object Ajv's reference walk entered
+ *   (see {@link refuseNestedIdsAndAnchors});
+ * - a loop of `$ref`, `allOf`, `anyOf` or `oneOf` that comes back to the same schema at the
  *   same value.
  * Literal data under `const`, `enum`, `default`, `examples` and annotations is not read as a
  * schema. The schema is checked as given, before it is copied, so an inherited keyword counts.
  * Returns whether the schema compares values (`const` or `enum`).
  */
 function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
+  refuseNonPlainSchemaObjects(root);
   const declared = isJsonObject(root) ? root.$schema : undefined;
   const dialect: Dialect = (typeof declared === 'string' && DIALECTS.get(declared)) || 'draft-07';
   let comparing = false;
   const inPlaceEdges = new Map<object, Array<[object, string]>>();
+  const children = new Map<object, object[]>();
   const visit = (node: unknown, pointer: string): void => {
     if (typeof node === 'boolean') {
       return;
@@ -302,9 +334,23 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
     }
     const edges: Array<[object, string]> = [];
     inPlaceEdges.set(node, edges);
+    const kids: object[] = [];
+    children.set(node, kids);
+    // A schema Ajv compiled reached this child; a member of `$defs` or `definitions` is reached
+    // only through a `$ref`.
+    const enter = (child: unknown, at: string, reached = true): void => {
+      visit(child, at);
+      if (reached && typeof child === 'object' && child !== null) {
+        kids.push(child);
+      }
+    };
     for (const key of Object.keys(node)) {
       const value = node[key];
       const at = `${pointer}/${pointerToken(key)}`;
+      if (value === undefined) {
+        // Ajv applied no keyword whose value is `undefined`; neither does this validator.
+        continue;
+      }
       if (key === '$schema') {
         // Fork main's Ajv read the dialect from the root alone and ignored a nested string
         // `$schema` (a workflow's converted input schema carries one).
@@ -333,7 +379,12 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
       if (key === '$id' && pointer !== '') {
         throw new JsonSchemaUnsupportedError(key, at, 'is only supported at the root');
       }
-      if (!allowed.valid(value)) {
+      if (
+        !allowed.valid(value) ||
+        (Array.isArray(value) &&
+          (allowed.reading !== 'data' || (key === 'enum' && value.length < AJV_LOOP_ENUM)) &&
+          hasHoleOrUndefined(value))
+      ) {
         throw new JsonSchemaUnsupportedError(key, at, 'has a value of the wrong type');
       }
       if (key === '$id' && AJV_2020_REGISTERED_IDS.has(ajvNormalizedId(value as string))) {
@@ -355,13 +406,9 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
           // Draft-07 `items` may list one schema per position, as Ajv's draft-07 metaschema
           // allowed (at least one); the 2020-12 metaschema allowed only one schema there.
           if (key === 'items' && dialect === 'draft-07' && Array.isArray(value) && value.length > 0) {
-            value.forEach((item, index) => visit(item, `${at}/${index}`));
+            value.forEach((item, index) => enter(item, `${at}/${index}`));
           } else {
-            visit(value, at);
-            // `not` reads the same value, so a loop through it reads the same schema again.
-            if (key === 'not' && typeof value === 'object' && value !== null) {
-              edges.push([value, at]);
-            }
+            enter(value, at);
           }
           break;
         case 'schema-map':
@@ -373,15 +420,15 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
                 'names a member like an Object prototype key',
               );
             }
-            visit((value as Record<string, unknown>)[name], `${at}/${pointerToken(name)}`);
+            enter((value as Record<string, unknown>)[name], `${at}/${pointerToken(name)}`, key === 'properties');
           }
           break;
         case 'schema-tuple':
-          (value as unknown[]).forEach((item, index) => visit(item, `${at}/${index}`));
+          (value as unknown[]).forEach((item, index) => enter(item, `${at}/${index}`));
           break;
         case 'schema-list':
           (value as unknown[]).forEach((branch, index) => {
-            visit(branch, `${at}/${index}`);
+            enter(branch, `${at}/${index}`);
             if (typeof branch === 'object' && branch !== null) {
               edges.push([branch, `${at}/${index}`]);
             }
@@ -405,6 +452,19 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
     if (node.nullable === false && (node.type === 'null' || (Array.isArray(node.type) && node.type.includes('null')))) {
       throw new JsonSchemaUnsupportedError('nullable', `${pointer}/nullable`, 'is false beside a "null" type');
     }
+    if (
+      node.nullable === true &&
+      Array.isArray(node.type) &&
+      !node.type.includes('null') &&
+      !Object.isExtensible(node.type)
+    ) {
+      // Fork main's Ajv added "null" to the schema's own `type` list and threw on a frozen one.
+      throw new JsonSchemaUnsupportedError(
+        'nullable',
+        `${pointer}/nullable`,
+        'is true beside a "type" list that cannot be extended',
+      );
+    }
     if (Array.isArray(node.required) && node.required.some(name => PROTOTYPE_NAMES.has(name as string))) {
       throw new JsonSchemaUnsupportedError(
         'required',
@@ -423,13 +483,24 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
       }
       if (typeof target === 'object' && target !== null) {
         edges.push([target, `${pointer}/$ref`]);
+        kids.push(target);
       }
     }
   };
   visit(root, '');
-  refuseDefsScopeChange(root);
-  refuseAjvReferenceConflicts(root, dialect === '2020-12' ? AJV_2020_REGISTERED_IDS : AJV_DRAFT_07_REGISTERED_IDS);
-  // A loop through `$ref`, `allOf`, `anyOf`, `oneOf` and `not` reads the same schema at the same
+  // Fork main's Ajv compiled only what the root reaches; it never resolved a `$ref` or entered
+  // a loop in a definition nothing reaches.
+  const reachable = new Set<object>();
+  const pending: object[] = typeof root === 'object' && root !== null ? [root] : [];
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    if (!reachable.has(next)) {
+      reachable.add(next);
+      pending.push(...(children.get(next) ?? []));
+    }
+  }
+  refuseDefsScopeChange(root, reachable);
+  refuseNestedIdsAndAnchors(root);
+  // A loop through `$ref`, `allOf`, `anyOf` and `oneOf` reads the same schema at the same
   // value again; Ajv overflowed or recursed on it, and so does this validator.
   const state = new Map<object, 'open' | 'done'>();
   const walk = (node: object): void => {
@@ -438,7 +509,7 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
       const seen = state.get(next);
       if (seen === 'open') {
         throw new JsonSchemaUnsupportedError(
-          at.endsWith('/$ref') ? '$ref' : at.endsWith('/not') ? 'not' : at.split('/').at(-2)!,
+          at.endsWith('/$ref') ? '$ref' : at.split('/').at(-2)!,
           at,
           'comes back to the same schema at the same value',
         );
@@ -450,11 +521,53 @@ function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
     state.set(node, 'done');
   };
   for (const node of inPlaceEdges.keys()) {
-    if (!state.has(node)) {
+    if (reachable.has(node) && !state.has(node)) {
       walk(node);
     }
   }
   return { comparesValues: comparing };
+}
+
+/**
+ * Refuses a schema holding, anywhere, a `Proxy` (where the runtime can tell), an own key that is
+ * not enumerable or is a symbol, or a property read through a getter or setter: Ajv and this
+ * validator read such schemas differently. Inside `const` or `enum` data, an object whose
+ * prototype is neither `Object.prototype` nor `Array.prototype` (a `Date`, a class instance, an
+ * object with a `null` prototype) is refused too: Ajv's equality compared constructors, and this
+ * validator's does not.
+ */
+function refuseNonPlainSchemaObjects(root: unknown): void {
+  const seen = new Set<object>();
+  const walk = (node: unknown, pointer: string, data: boolean): void => {
+    if (typeof node !== 'object' || node === null || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    const keyword = pointer.split('/').at(-1) || '$schema';
+    if (isProxy(node)) {
+      throw new JsonSchemaUnsupportedError(keyword, pointer, 'is a Proxy');
+    }
+    const prototype = Object.getPrototypeOf(node);
+    if (data && prototype !== Object.prototype && prototype !== Array.prototype) {
+      throw new JsonSchemaUnsupportedError(keyword, pointer, 'holds an object that is not a plain object or array');
+    }
+    const enumerable = new Set(Object.keys(node));
+    for (const key of Reflect.ownKeys(node)) {
+      if (Array.isArray(node) && key === 'length') {
+        continue;
+      }
+      const at = `${pointer}/${pointerToken(String(key))}`;
+      if (typeof key === 'symbol' || !enumerable.has(key)) {
+        throw new JsonSchemaUnsupportedError(keyword, at, 'has a key that is not enumerable or is a symbol');
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(node, key)!;
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        throw new JsonSchemaUnsupportedError(key, at, 'is read through a getter or setter');
+      }
+      walk(descriptor.value, at, data || key === 'const' || key === 'enum');
+    }
+  };
+  walk(root, '', false);
 }
 
 /** An ID as Ajv compared it: without a trailing `#` or `#/`. */
@@ -482,10 +595,10 @@ function hasRepeatedMember(list: unknown[]): boolean {
 
 /**
  * Refuses a `$defs` member named `$id` that fork main's Ajv read as the scope of every `$ref`
- * into `$defs`: it threw on a value other than a string, and resolved the references inside
- * `$defs` against a string.
+ * into `$defs` that the root reaches: it threw on a value other than a string, and resolved the
+ * references inside `$defs` against a string.
  */
-function refuseDefsScopeChange(root: unknown): void {
+function refuseDefsScopeChange(root: unknown, reachable: ReadonlySet<object>): void {
   if (!isJsonObject(root) || !isJsonObject(root.$defs) || !root.$defs.$id) {
     return;
   }
@@ -493,7 +606,7 @@ function refuseDefsScopeChange(root: unknown): void {
   let throughDefs = false;
   let insideDefs = false;
   forEachSchemaObject(root, (node, pointer) => {
-    if (typeof node.$ref === 'string' && node.$ref.startsWith('#/$defs/')) {
+    if (reachable.has(node) && typeof node.$ref === 'string' && node.$ref.startsWith('#/$defs/')) {
       throughDefs = true;
       insideDefs ||= pointer.startsWith('/$defs/');
     }
@@ -509,66 +622,49 @@ function refuseDefsScopeChange(root: unknown): void {
 
 /**
  * Walks the objects fork main's Ajv walked for IDs and anchors (every schema and every
- * object-valued annotation, as json-schema-traverse with `allKeys`), and refuses what made Ajv
- * throw there: an `$anchor` or `$dynamicAnchor` outside its grammar, or an `$id` or anchor that
- * resolves to one already seen or to a schema ID that Ajv had registered for the dialect.
+ * object-valued annotation, as json-schema-traverse with `allKeys`) and refuses a string `$id`,
+ * `$anchor` or `$dynamicAnchor` in any of them below the root. Ajv registered each one as a
+ * reference scope and threw on a malformed or repeated one; this validator resolves none of
+ * them, so none is accepted. The root `$id` is checked where it is read.
  */
-function refuseAjvReferenceConflicts(root: unknown, registered: ReadonlySet<string>): void {
-  const seen = new Set<string>(registered);
-  const resolve = (baseId: string, ref: string): string => {
-    try {
-      return ajvNormalizedId(baseId ? new URL(ref, baseId).href : ref);
-    } catch {
-      return ajvNormalizedId(`${baseId}\u0000${ref}`);
-    }
-  };
-  const add = (ref: string, keyword: string, at: string, baseId: string): string => {
-    const id = resolve(baseId, ref);
-    if (seen.has(id)) {
-      throw new JsonSchemaUnsupportedError(keyword, at, "names an ID or anchor fork main's Ajv had already seen");
-    }
-    seen.add(id);
-    return id;
-  };
-  const walk = (node: unknown, pointer: string, baseId: string): void => {
+function refuseNestedIdsAndAnchors(root: unknown): void {
+  const walk = (node: unknown, pointer: string): void => {
     if (typeof node !== 'object' || node === null || Array.isArray(node)) {
       return;
     }
     const record = node as Record<string, unknown>;
-    let inner = baseId;
     if (pointer !== '') {
-      if (typeof record.$id === 'string') {
-        inner = add(record.$id, '$id', `${pointer}/$id`, baseId);
-      }
-      for (const keyword of ['$anchor', '$dynamicAnchor']) {
-        const anchor = record[keyword];
-        if (typeof anchor === 'string') {
-          if (!AJV_ANCHOR.test(anchor)) {
-            throw new JsonSchemaUnsupportedError(keyword, `${pointer}/${keyword}`, "is not an anchor fork main's Ajv accepted");
-          }
-          add(`#${anchor}`, keyword, `${pointer}/${keyword}`, inner);
+      for (const keyword of ['$id', '$anchor', '$dynamicAnchor']) {
+        if (typeof record[keyword] === 'string') {
+          throw new JsonSchemaUnsupportedError(
+            keyword,
+            `${pointer}/${keyword}`,
+            'is below the root; nested IDs and anchors are not supported',
+          );
         }
       }
     }
     for (const [key, value] of Object.entries(record)) {
       const at = `${pointer}/${pointerToken(key)}`;
+      // json-schema-traverse tested `key in table`, so a name `Object.prototype` holds, such as
+      // `toString`, counted as an array keyword and as a name-map keyword.
+      const inherited = PROTOTYPE_NAMES.has(key);
       if (Array.isArray(value)) {
-        if (AJV_TRAVERSE_ARRAYS.has(key)) {
-          value.forEach((item, index) => walk(item, `${at}/${index}`, inner));
+        if (inherited || AJV_TRAVERSE_ARRAYS.has(key)) {
+          value.forEach((item, index) => walk(item, `${at}/${index}`));
         }
-      } else if (AJV_TRAVERSE_MAPS.has(key)) {
+      } else if (inherited || AJV_TRAVERSE_MAPS.has(key)) {
         if (typeof value === 'object' && value !== null) {
           for (const [name, member] of Object.entries(value)) {
-            walk(member, `${at}/${pointerToken(name)}`, inner);
+            walk(member, `${at}/${pointerToken(name)}`);
           }
         }
       } else if (!AJV_TRAVERSE_SKIPPED.has(key)) {
-        walk(value, at, inner);
+        walk(value, at);
       }
     }
   };
-  const rootId = isJsonObject(root) && typeof root.$id === 'string' ? ajvNormalizedId(root.$id) : '';
-  walk(root, '', rootId);
+  walk(root, '');
 }
 
 /** Whether literal data holds an object with a key that Ajv's equality reads from the prototype. */
@@ -583,12 +679,32 @@ function holdsPrototypeName(value: unknown): boolean {
 }
 
 /**
+ * Whether `value` is a `Proxy`, where the runtime can tell (Node and Bun expose
+ * `util.types.isProxy`). Elsewhere a `Proxy` is not recognised; the changeset names that limit.
+ */
+const isProxy: (value: object) => boolean = (() => {
+  const util = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process?.getBuiltinModule?.(
+    'node:util',
+  ) as { types?: { isProxy?: (value: unknown) => boolean } } | undefined;
+  const check = util?.types?.isProxy;
+  return typeof check === 'function' ? (value: object) => check(value) : () => false;
+})();
+
+/** Whether an own property of `value` is read through a getter or setter rather than held as data. */
+function hasAccessor(value: object): boolean {
+  return Object.values(Object.getOwnPropertyDescriptors(value)).some(d => d.get !== undefined || d.set !== undefined);
+}
+
+/**
  * The path of the first place in `value` that JSON cannot carry, or `undefined`: a number that
  * is not finite, an object with a prototype other than `Object.prototype` (a `Date`, a class
  * instance, an object with inherited properties), a sparse or cyclic array or object, a
- * function, a `bigint` or a symbol. `undefined` property values are allowed and handled as Ajv
- * handled them. When the schema compares values, an object key that Ajv's equality reads from
- * the prototype (`constructor`, `toString`, `valueOf`, `__proto__`) is refused too.
+ * function, a `bigint` or a symbol, a `Proxy` where the runtime can tell, or an own property read
+ * through a getter or setter (this validator could read it more than once). `undefined` property
+ * values are allowed and handled as Ajv handled them. When the schema compares values, an object
+ * key that Ajv's equality reads from the prototype (`constructor`, `toString`, `valueOf`,
+ * `__proto__`), an object with a `null` prototype and an array subclass are refused too: Ajv's
+ * equality compared constructors, and this validator's does not.
  */
 function nonJsonLocation(
   value: unknown,
@@ -611,7 +727,13 @@ function nonJsonLocation(
   if (value === null) {
     return undefined;
   }
-  if (open.has(value) || (!Array.isArray(value) && !isJsonObject(value))) {
+  if (open.has(value) || (!Array.isArray(value) && !isJsonObject(value)) || isProxy(value) || hasAccessor(value)) {
+    return path;
+  }
+  if (
+    comparing &&
+    (Array.isArray(value) ? Object.getPrototypeOf(value) !== Array.prototype : Object.getPrototypeOf(value) === null)
+  ) {
     return path;
   }
   open.add(value);
@@ -694,8 +816,8 @@ function namedReferenceTarget(root: unknown, ref: string): unknown {
  * Copies a JSON Schema the allow-list accepted into the form the validator checks. OpenAPI
  * `nullable: true` adds `"null"` to the `type` beside it, as Ajv's built-in `nullable` keyword
  * did; `enum` and `const` still apply. The copy is then checked so that the validator resolves
- * every `$ref` to the schema its JSON Pointer names (an annotation the validator walks could
- * otherwise declare an `$id` that takes that place).
+ * every `$ref` to the schema its JSON Pointer names. The allow-list already refuses every `$id`
+ * and anchor that could take that place; this check fails closed if one is ever missed.
  */
 function toValidationSchema(
   schema: JSONSchema7,
@@ -751,14 +873,7 @@ function instanceLocationToPath(instanceLocation: string): Array<PropertyKey> {
  * `Property "x" does not match schema.`). The subschema's own error follows it,
  * so these add nothing for the reader.
  */
-const SUMMARY_KEYWORDS = new Set([
-  'properties',
-  'items',
-  'prefixItems',
-  'additionalItems',
-  'allOf',
-  '$ref',
-]);
+const SUMMARY_KEYWORDS = new Set(['properties', 'items', 'prefixItems', 'additionalItems', 'allOf', '$ref']);
 
 /** The validator's error for a property refused by `additionalProperties`. */
 const CLOSED_OBJECT_MESSAGES: Record<string, (name: string) => string> = {
