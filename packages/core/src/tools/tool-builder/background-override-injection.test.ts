@@ -366,6 +366,26 @@ describe('CoreToolBuilder background override injection', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it("refuses a fresh call missing the tool's own required top-level suspendedToolRunId", async () => {
+      const execute = vi.fn().mockResolvedValue({ done: true });
+      const tool = createTool({
+        id: 'workflow-own-run-id',
+        description: 'Workflow as a tool',
+        inputSchema: z3.object({ message: z3.string(), suspendedToolRunId: z3.string() }),
+        execute,
+      });
+
+      const built = new CoreToolBuilder({
+        originalTool: tool,
+        options: { ...baseOptions(), name: 'workflow-own-run-id', backgroundConfig: undefined },
+      }).build();
+
+      const result = await built.execute!({ message: 'hi' } as any, { toolCallId: 'call-1', messages: [] });
+
+      expect(result).toMatchObject({ error: true, message: expect.stringContaining('suspendedToolRunId') });
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     // Both gates can fire at once: a resumable id AND backgroundTaskEnabled.
     // Ensure all three injected fields end up in the same schema.
     // https://github.com/mastra-ai/mastra/pull/16915#pullrequestreview

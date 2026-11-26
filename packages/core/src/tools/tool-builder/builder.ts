@@ -436,6 +436,8 @@ export class CoreToolBuilder extends MastraBase {
    */
   private injectedInputSchema?: StandardSchemaWithJSON;
   private isResumableTool: boolean;
+  /** The tool's own input schema declares `suspendedToolRunId`, so a refusal of it is the tool's, not the builder's. */
+  private schemaDeclaresSuspendedToolRunId = false;
 
   private bindFGAResourceId<T extends object>(tool: T): T {
     return bindBuiltToolFGAResourceId(
@@ -500,6 +502,7 @@ export class CoreToolBuilder extends MastraBase {
         //   `TypeError: keyValidator._parse is not a function`.
         if (isZodObject(schema) && isZodV4Schema(schema)) {
           let nextSchema: z.ZodObject<any> = schema as z.ZodObject<any>;
+          this.schemaDeclaresSuspendedToolRunId = Object.hasOwn(nextSchema.shape, 'suspendedToolRunId');
           if (isBackgroundEligible) {
             nextSchema = safeExtendZodObject(nextSchema, {
               _background: backgroundOverrideZodSchema,
@@ -516,6 +519,7 @@ export class CoreToolBuilder extends MastraBase {
 
           if (jsonSchema && typeof jsonSchema === 'object' && jsonSchema.type === 'object') {
             const properties: Record<string, JSONSchema7Definition> = { ...(jsonSchema.properties ?? {}) };
+            this.schemaDeclaresSuspendedToolRunId = Object.hasOwn(properties, 'suspendedToolRunId');
             const injectedKeys: string[] = [];
 
             if (isBackgroundEligible) {
@@ -1177,24 +1181,32 @@ export class CoreToolBuilder extends MastraBase {
             options.name,
           );
           // suspendedToolRunId is only needed when resuming. The one refusal
-          // ignored is the builder's own injected top-level key being absent on a
-          // call that is not resuming; the raw args then run unchanged.
-          const ignoresAbsentInjectedRunId =
+          // retried is of the key the builder injected (the tool's own schema
+          // does not declare it), absent at the top level, on a call that is not
+          // resuming; a compat layer may require it as nullable. The call is
+          // validated again with the key set to null, and that result stands.
+          const absentInjectedRunId =
             error !== undefined &&
             this.isResumableTool &&
             this.injectedInputSchema !== undefined &&
+            !this.schemaDeclaresSuspendedToolRunId &&
             !isResuming &&
             (args as Record<string, unknown> | undefined)?.resumeData === undefined &&
             isOnlyAbsentTopLevelField(error, args, 'suspendedToolRunId');
-          if (error && !ignoresAbsentInjectedRunId) {
+          const validated = absentInjectedRunId
+            ? await validateToolInputAsync(
+                parameters as StandardSchemaWithJSON | undefined,
+                { ...(args as Record<string, unknown>), suspendedToolRunId: null },
+                options.name,
+              )
+            : { data, error };
+          if (validated.error) {
             logger.warn('Tool input validation failed', logData);
             toolSpan?.end({ output: { error: true }, attributes: { success: false } });
-            return error;
+            return validated.error;
           }
-          if (!ignoresAbsentInjectedRunId) {
-            // Use validated/transformed data
-            args = data;
-          }
+          // Use validated/transformed data
+          args = validated.data;
         } else {
           // Best-effort normalization on resume: replayed args keep the provider's
           // raw shape (OpenAI strict compat materializes .optional() fields as null),
