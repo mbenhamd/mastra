@@ -1737,12 +1737,14 @@ describe('ComposioToolProvider — approval from Composio tags', () => {
     const pinned = async (config: Partial<ComposioToolProviderConfig>) => {
       composioInstances.length = 0;
       const { integration } = await resolveWithPolicy([], config);
-      getMastraInstance();
+      // The host edits its map after the Mastra client exists and before the
+      // raw one does: neither client sees the edit.
+      if (config.toolkitVersions) (config.toolkitVersions as Record<string, string>).gmail = 'edited';
       await integration.listToolkitsVNext().catch(() => undefined);
       return composioInstances.map(instance => [instance.hasProvider, instance.toolkitVersions]);
     };
     const toolkitVersions = { gmail: '20261120_00', github: '20261123_00' };
-    expect(await pinned({ toolkitVersions })).toEqual([
+    expect(await pinned({ toolkitVersions: { ...toolkitVersions } })).toEqual([
       [true, toolkitVersions],
       [false, toolkitVersions],
     ]);

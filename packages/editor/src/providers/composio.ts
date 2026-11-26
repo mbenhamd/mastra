@@ -76,14 +76,17 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
   /**
    * The dated toolkit version each toolkit's tools are fetched and executed
    * at, keyed by toolkit slug (for example `{ gmail: '20261120_00' }`).
-   * Forwarded to both Composio clients.
+   * Copied when the provider is built and forwarded to both Composio
+   * clients, so a later change to the caller's map reaches neither.
    *
    * The SDK lays this map over its `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>`
    * environment values, key by key, with the map winning. A toolkit in
    * neither runs Composio's `latest` version: provider execution skips the
    * SDK's version check. Slugs match case-insensitively but are otherwise
    * compared as written. A host that must not follow Composio's schema
-   * changes unannounced maps every toolkit it offers.
+   * changes unannounced maps every toolkit it offers. The connection-management
+   * session tools (`COMPOSIO_MANAGE_CONNECTIONS`, `COMPOSIO_WAIT_FOR_CONNECTIONS`)
+   * are not pinned: the SDK's session requests carry no toolkit version.
    */
   toolkitVersions?: Readonly<Record<string, string>>;
 }
@@ -290,7 +293,7 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.sharedConnections = config.sharedConnections;
     this.requireToolApproval = config.requireToolApproval;
     this.allowTracking = config.allowTracking;
-    this.toolkitVersions = config.toolkitVersions;
+    this.toolkitVersions = config.toolkitVersions === undefined ? undefined : { ...config.toolkitVersions };
   }
 
   /**
