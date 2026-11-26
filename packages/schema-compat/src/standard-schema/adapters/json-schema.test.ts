@@ -899,7 +899,12 @@ describe('json-schema standard-schema adapter', () => {
     ],
     [
       'normalisation replaces its target',
-      { type: 'array', nullable: true, prefixItems: { length: 1, 0: { $ref: '#/type' } } },
+      {
+        type: 'array',
+        minimum: 5,
+        exclusiveMinimum: true,
+        prefixItems: { length: 1, 0: { $ref: '#/exclusiveMinimum' } },
+      },
       'a $ref resolves to a different target once the schema is prepared for validation, so the schema is refused',
     ],
     [
@@ -936,6 +941,39 @@ describe('json-schema standard-schema adapter', () => {
       ],
     });
     expect(await unused['~standard'].validate({})).toEqual({ value: {} });
+  });
+
+  it('refuses a reachable $ref to a value that is not a schema', async () => {
+    const standardSchema = toStandardSchema({
+      properties: { x: { $ref: '#/x-n' } },
+      'x-n': null,
+    } as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate({})).toEqual({
+      issues: [
+        {
+          message:
+            'Schema validation error: $ref "#/x-n" at "/properties/x/$ref" points at a value that is not a schema, so the schema is refused',
+        },
+      ],
+    });
+  });
+
+  it.each([
+    ['then without if', { then: { $ref: '#/missing' } }, 5],
+    ['else without if', { type: 'object', else: { $ref: '#/missing' } }, {}],
+    ['additionalItems without items', { additionalItems: { $ref: '#/missing' } }, [1]],
+    [
+      'additionalItems beside an object items',
+      { items: { type: 'number' }, additionalItems: { $ref: '#/missing' } },
+      [1],
+    ],
+  ])('accepts a dangling $ref under %s, which the validator never reads', async (_label, schema, value) => {
+    const standardSchema = toStandardSchema(schema as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate(value)).toEqual({ value });
   });
 
   it('refuses a $ref to "#/", which the validator reads as the root\'s "" member', async () => {

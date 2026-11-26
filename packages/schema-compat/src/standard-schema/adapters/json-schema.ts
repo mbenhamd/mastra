@@ -406,9 +406,11 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
 
 /**
  * Refuses a schema in which a `$ref` the validator can reach from the root, through its
- * applicators and other references, points nowhere, as Ajv refused it when compiling. The
- * validator would otherwise throw only for a value that reaches the reference. Definitions no
- * reference uses are not read, as with Ajv.
+ * applicators and other references, points nowhere or at a value that is not a schema. The
+ * validator would otherwise throw only for a value that reaches the reference. Ajv refused most
+ * of these when compiling; this also refuses them where fork main's draft-07 Ajv compiled them.
+ * Definitions no reference uses, `then` and `else` without `if`, and `additionalItems` without
+ * an array `items` are not read, as the validator does not read them.
  */
 function refuseUnresolvedReferences(root: unknown): void {
   const seen = new Set<object>();
@@ -431,10 +433,21 @@ function refuseUnresolvedReferences(root: unknown): void {
           `$ref "${record.$ref}" at "${pointer}/$ref" does not resolve within the schema, so the schema is refused`,
         );
       }
+      if (!isPlainObject(target) && typeof target !== 'boolean') {
+        throw new Error(
+          `$ref "${record.$ref}" at "${pointer}/$ref" points at a value that is not a schema, so the schema is refused`,
+        );
+      }
       pending.push([target, record.$ref.slice(1)]);
     }
     for (const [key, value] of Object.entries(record)) {
       const at = `${pointer}/${pointerToken(key)}`;
+      if (
+        ((key === 'then' || key === 'else') && record.if === undefined) ||
+        (key === 'additionalItems' && !Array.isArray(record.items))
+      ) {
+        continue;
+      }
       if (SUBSCHEMA_KEYWORDS.has(key) || (SUBSCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value))) {
         pending.push([value, at]);
       } else if (key === 'prefixItems' && isPlainObject(value)) {
