@@ -1790,21 +1790,27 @@ verify_pf9666_patched_cfworker_graph() (
   actual_paths="$(mktemp)"
   trap 'rm -f "$expected_paths" "$actual_paths" "$actual_paths.z" "$actual_paths.graph"' EXIT
 
-  printf '%s\n' "$patch_path" pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
-  LC_ALL=C sort -u "$manifest_changes" > "$actual_paths"
+  if ! printf '%s\n' "$patch_path" pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths" ||
+    ! LC_ALL=C sort -u "$manifest_changes" > "$actual_paths"; then
+    echo 'PF-9666 could not read the watched dependency-graph paths.' >&2
+    return 1
+  fi
   if ! cmp -s "$expected_paths" "$actual_paths"; then
     echo 'PF-9666 watched dependency-graph paths are outside the exact reviewed set:' >&2
     diff -u "$expected_paths" "$actual_paths" >&2 || true
     return 1
   fi
 
-  printf '%s\n' \
+  if ! printf '%s\n' \
     "$patch_path" \
     agent-sdks/claude/package.json \
     agent-sdks/openai/package.json \
     packages/schema-compat/package.json \
     pnpm-lock.yaml \
-    pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"
+    pnpm-workspace.yaml | LC_ALL=C sort > "$expected_paths"; then
+    echo 'PF-9666 could not write the reviewed dependency-graph paths.' >&2
+    return 1
+  fi
   # -z prints every path verbatim; without it Git quotes unusual names and the
   # end-anchored filter below would miss them. A path containing a newline
   # cannot be compared line by line, so it is refused.
@@ -1812,11 +1818,16 @@ verify_pf9666_patched_cfworker_graph() (
     echo 'PF-9666 could not list the changed paths.' >&2
     return 1
   fi
-  if [[ "$(tr -cd '\n' < "$actual_paths.z" | wc -c)" -ne 0 ]]; then
+  local newline_count
+  if ! newline_count="$(tr -cd '\n' < "$actual_paths.z" | wc -c)" ||
+    ! tr '\0' '\n' < "$actual_paths.z" > "$actual_paths"; then
+    echo 'PF-9666 could not read the changed paths.' >&2
+    return 1
+  fi
+  if [[ "$newline_count" -ne 0 ]]; then
     echo 'PF-9666 refuses a changed path that contains a newline.' >&2
     return 1
   fi
-  tr '\0' '\n' < "$actual_paths.z" > "$actual_paths"
   # In a UTF-8 locale grep drops a line holding an invalid byte; read bytes.
   # No match (status 1) is an empty set; a read error refuses.
   local graph_status=0
@@ -6329,6 +6340,36 @@ run_validator_self_tests() {
       cat "$command_log" >&2
       exit 1
     fi
+
+    # A test file the build writes under src is refused before the suite runs.
+    local generating_pnpm_bin="$test_root/generating-pnpm-bin"
+    mkdir -p "$generating_pnpm_bin"
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [[ "$*" == *"./agent-sdks/openai --fail-if-no-match build"* ]]; then' \
+      "  printf '%s\\n' \"it('generated', () => {});\" > agent-sdks/openai/src/generated.test.ts" \
+      'fi' \
+      "exec '$mock_bin/pnpm' \"\$@\"" > "$generating_pnpm_bin/pnpm"
+    chmod +x "$generating_pnpm_bin/pnpm"
+    git -C "$fixture_repo" reset -q --hard "$owned_head"
+    : > "$command_log"
+    output="$test_root/pf9666-sdk-generated-test.log"
+    if run_fixture "$owned_head" "$output" BASE_SHA="$owned_base" PATH="$generating_pnpm_bin:$mock_bin:$PATH"; then
+      echo 'A test file written by the Agent SDK build unexpectedly passed validation.' >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    grep -A1 -F 'agent-sdks/openai source entries are not tracked by Git' "$output" |
+      grep -Fxq 'agent-sdks/openai/src/generated.test.ts' || {
+      echo 'The untracked-source refusal did not name agent-sdks/openai/src/generated.test.ts.' >&2
+      cat "$output" >&2
+      exit 1
+    }
+    if grep -Fq -- '--dir agent-sdks/openai exec vitest' "$command_log"; then
+      echo 'The Agent SDK suite ran with a test file the build wrote.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+    rm -f "$fixture_repo/agent-sdks/openai/src/generated.test.ts"
     git -C "$fixture_repo" reset -q --hard "$base_sha"
     echo 'PF-9666 owned Agent SDK and Factory validation-target fixtures passed.'
   }
@@ -16771,13 +16812,17 @@ fi
 # follows a directory symlink to tests Git does not list), before anything
 # runs. A failed inventory returns non-zero.
 agent_sdk_unsupported_tests() {
-  local file playwright_status inventory
-  inventory="$(mktemp)"
-  if ! git ls-files -z -- "$1" > "$inventory"; then
+  local file playwright_status inventory expected_count read_count=0
+  inventory="$(mktemp)" || return 1
+  # Every entry must be read back: a failed reopen or a short read returns
+  # non-zero rather than an empty refusal list.
+  if ! git ls-files -z -- "$1" > "$inventory" ||
+    ! expected_count="$(LC_ALL=C tr -cd '\0' < "$inventory" | wc -c)"; then
     rm -f "$inventory"
     return 1
   fi
   while IFS= read -r -d '' file; do
+    read_count=$((read_count + 1))
     if ! git_regular_file_at_head "$file"; then
       printf '%s\n' "$file"
       continue
@@ -16793,8 +16838,26 @@ agent_sdk_unsupported_tests() {
     if (( playwright_status != 1 )); then
       printf '%s\n' "$file"
     fi
-  done < "$inventory"
+  done < "$inventory" || {
+    rm -f "$inventory"
+    return 1
+  }
   rm -f "$inventory"
+  (( read_count == expected_count ))
+}
+
+# Vitest collects src/**/*.test.ts from the working tree. Refuse any entry under
+# src that Git does not track (ignored ones included), say one the build wrote,
+# right before the suite runs. A failed listing returns non-zero.
+agent_sdk_untracked_sources() {
+  local listing
+  listing="$(mktemp)" || return 1
+  if ! git ls-files --others -z -- "$1/src" > "$listing" ||
+    ! tr '\0' '\n' < "$listing"; then
+    rm -f "$listing"
+    return 1
+  fi
+  rm -f "$listing"
 }
 for agent_sdk in agent-sdks/claude agent-sdks/openai; do
   if workspace_changed "$agent_sdk"; then
@@ -16810,6 +16873,15 @@ for agent_sdk in agent-sdks/claude agent-sdks/openai; do
     run_with_validation_budget 900 pnpm --filter "./$agent_sdk" --fail-if-no-match build
     run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match exec tsc --noEmit
     run_with_validation_budget 600 pnpm --filter "./$agent_sdk" --fail-if-no-match lint
+    if ! agent_sdk_untracked="$(agent_sdk_untracked_sources "$agent_sdk")"; then
+      echo "The $agent_sdk untracked-file listing could not be read, so fork PR validation stops." >&2
+      exit 1
+    fi
+    if [[ -n "$agent_sdk_untracked" ]]; then
+      echo "These $agent_sdk source entries are not tracked by Git, so its suite does not run:" >&2
+      printf '%s\n' "$agent_sdk_untracked" >&2
+      exit 1
+    fi
     run_with_validation_budget 900 \
       env OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY= \
       pnpm --dir "$agent_sdk" exec vitest run --reporter=dot
