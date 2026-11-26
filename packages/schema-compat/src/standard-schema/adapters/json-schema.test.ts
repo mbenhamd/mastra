@@ -371,9 +371,25 @@ describe('json-schema standard-schema adapter', () => {
           'patternProperties',
           '/properties/a/patternProperties',
         ],
-        [{ anyOf: [{ not: { type: 'string' } }] }, 'not', '/anyOf/0/not'],
+        // The subschema under `not` is held to the same list.
+        [{ anyOf: [{ not: { else: {} } }] }, 'else', '/anyOf/0/not/else'],
         [{ $defs: { A: { $anchor: 'a' } } }, '$anchor', '/$defs/A/$anchor'],
         [{ properties: { a: { type: 'string', id: 'x' } } }, 'id', '/properties/a/id'],
+        // Fork main's Ajv compared these differently: a float step, and duplicates of "__proto__".
+        [{ type: 'integer', multipleOf: 1 }, 'multipleOf', '/multipleOf'],
+        [{ items: { type: 'string' }, uniqueItems: true }, 'uniqueItems', '/uniqueItems'],
+        // Under 2020-12 too: Ajv2020 marked evaluated items and properties its own way.
+        [{ $schema: 'https://json-schema.org/draft/2020-12/schema', contains: true }, 'contains', '/contains'],
+        [
+          { $schema: 'https://json-schema.org/draft/2020-12/schema', unevaluatedProperties: false },
+          'unevaluatedProperties',
+          '/unevaluatedProperties',
+        ],
+        [
+          { $schema: 'https://json-schema.org/draft/2020-12/schema', dependentSchemas: { a: true } },
+          'dependentSchemas',
+          '/dependentSchemas',
+        ],
       ];
       for (const [schema, keyword, pointer] of cases) {
         expect(await validate(schema)).toEqual(refused(keyword, pointer, 'is not a supported keyword'));
@@ -383,8 +399,13 @@ describe('json-schema standard-schema adapter', () => {
     it('refuses a listed keyword whose value has the wrong type', async () => {
       const cases: Case[] = [
         [{ type: 'number', minimum: 5, exclusiveMinimum: true }, 'exclusiveMinimum', '/exclusiveMinimum'],
-        [{ multipleOf: 0.01 }, 'multipleOf', '/multipleOf'],
+        [{ minLength: 1.5 }, 'minLength', '/minLength'],
         [{ required: true }, 'required', '/required'],
+        [
+          { $schema: 'https://json-schema.org/draft/2020-12/schema', dependentRequired: { x: null } },
+          'dependentRequired',
+          '/dependentRequired',
+        ],
         [{ enum: [] }, 'enum', '/enum'],
       ];
       for (const [schema, keyword, pointer] of cases) {
@@ -406,6 +427,74 @@ describe('json-schema standard-schema adapter', () => {
       expect(await validate(nestedId)).toEqual(refused('$id', '/properties/a/$id', 'is only supported at the root'));
     });
 
+    it('refuses what fork main\'s Ajv threw on while compiling a listed keyword', async () => {
+      const s2020 = 'https://json-schema.org/draft/2020-12/schema';
+      expect(await validate({ $schema: s2020, $id: s2020 })).toEqual(
+        refused('$id', '/$id', "names a schema fork main's Ajv had already registered"),
+      );
+      expect(await validate({ enum: [{ a: 1, b: 2 }, { b: 2, a: 1 }] })).toEqual(
+        refused('enum', '/enum', 'repeats a member, which the draft-07 metaschema refuses'),
+      );
+      expect(await validate({ $schema: s2020, enum: [0, 0] }, 0)).toEqual({ value: 0 });
+      expect(await validate({ 'x-a': { $anchor: '!' } })).toEqual(
+        refused('$anchor', '/x-a/$anchor', "is not an anchor fork main's Ajv accepted"),
+      );
+      expect(
+        await validate({ 'x-a': { $id: 'https://example.test/s' }, example: { $id: 'https://example.test/s' } }),
+      ).toEqual(refused('$id', '/example/$id', "names an ID or anchor fork main's Ajv had already seen"));
+      // Each dialect's Ajv had registered its own metaschema IDs, and only those.
+      expect(await validate({ $schema: s2020, 'x-a': { $id: `${s2020}#` } })).toEqual(
+        refused('$id', '/x-a/$id', "names an ID or anchor fork main's Ajv had already seen"),
+      );
+      expect(await validate({ 'x-a': { $id: 'http://json-schema.org/draft-07/schema' } })).toEqual(
+        refused('$id', '/x-a/$id', "names an ID or anchor fork main's Ajv had already seen"),
+      );
+      expect(await validate({ 'x-a': { $id: s2020 } })).toEqual({ value: {} });
+      expect(await validate({ $defs: { $id: true, A: true }, $ref: '#/$defs/A' })).toEqual(
+        refused('$defs', '/$defs/$id', 'names a member "$id", which fork main\'s Ajv read as the scope of a "$ref" into "$defs"'),
+      );
+      // Ajv walked no annotation under a skipped keyword, and no valid anchor that appears once.
+      expect(await validate({ default: { $anchor: '!' }, 'x-a': { $anchor: 'a' } })).toEqual({ value: {} });
+    });
+
+    it('applies not in both dialects and refuses a loop through it', async () => {
+      const combined = {
+        type: 'object',
+        properties: { cpuCount: { type: 'integer' }, memoryMb: { type: 'integer' } },
+        not: { required: ['cpuCount', 'memoryMb'], properties: { cpuCount: { const: 8 }, memoryMb: { const: 512 } } },
+      };
+      for (const schema of [combined, { $schema: 'https://json-schema.org/draft/2020-12/schema', ...combined }]) {
+        expect(await validate(schema, { cpuCount: 8, memoryMb: 2048 })).toEqual({ value: { cpuCount: 8, memoryMb: 2048 } });
+        expect(await validate(schema, { cpuCount: 8, memoryMb: 512 })).toHaveProperty('issues');
+      }
+      expect(await validate({ $defs: { A: { not: { $ref: '#/$defs/A' } } }, $ref: '#/$defs/A' })).toEqual(
+        refused('$ref', '/$defs/A/not/$ref', 'comes back to the same schema at the same value'),
+      );
+    });
+
+    it('validates a draft-07 tuple and ignores a nested $schema, as fork main did', async () => {
+      const tuple = { type: 'array', items: [{ type: 'string' }, { type: 'integer' }], additionalItems: false };
+      expect(await validate(tuple, ['a', 1])).toEqual({ value: ['a', 1] });
+      expect(await validate(tuple, ['a', 1, 2])).toHaveProperty('issues');
+      expect(await validate(tuple, [1, 'a'])).toHaveProperty('issues');
+      expect(await validate({ items: [] }, [])).toEqual(refused('items', '/items', 'has a value of the wrong type'));
+      expect(
+        await validate({ $schema: 'https://json-schema.org/draft/2020-12/schema', items: [{ type: 'string' }] }, ['a']),
+      ).toEqual(refused('schema', '/items', 'is not a JSON object or boolean'));
+      // A workflow's converted input schema keeps its own $schema; the root's dialect applies.
+      const nested = {
+        type: 'object',
+        properties: {
+          inputData: { $schema: 'https://json-schema.org/draft/2019-09/schema', type: 'object', required: ['t'] },
+        },
+      };
+      expect(await validate(nested, { inputData: { t: 1 } })).toEqual({ value: { inputData: { t: 1 } } });
+      expect(await validate(nested, { inputData: {} })).toHaveProperty('issues');
+      expect(await validate({ properties: { a: { $schema: 5 } } })).toEqual(
+        refused('$schema', '/properties/a/$schema', 'is not a draft-07 or 2020-12 $schema at the root'),
+      );
+    });
+
     it('validates a 2020-12 schema with the keywords fork main checked with Ajv2020', async () => {
       const schema = {
         $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -414,7 +503,7 @@ describe('json-schema standard-schema adapter', () => {
         $defs: { leaf: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], items: false } },
         properties: { value: { anyOf: [{ $ref: '#/$defs/leaf' }, { type: 'null' }] } },
         required: ['value'],
-        unevaluatedProperties: false,
+        additionalProperties: false,
       };
       expect(await validate(schema, { value: ['a', 1] })).toEqual({ value: { value: ['a', 1] } });
       expect(await validate(schema, { value: ['a', 1, true] })).toHaveProperty('issues');
@@ -457,6 +546,13 @@ describe('json-schema standard-schema adapter', () => {
       );
       expect(await validate({ required: ['toString'] })).toEqual(
         refused('required', '/required', 'names a property like an Object prototype key'),
+      );
+      // Ajv's generated code read every inherited member, not only the four its equality reads.
+      expect(await validate({ properties: { hasOwnProperty: false } })).toEqual(
+        refused('properties', '/properties/hasOwnProperty', 'names a member like an Object prototype key'),
+      );
+      expect(await validate({ oneOf: [true, { required: ['isPrototypeOf'] }] })).toEqual(
+        refused('required', '/oneOf/1/required', 'names a property like an Object prototype key'),
       );
       expect(await validate({ const: { constructor: {} } })).toEqual(
         refused('const', '/const', 'holds an object key like an Object prototype key'),
@@ -511,82 +607,6 @@ describe('json-schema standard-schema adapter', () => {
         { message: 'Property "extra" does not match additional properties schema.', path: [] },
       ],
     });
-  });
-
-  describe('uniqueItems', () => {
-    const schema = toStandardSchema({
-      type: 'object',
-      properties: {
-        tags: { $ref: '#/$defs/Tags' },
-        nested: { type: 'object', properties: { ids: { type: 'array', uniqueItems: true } } },
-      },
-      $defs: { Tags: { type: 'array', items: { type: 'string' }, uniqueItems: true } },
-    } as JSONSchema7);
-    const validate = async (value: unknown) => {
-      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
-      return schema['~standard'].validate(value);
-    };
-
-    it('refuses a duplicate behind a $ref, naming the first value that repeats and its next index', async () => {
-      expect(await validate({ tags: ['a', 'b', 'b', 'a'] })).toEqual({
-        issues: [{ message: 'Duplicate items at indexes 0 and 3.', path: ['tags'] }],
-      });
-    });
-
-    it('accepts distinct items, including values that differ only in type', async () => {
-      expect(await validate({ tags: ['a', 'b'] })).toEqual({ value: { tags: ['a', 'b'] } });
-      expect(await validate({ nested: { ids: ['1', 1, true, null] } })).toEqual({
-        value: { nested: { ids: ['1', 1, true, null] } },
-      });
-    });
-
-    it('refuses equal numbers, nulls and objects in a nested array', async () => {
-      for (const ids of [
-        [1, 1.0],
-        [null, null],
-        [{ a: [1] }, { a: [1] }],
-        [
-          { a: 1, b: [2] },
-          { b: [2], a: 1 },
-        ],
-      ]) {
-        expect(await validate({ nested: { ids } })).toEqual({
-          issues: [{ message: 'Duplicate items at indexes 0 and 1.', path: ['nested', 'ids'] }],
-        });
-      }
-    });
-
-    it('finds a duplicate in an array that mixes strings and objects', async () => {
-      expect(await validate({ nested: { ids: ['a', { x: 1 }, 'b', { x: 1 }] } })).toEqual({
-        issues: [{ message: 'Duplicate items at indexes 1 and 3.', path: ['nested', 'ids'] }],
-      });
-      expect(await validate({ nested: { ids: ['a', { x: 1 }, 'a', { x: 1 }] } })).toEqual({
-        issues: [{ message: 'Duplicate items at indexes 0 and 2.', path: ['nested', 'ids'] }],
-      });
-    });
-
-    it('checks strings and objects in time that grows linearly with their count', async () => {
-      // One array of 16,000 items, half strings and half objects, against 16 arrays
-      // of 1,000. A linear check costs about the same for both; the pairwise check
-      // costs 16 times more for the long one. The fastest of five interleaved rounds
-      // keeps a loaded host from deciding.
-      const item = (prefix: string, i: number) => (i % 2 === 0 ? `${prefix}${i}` : { id: `${prefix}${i}`, n: [i] });
-      const long = { nested: { ids: Array.from({ length: 16_000 }, (_, i) => item('t', i)) } };
-      const short = Array.from({ length: 16 }, (_, n) => ({
-        nested: { ids: Array.from({ length: 1_000 }, (_, i) => item(`t${n}-`, i)) },
-      }));
-      let longBest = Infinity;
-      let shortBest = Infinity;
-      for (let round = 0; round < 5; round++) {
-        let start = performance.now();
-        expect('value' in (await validate(long))).toBe(true);
-        longBest = Math.min(longBest, performance.now() - start);
-        start = performance.now();
-        for (const value of short) expect('value' in (await validate(value))).toBe(true);
-        shortBest = Math.min(shortBest, performance.now() - start);
-      }
-      expect(longBest / shortBest).toBeLessThan(6);
-    }, 120_000);
   });
 
   describe('isStandardSchemaWithJSON', () => {
