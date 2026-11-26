@@ -412,13 +412,13 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
  * applicators and other references, points nowhere or at a value that is not a schema. The
  * validator would otherwise throw only for a value that reaches the reference. Ajv refused most
  * of these when compiling; this also refuses them where fork main's draft-07 Ajv compiled them.
- * Definitions no reference uses, `then` and `else` without `if`, and `additionalItems` without
- * an array `items` are not read, as the validator does not read them.
+ * Definitions no reference uses, `then` and `else` without `if`, `additionalItems` without an
+ * array `items`, and `unevaluatedProperties` beside `additionalProperties` are not read, as the
+ * validator does not read them.
  */
 function refuseUnresolvedReferences(root: unknown): void {
   const seen = new Set<object>();
-  let unevaluatedPropertiesAt: string | undefined;
-  let schemaDependencyAt: string | undefined;
+  const unevaluatedPropertiesHolders: Array<[Record<string, unknown>, string]> = [];
   const pending: Array<[unknown, string]> = [[root, '']];
   while (pending.length > 0) {
     const [node, pointer] = pending.pop()!;
@@ -449,7 +449,8 @@ function refuseUnresolvedReferences(root: unknown): void {
       const at = `${pointer}/${pointerToken(key)}`;
       if (
         ((key === 'then' || key === 'else') && record.if === undefined) ||
-        (key === 'additionalItems' && !Array.isArray(record.items))
+        (key === 'additionalItems' && !Array.isArray(record.items)) ||
+        (key === 'unevaluatedProperties' && record.additionalProperties !== undefined)
       ) {
         continue;
       }
@@ -470,23 +471,63 @@ function refuseUnresolvedReferences(root: unknown): void {
           if (isPlainObject(item) || (Array.isArray(value) && typeof item === 'object' && item !== null)) {
             pending.push([item, `${at}/${pointerToken(name)}`]);
           }
-          if (key === 'dependencies' && !Array.isArray(item) && (isPlainObject(item) || typeof item === 'boolean')) {
-            schemaDependencyAt ??= `${at}/${pointerToken(name)}`;
-          }
         }
       }
       if (key === 'unevaluatedProperties') {
-        unevaluatedPropertiesAt ??= at;
+        unevaluatedPropertiesHolders.push([record, pointer]);
       }
     }
   }
-  // The validator checks a schema-valued `dependencies` entry without recording the properties it
-  // evaluates, so `unevaluatedProperties` would refuse them, and under `oneOf` or `not` accept
-  // what Ajv refused. Such a schema is refused (`dependentSchemas` records them).
-  if (unevaluatedPropertiesAt !== undefined && schemaDependencyAt !== undefined) {
-    throw new Error(
-      `a schema-valued "dependencies" entry at "${schemaDependencyAt}" beside "unevaluatedProperties" at "${unevaluatedPropertiesAt}" is not supported: the validator does not record the properties it evaluates, so the schema is refused; use "dependentSchemas"`,
-    );
+  for (const [holder, holderPointer] of unevaluatedPropertiesHolders) {
+    refuseUnrecordedDependencies(root, holder, holderPointer);
+  }
+}
+
+/**
+ * The validator checks a schema-valued `dependencies` entry without recording the properties it
+ * evaluates, so an `unevaluatedProperties` that reads the same object, beside it or through
+ * in-place applicators and references, would refuse them, and under `oneOf` or `not` accept what
+ * Ajv refused. Such a schema is refused (`dependentSchemas` records them). Subschemas applied to
+ * another instance location, such as under `properties` or `items`, are not followed.
+ */
+function refuseUnrecordedDependencies(root: unknown, holder: Record<string, unknown>, holderPointer: string): void {
+  const seen = new Set<object>();
+  const pending: Array<[unknown, string]> = [[holder, holderPointer]];
+  while (pending.length > 0) {
+    const [node, pointer] = pending.pop()!;
+    if (!isPlainObject(node) || seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+    const record = node as Record<string, unknown>;
+    const dependencies = record.dependencies;
+    if (isPlainObject(dependencies)) {
+      for (const [name, entry] of Object.entries(dependencies)) {
+        if (isPlainObject(entry) || typeof entry === 'boolean') {
+          throw new Error(
+            `a schema-valued "dependencies" entry at "${pointer}/dependencies/${pointerToken(name)}" beside "unevaluatedProperties" at "${holderPointer}/unevaluatedProperties" is not supported: the validator does not record the properties it evaluates, so the schema is refused; use "dependentSchemas"`,
+          );
+        }
+      }
+    }
+    if (typeof record.$ref === 'string') {
+      pending.push([record.$ref === '#' ? root : resolveByPointer({ '': root }, record.$ref), record.$ref.slice(1)]);
+    }
+    for (const key of ['allOf', 'anyOf', 'oneOf'] as const) {
+      const branches = record[key];
+      if (Array.isArray(branches)) {
+        branches.forEach((branch, index) => pending.push([branch, `${pointer}/${key}/${index}`]));
+      }
+    }
+    pending.push([record.not, `${pointer}/not`]);
+    if (record.if !== undefined) {
+      pending.push([record.if, `${pointer}/if`], [record.then, `${pointer}/then`], [record.else, `${pointer}/else`]);
+    }
+    if (isPlainObject(record.dependentSchemas)) {
+      for (const [name, entry] of Object.entries(record.dependentSchemas as Record<string, unknown>)) {
+        pending.push([entry, `${pointer}/dependentSchemas/${pointerToken(name)}`]);
+      }
+    }
   }
 }
 

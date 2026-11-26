@@ -978,6 +978,9 @@ describe('json-schema standard-schema adapter', () => {
       oneOf: [true, { dependencies: { x: { properties: { x: true } } }, unevaluatedProperties: false }],
     } as unknown as JSONSchema7);
     const alone = toStandardSchema({ dependencies: { x: { required: ['y'] } } } as unknown as JSONSchema7);
+    const apart = toStandardSchema({
+      properties: { left: { dependencies: { x: { required: ['y'] } } }, right: { unevaluatedProperties: false } },
+    } as unknown as JSONSchema7);
     if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
     expect(await together['~standard'].validate({ x: 1 })).toEqual({
@@ -989,6 +992,7 @@ describe('json-schema standard-schema adapter', () => {
       ],
     });
     expect(await alone['~standard'].validate({ x: 1, y: 2 })).toEqual({ value: { x: 1, y: 2 } });
+    expect(await apart['~standard'].validate({})).toEqual({ value: {} });
   });
 
   it('refuses a reachable $ref to a value that is not a schema', async () => {
@@ -1017,7 +1021,17 @@ describe('json-schema standard-schema adapter', () => {
       { items: { type: 'number' }, additionalItems: { $ref: '#/missing' } },
       [1],
     ],
-  ])('accepts a dangling $ref under %s, which the validator never reads', async (_label, schema, value) => {
+    [
+      'unevaluatedProperties beside additionalProperties',
+      {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        additionalProperties: true,
+        unevaluatedProperties: { $ref: '#/default' },
+        default: 'note',
+      },
+      { x: 1 },
+    ],
+  ])('accepts a dangling or non-schema $ref under %s, which the validator never reads', async (_label, schema, value) => {
     const standardSchema = toStandardSchema(schema as unknown as JSONSchema7);
     if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
 
