@@ -79,6 +79,7 @@ import {
   validateToolOutput,
   validateToolSuspendData,
 } from '../validation';
+import type { ValidationError } from '../validation';
 
 // Built once: `.describe()` registers schemas in Zod's global registry, which is a
 // strong Map under zod@3.25.x's `zod/v4` shim, so per-build copies would leak.
@@ -94,6 +95,30 @@ const resumeFieldsZodShape = {
  */
 export type ToolToConvert = VercelTool | ToolAction<any, any, any> | VercelToolV5 | ProviderDefinedTool;
 export type LogType = 'tool' | 'toolset' | 'client-tool';
+
+/**
+ * True when a validation refusal names exactly one field, `key` at the top level,
+ * with no root or nested errors, and the input object has no value for it.
+ */
+function isOnlyAbsentTopLevelField(error: ValidationError, input: unknown, key: string): boolean {
+  const { errors, fields } = error.validationErrors as {
+    errors: string[];
+    fields: Record<string, { errors: string[]; fields: Record<string, unknown> }>;
+  };
+  const keys = Object.keys(fields ?? {});
+  const field = fields?.[key];
+  return (
+    errors.length === 0 &&
+    keys.length === 1 &&
+    keys[0] === key &&
+    field !== undefined &&
+    Object.keys(field.fields ?? {}).length === 0 &&
+    input !== null &&
+    typeof input === 'object' &&
+    !Array.isArray(input) &&
+    (input as Record<string, unknown>)[key] === undefined
+  );
+}
 
 const schemasWithoutNativeInputValidation = new WeakSet<object>();
 
@@ -1151,17 +1176,25 @@ export class CoreToolBuilder extends MastraBase {
             args,
             options.name,
           );
-          //suspendedToolRunId is only required when resumeData is provided
-          const suspendedToolRunIdErrToIgnore =
-            error?.message?.includes('suspendedToolRunId: Required') &&
-            (args as Record<string, unknown>)?.resumeData === undefined;
-          if (error && !suspendedToolRunIdErrToIgnore) {
+          // suspendedToolRunId is only needed when resuming. The one refusal
+          // ignored is the builder's own injected top-level key being absent on a
+          // call that is not resuming; the raw args then run unchanged.
+          const ignoresAbsentInjectedRunId =
+            error !== undefined &&
+            this.isResumableTool &&
+            this.injectedInputSchema !== undefined &&
+            !isResuming &&
+            (args as Record<string, unknown> | undefined)?.resumeData === undefined &&
+            isOnlyAbsentTopLevelField(error, args, 'suspendedToolRunId');
+          if (error && !ignoresAbsentInjectedRunId) {
             logger.warn('Tool input validation failed', logData);
             toolSpan?.end({ output: { error: true }, attributes: { success: false } });
             return error;
           }
-          // Use validated/transformed data
-          args = data;
+          if (!ignoresAbsentInjectedRunId) {
+            // Use validated/transformed data
+            args = data;
+          }
         } else {
           // Best-effort normalization on resume: replayed args keep the provider's
           // raw shape (OpenAI strict compat materializes .optional() fields as null),

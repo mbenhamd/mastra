@@ -8,3 +8,7 @@ Agent tool calls now also handle fallbacks like `validateToolInput`:
 
 - A `prompt` alias (such as `query`) that comes with a `null` optional field is now accepted. When the alias retry fails, the error lists that retry's faults.
 - The stringified-JSON coercion and the null retry build on each other. This applies only where the tool's own Zod schema is validated: models with no compat layer (such as Grok via OpenRouter), tools built with `strict: false` (which get no compat layer on any model), and the approval check. On Anthropic and Gemini, agent tool calls validate a compat schema, which is never coerced.
+
+A tool whose schema validates asynchronously (for example a Zod schema with an async refinement) keeps the earlier agent tool-call fallbacks, so it accepts nothing it refused before.
+
+A resumable tool (agent or workflow as a tool) now skips only its own top-level `suspendedToolRunId` when that key is absent on a call that is not resuming, and the call runs with its arguments. A missing `suspendedToolRunId` nested inside the tool's own input is refused like any other missing field.
