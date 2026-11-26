@@ -847,6 +847,18 @@ describe('json-schema standard-schema adapter', () => {
         '$recursiveAnchor at "/default/$recursiveAnchor"',
       ],
       [
+        'a keyword that a $ref in a named member of an array-valued properties reaches',
+        (() => {
+          const entry = { $ref: '#/default' };
+          return {
+            properties: Object.assign([], { item: entry }),
+            'x-entry': entry,
+            default: { $recursiveAnchor: true, type: 'string' },
+          };
+        })(),
+        '$recursiveAnchor at "/default/$recursiveAnchor"',
+      ],
+      [
         'an object-valued $ref in data the dereference also walks',
         { $ref: '#/x/properties', x: { properties: { const: { example: { $ref: {} } } } } },
         '$ref that is not a string at "/x/properties/const/example/$ref"',
@@ -941,6 +953,42 @@ describe('json-schema standard-schema adapter', () => {
       ],
     });
     expect(await unused['~standard'].validate({})).toEqual({ value: {} });
+  });
+
+  it('names the index of a dangling $ref in a sparse object-valued prefixItems', async () => {
+    const standardSchema = toStandardSchema({
+      type: 'array',
+      prefixItems: { length: 2, 1: { $ref: '#/missing' } },
+    } as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await standardSchema['~standard'].validate([1, 2])).toEqual({
+      issues: [
+        {
+          message:
+            'Schema validation error: $ref "#/missing" at "/prefixItems/1/$ref" does not resolve within the schema, so the schema is refused',
+        },
+      ],
+    });
+  });
+
+  it('refuses a schema-valued dependencies entry beside unevaluatedProperties, which Ajv evaluated together', async () => {
+    const together = toStandardSchema({
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      oneOf: [true, { dependencies: { x: { properties: { x: true } } }, unevaluatedProperties: false }],
+    } as unknown as JSONSchema7);
+    const alone = toStandardSchema({ dependencies: { x: { required: ['y'] } } } as unknown as JSONSchema7);
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
+
+    expect(await together['~standard'].validate({ x: 1 })).toEqual({
+      issues: [
+        {
+          message:
+            'Schema validation error: a schema-valued "dependencies" entry at "/oneOf/1/dependencies/x" beside "unevaluatedProperties" at "/oneOf/1/unevaluatedProperties" is not supported: the validator does not record the properties it evaluates, so the schema is refused; use "dependentSchemas"',
+        },
+      ],
+    });
+    expect(await alone['~standard'].validate({ x: 1, y: 2 })).toEqual({ value: { x: 1, y: 2 } });
   });
 
   it('refuses a reachable $ref to a value that is not a schema', async () => {

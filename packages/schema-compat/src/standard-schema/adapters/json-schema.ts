@@ -279,12 +279,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 type Role = 'schema' | 'names' | 'data' | 'weak' | 'weak-names' | 'weak-data';
 
-/** The values the validator reads from an object-valued `prefixItems`: indices below `length`. */
-function prefixItemsRead(value: Record<string, unknown>): unknown[] {
+/**
+ * The entries the validator reads from an object-valued `prefixItems`: indices below `length`,
+ * each with its key.
+ */
+function prefixItemsRead(value: Record<string, unknown>): Array<[string, unknown]> {
   const length = Number(value.length);
-  return Object.keys(value)
-    .filter(key => /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < length)
-    .map(key => value[key]);
+  return Object.entries(value).filter(([key]) => /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < length);
 }
 
 /**
@@ -333,9 +334,11 @@ function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) =
       if (DATA_KEYWORDS.has(key)) {
         walk(value, role === 'schema' ? 'data' : 'weak-data');
       } else if (role === 'schema' && SCHEMA_MAP_KEYWORD_SET.has(key) && Array.isArray(value)) {
-        // The validator reads an array-valued name map item by item (`for...in`), so its items are
-        // schemas; the dereference skips it.
-        walk(value, 'schema');
+        // The validator reads an array-valued name map member by member (`for...in` or
+        // `Object.entries`, named members included), so its members are schemas; the dereference
+        // skips it.
+        mark(value, 'schema');
+        Object.values(value).forEach(item => walk(item, 'schema'));
       } else if (SCHEMA_MAP_KEYWORD_SET.has(key)) {
         walk(value, role === 'schema' ? 'names' : 'weak-names');
       } else if (
@@ -347,7 +350,7 @@ function assignRoles(root: unknown, targetsOf: (node: Record<string, unknown>) =
         // The validator reads an object-valued `prefixItems` item by item through its `length`
         // (`$prefixItems[i]`), so the values at its indices below `length` are schemas; the
         // dereference walks the object itself as an unknown keyword's value.
-        prefixItemsRead(value).forEach(item => walk(item, 'schema'));
+        prefixItemsRead(value).forEach(([, item]) => walk(item, 'schema'));
         walk(value, 'weak');
       } else {
         walk(value, 'weak');
@@ -414,6 +417,8 @@ function referenceTargets(node: Record<string, unknown>, lookup: Lookup): unknow
  */
 function refuseUnresolvedReferences(root: unknown): void {
   const seen = new Set<object>();
+  let unevaluatedPropertiesAt: string | undefined;
+  let schemaDependencyAt: string | undefined;
   const pending: Array<[unknown, string]> = [[root, '']];
   while (pending.length > 0) {
     const [node, pointer] = pending.pop()!;
@@ -451,19 +456,37 @@ function refuseUnresolvedReferences(root: unknown): void {
       if (SUBSCHEMA_KEYWORDS.has(key) || (SUBSCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value))) {
         pending.push([value, at]);
       } else if (key === 'prefixItems' && isPlainObject(value)) {
-        pending.push([prefixItemsRead(value), at]);
-      } else if (SCHEMA_MAP_KEYWORD_SET.has(key) && key !== '$defs' && key !== 'definitions') {
-        if (Array.isArray(value)) {
-          pending.push([value, at]);
-        } else if (isPlainObject(value)) {
-          for (const [name, item] of Object.entries(value)) {
-            if (isPlainObject(item)) {
-              pending.push([item, `${at}/${pointerToken(name)}`]);
-            }
+        for (const [index, item] of prefixItemsRead(value)) {
+          pending.push([item, `${at}/${index}`]);
+        }
+      } else if (
+        SCHEMA_MAP_KEYWORD_SET.has(key) &&
+        key !== '$defs' &&
+        key !== 'definitions' &&
+        (Array.isArray(value) || isPlainObject(value))
+      ) {
+        // Named members of an array-valued map are read too.
+        for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
+          if (isPlainObject(item) || (Array.isArray(value) && typeof item === 'object' && item !== null)) {
+            pending.push([item, `${at}/${pointerToken(name)}`]);
+          }
+          if (key === 'dependencies' && !Array.isArray(item) && (isPlainObject(item) || typeof item === 'boolean')) {
+            schemaDependencyAt ??= `${at}/${pointerToken(name)}`;
           }
         }
       }
+      if (key === 'unevaluatedProperties') {
+        unevaluatedPropertiesAt ??= at;
+      }
     }
+  }
+  // The validator checks a schema-valued `dependencies` entry without recording the properties it
+  // evaluates, so `unevaluatedProperties` would refuse them, and under `oneOf` or `not` accept
+  // what Ajv refused. Such a schema is refused (`dependentSchemas` records them).
+  if (unevaluatedPropertiesAt !== undefined && schemaDependencyAt !== undefined) {
+    throw new Error(
+      `a schema-valued "dependencies" entry at "${schemaDependencyAt}" beside "unevaluatedProperties" at "${unevaluatedPropertiesAt}" is not supported: the validator does not record the properties it evaluates, so the schema is refused; use "dependentSchemas"`,
+    );
   }
 }
 
