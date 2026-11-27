@@ -11,20 +11,13 @@ export default defineConfig({
     environment: 'node',
     projects: [
       {
-        // Node caches the external @cfworker/json-schema module per process, so these run in fresh forks.
-        test: {
-          name: 'unit:packages/schema-compat:fresh-process',
-          environment: 'node',
-          include: [BLOB_WORKER_TEST],
-          pool: 'forks',
-          isolate: true,
-        },
-      },
-      {
+        // Both need a process that disallows code generation from strings before anything is
+        // imported, and Node caches the external @cfworker/json-schema module per process, so
+        // each runs in a fresh fork.
         test: {
           name: 'unit:packages/schema-compat:no-codegen',
           environment: 'node',
-          include: [NO_CODEGEN_TEST],
+          include: FRESH_PROCESS_TESTS,
           pool: 'forks',
           isolate: true,
           execArgv: ['--disallow-code-generation-from-strings'],

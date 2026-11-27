@@ -80,6 +80,7 @@ import {
   isToolValidationError,
   registerToolOutputValidationSchema,
   ToolSchemaValidationError,
+  refuseUnusableToolOutputSchema,
   validateToolInput,
   validateToolInputAsync,
   validateToolOutput,
@@ -1189,6 +1190,17 @@ export class CoreToolBuilder extends MastraBase {
             logger.warn('Tool resume data validation failed', logData);
             toolSpan?.end({ output: { error: true }, attributes: { success: false } });
             return resumeValidation.error;
+          }
+        }
+
+        // A Vercel/AI SDK tool's output is validated here after it runs, so a tool whose output
+        // schema is refused must not run (Mastra tools check this in Tool.execute).
+        if (isVercelTool(tool)) {
+          const outputSchemaRefusal = refuseUnusableToolOutputSchema(this.getOutputSchema(), options.name);
+          if (outputSchemaRefusal) {
+            logger.warn('Tool output schema refused', logData);
+            toolSpan?.end({ output: { error: true }, attributes: { success: false } });
+            return outputSchemaRefusal;
           }
         }
 

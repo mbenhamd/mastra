@@ -1,7 +1,8 @@
 import type { JSONSchema7 } from 'json-schema';
 import { describe, expect, it } from 'vitest';
 
-import { jsonSchemaValidatorReady, toStandardSchema } from '../../index';
+import { JSON_SCHEMA_REFUSAL, jsonSchemaValidatorReady, toStandardSchema } from '../../index';
+import { toStandardSchema as wrapJsonSchema } from './json-schema';
 
 // vitest.config.ts runs this file in a fresh process started with
 // `--disallow-code-generation-from-strings`, before the adapter is imported.
@@ -43,6 +44,23 @@ describe('JSON Schema adapter where code generation from strings is disallowed',
         { message: 'Instance type "number" is invalid. Expected "string".', path: ['label_ids', 0] },
         { message: '5000 is greater than 500.', path: ['max_results'] },
       ],
+    });
+  });
+
+  it('names why a schema is refused before anything is validated against it', async () => {
+    await jsonSchemaValidatorReady();
+
+    expect(toStandardSchema(gmailFetchEmails)[JSON_SCHEMA_REFUSAL]()).toBeUndefined();
+    expect(toStandardSchema({ not: { type: 'string' } })[JSON_SCHEMA_REFUSAL]()).toBe(
+      'not at "/not" is not a supported keyword, so the schema is refused',
+    );
+    // Only the JSON Schema adapter itself takes options.
+    const withAjvOptions = wrapJsonSchema({ type: 'string' }, { ajvOptions: { coerceTypes: true } });
+    expect(withAjvOptions[JSON_SCHEMA_REFUSAL]()).toBe(
+      'schema at "" is given ajvOptions, and Ajv needs code generation, so the schema is refused',
+    );
+    expect(await withAjvOptions['~standard'].validate('a')).toEqual({
+      issues: [{ message: `Schema validation error: ${withAjvOptions[JSON_SCHEMA_REFUSAL]()}` }],
     });
   });
 });

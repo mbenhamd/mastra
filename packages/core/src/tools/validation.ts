@@ -6,6 +6,7 @@ import {
   standardSchemaToJSONSchema,
   jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
+  JSON_SCHEMA_REFUSAL,
 } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '../schema';
 import { getZodTypeName, isZodArray, isZodObject, unwrapZodType } from '../utils/zod-utils';
@@ -859,6 +860,31 @@ function validateToolOutputUnsafe<T = unknown>(
   });
 
   return { error };
+}
+
+/**
+ * Refuses to run a tool whose output schema is refused. Where code generation from strings is
+ * disallowed, a JSON Schema output schema is compiled here, before the tool runs, so a tool
+ * whose result could never be validated does not perform its action and then report failure.
+ * Where Ajv validates, and for every other kind of schema, this returns `undefined`.
+ */
+export function refuseUnusableToolOutputSchema<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  toolId?: string,
+): ValidationError<T> | undefined {
+  const refusal = runSchemaValidationBoundary(() => {
+    const check = (schema as { [JSON_SCHEMA_REFUSAL]?: () => string | undefined } | undefined)?.[JSON_SCHEMA_REFUSAL];
+    return typeof check === 'function' ? check.call(schema) : undefined;
+  });
+  if (refusal === undefined) {
+    return undefined;
+  }
+  const issues = [{ message: `Schema validation error: ${refusal}` }];
+  return markToolValidationError<T>({
+    error: true,
+    message: `Tool output schema is refused${toolId ? ` for ${toolId}` : ''}, so the tool was not run:\n- root: ${issues[0]!.message}`,
+    validationErrors: buildFormattedErrors<T>(issues),
+  });
 }
 
 /**

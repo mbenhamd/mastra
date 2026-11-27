@@ -22,7 +22,13 @@ import type {
   ToolResultStatus,
   ToolTerminalResultConfig,
 } from './types';
-import { validateToolInput, validateToolOutput, validateToolSuspendData, validateRequestContext } from './validation';
+import {
+  refuseUnusableToolOutputSchema,
+  validateToolInput,
+  validateToolOutput,
+  validateToolSuspendData,
+  validateRequestContext,
+} from './validation';
 
 /**
  * Marker to identify Mastra tools even when `instanceof` fails.
@@ -710,6 +716,12 @@ export class Tool<
           if (resumeValidation.error) {
             return resumeValidation.error as any;
           }
+        }
+
+        // A tool whose output schema is refused does not run (see refuseUnusableToolOutputSchema).
+        const outputSchemaRefusal = refuseUnusableToolOutputSchema(this.outputSchema, this.id);
+        if (outputSchemaRefusal) {
+          return outputSchemaRefusal as any;
         }
 
         // Call the original execute with validated input and organized context

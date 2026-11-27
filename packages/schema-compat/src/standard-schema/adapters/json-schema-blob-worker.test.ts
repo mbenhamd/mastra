@@ -15,6 +15,8 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
+// vitest.config.ts runs this file in a fresh process started with
+// `--disallow-code-generation-from-strings`, so the adapter takes the interpreter path.
 describe('JSON Schema adapter in a blob worker location (validator cannot load)', () => {
   it('imports without throwing and refuses every value instead of passing it unchecked', async () => {
     await jsonSchemaValidatorReady();

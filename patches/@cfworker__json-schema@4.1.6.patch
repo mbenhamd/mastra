@@ -34,7 +34,7 @@ index 1614c8339a4a376e682f09115218c09f9c5ef4f7..45588773b533a9d7d410469ad9ae2e8d
 +        // the adapter validates in 2020-12 mode; read as a URI, a boolean,
 +        // object or array `id` in an annotation such as `example` collided
 +        // with another and refused every value with a duplicate schema URI.
-+        // The adapter refuses a schema using `$id`; only a string is read.
++        // The adapter refuses `$id` except a canonical http(s) root ID; only a string is read.
 +        const id = typeof schema.$id === 'string' ? schema.$id : undefined;
          if (id) {
              const url = resolveURI(id, baseURI);
@@ -737,7 +737,7 @@ index 6d6a72065e53d9566e97eaf1ecd1a3a5f6ca2f5a..4e080f68c734c7c9bea13dcc9395cc71
 +        // the adapter validates in 2020-12 mode; read as a URI, a boolean,
 +        // object or array `id` in an annotation such as `example` collided
 +        // with another and refused every value with a duplicate schema URI.
-+        // The adapter refuses a schema using `$id`; only a string is read.
++        // The adapter refuses `$id` except a canonical http(s) root ID; only a string is read.
 +        const id = typeof schema.$id === 'string' ? schema.$id : undefined;
          if (id) {
              const url = resolveURI(id, baseURI);
