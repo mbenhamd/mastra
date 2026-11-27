@@ -419,6 +419,20 @@ describe('JSON Schema interpreter (code generation disallowed)', () => {
       expect(validate(open, { at: Object.setPrototypeOf([1], class extends Array {}.prototype) })).toEqual(
         valueNotJson(['at'], 'is an array subclass'),
       );
+      expect(validate(open, { at: Object.assign([], { 4294967295: 1 }) })).toEqual(
+        valueNotJson(['at', '4294967295'], 'is an array key that is not an index'),
+      );
+      let deep: unknown = 1;
+      for (let depth = 0; depth < 100_000; depth++) {
+        deep = [deep];
+      }
+      expect(validate({}, deep)).toEqual(
+        valueNotJson(Array<number>(1000).fill(0), 'is nested deeper than 1000 levels'),
+      );
+      // A key with a lone surrogate is plain JSON, but the validator cannot write it into an error location.
+      expect(validate({ additionalProperties: false }, JSON.parse('{"\\ud800":1}'))).toEqual({
+        issues: [{ message: 'The value could not be checked (URI malformed), so it is refused.' }],
+      });
       // A frozen value is plain JSON: neither validator writes to a value.
       const frozen = Object.freeze({ at: Object.freeze([1]) });
       expect(validate(open, frozen)).toEqual({ value: frozen });
@@ -445,6 +459,9 @@ describe('JSON Schema interpreter (code generation disallowed)', () => {
         shared = { a: shared, b: shared };
       }
       expect(validate({ type: 'object' }, shared)).toEqual({ value: shared });
+      // Under `const`, every key of the value is scanned for prototype names, also once per object.
+      const schema = { type: 'object', properties: { status: { const: 'sent' } } };
+      expect(validate(schema, { status: 'sent', meta: shared })).toEqual({ value: { status: 'sent', meta: shared } });
     });
 
     it('reads the schema once, when it is wrapped, so a later change does not reach validation', () => {

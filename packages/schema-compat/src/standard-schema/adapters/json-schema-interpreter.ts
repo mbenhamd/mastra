@@ -329,7 +329,7 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
  * - a loop of `$ref`, `allOf`, `anyOf` or `oneOf` that comes back to the same schema at the
  *   same value.
  * Literal data under `const`, `enum`, `default`, `examples` and annotations is not read as a
- * schema. The schema is checked as given, before it is copied, so an inherited keyword counts.
+ * schema. The schema checked is the plain-JSON snapshot, so every keyword is an own data key.
  * Returns whether the schema compares values (`const` or `enum`).
  */
 function refuseUnlistedSchema(root: unknown): { comparesValues: boolean } {
@@ -661,6 +661,9 @@ const isProxy: (value: object) => boolean = (() => {
   return typeof check === 'function' ? (value: object) => check(value) : () => false;
 })();
 
+/** The deepest nesting a schema or value snapshot holds; deeper is refused as not plain JSON. */
+export const MAX_JSON_DEPTH = 1000;
+
 /** Why a value or schema is not plain JSON, and where. */
 export class NotPlainJsonError extends Error {
   readonly path: Array<string | number>;
@@ -692,6 +695,9 @@ export class NotPlainJsonError extends Error {
  *   changed the value. An object member whose value is `undefined` is kept: the patched
  *   validator handles it as Ajv did (absent for `properties` and `required`, present for
  *   `additionalProperties` and the property counts). Model output can hold one.
+ *
+ * Nesting deeper than {@link MAX_JSON_DEPTH} levels is refused, so a deep value is reported as an
+ * issue instead of exhausting the stack.
  */
 export function plainJsonSnapshot(value: unknown, kind: 'schema' | 'value'): unknown {
   const open = new Set<object>();
@@ -722,6 +728,9 @@ export function plainJsonSnapshot(value: unknown, kind: 'schema' | 'value'): unk
     if (open.has(node)) {
       throw new NotPlainJsonError(path, 'is part of a cycle');
     }
+    if (path.length >= MAX_JSON_DEPTH) {
+      throw new NotPlainJsonError(path, `is nested deeper than ${MAX_JSON_DEPTH} levels`);
+    }
     if (copies.has(node)) {
       if (kind === 'schema') {
         throw new NotPlainJsonError(path, 'is an object reached through more than one reference');
@@ -747,7 +756,10 @@ export function plainJsonSnapshot(value: unknown, kind: 'schema' | 'value'): unk
       const list = node as unknown[];
       const items: unknown[] = [];
       for (const key of keys) {
-        if (key !== 'length' && (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key))) {
+        if (
+          key !== 'length' &&
+          (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= list.length)
+        ) {
           throw new NotPlainJsonError([...path, String(key)], 'is an array key that is not an index');
         }
       }
@@ -804,8 +816,14 @@ export function plainJsonSnapshot(value: unknown, kind: 'schema' | 'value'): unk
  * `__proto__`), or `undefined`. Ajv's equality compared constructors and read those keys, and this
  * validator's does not. It is checked over the whole value, not only where it is compared.
  */
-function equalityNameLocation(value: unknown, path: Array<string | number> = []): Array<string | number> | undefined {
-  if (typeof value !== 'object' || value === null) {
+function equalityNameLocation(
+  value: unknown,
+  path: Array<string | number> = [],
+  passed: Set<object> = new Set(),
+): Array<string | number> | undefined {
+  // A value snapshot shares an object reached through two references; one that passed once is
+  // not scanned again, so the scan stays linear in the size of the value.
+  if (typeof value !== 'object' || value === null || passed.has(value)) {
     return undefined;
   }
   for (const [key, member] of Object.entries(value)) {
@@ -813,11 +831,12 @@ function equalityNameLocation(value: unknown, path: Array<string | number> = [])
     if (!Array.isArray(value) && EQUALITY_NAMES.has(key)) {
       return at;
     }
-    const found = equalityNameLocation(member, at);
+    const found = equalityNameLocation(member, at, passed);
     if (found !== undefined) {
       return found;
     }
   }
+  passed.add(value);
   return undefined;
 }
 
@@ -1078,7 +1097,15 @@ export class InterpretedJsonSchema {
         };
       }
     }
-    const result = this.#validator!.validate(snapshot);
+    let result: ReturnType<Validator['validate']>;
+    try {
+      result = this.#validator!.validate(snapshot);
+    } catch (error) {
+      // For example a stack overflow under a recursive schema, or a key holding a lone surrogate
+      // that the validator cannot write into an error location. The value is refused as an issue.
+      const reason = error instanceof Error ? error.message : 'unknown error';
+      return { issues: [{ message: `The value could not be checked (${reason}), so it is refused.` }] };
+    }
     if (result.valid) {
       return { value: value as Output };
     }

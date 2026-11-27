@@ -293,7 +293,7 @@ describe('json-schema standard-schema adapter', () => {
   });
 
   describe('where code generation is allowed', () => {
-    it('validates with Ajv as before, loads no interpreter and reports no refusal', async () => {
+    it('validates with Ajv as before, with no interpreter load pending and no refusal', async () => {
       // `not` is outside the interpreter's allow-list, and Ajv still checks it here.
       const wrapper = toStandardSchema({ not: { type: 'string' } });
 

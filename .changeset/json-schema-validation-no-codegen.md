@@ -36,22 +36,9 @@ In this path:
 - **A schema given `ajvOptions` is refused**, because those options need Ajv.
 - **Messages are the interpreter's own**, for example `5000 is greater than 500.` Issue paths mostly match Ajv's. They differ for `propertyNames`, for a tuple with too many items, and for `additionalProperties` set to a schema.
 - **The new `JSON_SCHEMA_REFUSAL` symbol names a method on each wrapped schema.** In this path, the method returns why the schema is refused, or `undefined`. Where Ajv validates, it always returns `undefined`.
-- **Large values take longer to check**, because the schema is interpreted rather than compiled. A valid 34 MB value with 800,000 rows took about 1.5 to 8 seconds; Ajv took about 25 to 350 ms. A value nested about 200 levels deep under a recursive schema ends in `Maximum call stack size exceeded`, and the value is refused.
+- **Large values take longer to check**, because the schema is interpreted rather than compiled. A valid 34 MB value with 800,000 rows took about 1.5 to 8 seconds; Ajv took about 25 to 350 ms. A value nested more than 1,000 levels deep is refused. Under a recursive schema, a value nested about 200 levels deep exhausts the stack, and the value is refused with an issue.
 
-The patch to `@cfworker/json-schema` is `patches/@cfworker__json-schema@4.1.6.patch`, listed under `patchedDependencies` in `pnpm-workspace.yaml`. It changes validation as follows:
-
-- An object property whose value is `undefined` counts as absent for `required`, `dependentRequired` and `properties`. It counts as present for `additionalProperties`, `propertyNames` and the property counts, as with Ajv. An `undefined` value matches no `type`.
-- `anyOf` stops at the first branch that passes, as Ajv did. `anyOf` and `oneOf` check their branches with short-circuiting, and collect the full errors only when the keyword fails.
-- A schema reached through `$ref` that can refer back to itself is checked against each value location at most twice, and the result is then reused. So time grows with the size of the value, not exponentially with its depth.
-- A `#/` reference that the library misses is resolved by following its JSON Pointer.
-- `format` is never checked.
-- Annotations are kept only from subschemas that pass.
-- `not` and `if` stop at their first error.
-- `examples` is never read as schemas.
-- The draft-04 `id` is ignored, and only a string `$id` is read.
-- `uniqueItems` is checked in one pass instead of comparing every pair.
-
-Some of these patched paths serve keywords that the list refuses. They stay in the patch so that it matches the library's structure. The patch is pinned to 4.1.6: with a different version, `pnpm install` fails with `ERR_PNPM_UNUSED_PATCH`.
+The interpreter is `@cfworker/json-schema` 4.1.6 with a local patch (`patches/@cfworker__json-schema@4.1.6.patch`) that brings its results in line with Ajv's for the listed keywords. With a different version, `pnpm install` fails with `ERR_PNPM_UNUSED_PATCH`.
 
 The interpreter is imported lazily, and only where code generation is disallowed. This is because `@cfworker/json-schema` reads `self.location` on import, which throws in a browser worker created from a blob URL. Until the interpreter has loaded, every validation in this path fails closed with `Schema validation error: JSON Schema validator unavailable (<reason>)`. Where it cannot load, every validation fails this way permanently. Validation never reports success while the interpreter is missing.
 

@@ -3969,7 +3969,7 @@ describe('om-tools', () => {
       // Schema validation catches it: the model gets a correctable error, not
       // the "searchMessages requires a vector store" throw.
       expect((result as any).error).toBe(true);
-      expect((result as any).message).toContain('does not match any of');
+      expect((result as any).message).toContain('must be equal to one of the allowed values');
     });
 
     it('returns the "Search is not configured" guidance when a resumed run carries a stale search call', async () => {
