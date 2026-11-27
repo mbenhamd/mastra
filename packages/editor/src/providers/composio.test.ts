@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
@@ -14,6 +14,7 @@ const { composioInstances, makeFakeComposio, composioTransport } = vi.hoisted(()
   interface FakeComposioInstance {
     apiKey: string;
     allowTracking?: boolean;
+    toolkitVersions?: Record<string, string>;
     hasProvider: boolean;
     toolkits: { get: ReturnType<typeof vi.fn>; getConnectedAccountInitiationFields: ReturnType<typeof vi.fn> };
     tools: { get: ReturnType<typeof vi.fn>; getRawComposioTools: ReturnType<typeof vi.fn> };
@@ -30,10 +31,16 @@ const { composioInstances, makeFakeComposio, composioTransport } = vi.hoisted(()
 
   const instances: FakeComposioInstance[] = [];
 
-  const factory = (opts: { apiKey: string; provider?: unknown; allowTracking?: boolean }): FakeComposioInstance => {
+  const factory = (opts: {
+    apiKey: string;
+    provider?: unknown;
+    allowTracking?: boolean;
+    toolkitVersions?: Record<string, string>;
+  }): FakeComposioInstance => {
     const inst: FakeComposioInstance = {
       apiKey: opts.apiKey,
       allowTracking: opts.allowTracking,
+      toolkitVersions: opts.toolkitVersions,
       hasProvider: Boolean(opts.provider),
       toolkits: { get: vi.fn(), getConnectedAccountInitiationFields: vi.fn() },
       tools: { get: vi.fn(), getRawComposioTools: vi.fn() },
@@ -59,7 +66,7 @@ type FakeComposioInstance = ReturnType<typeof makeFakeComposio>;
 vi.mock('@composio/core', () => ({
   Composio: function (
     this: Record<string, unknown>,
-    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean },
+    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean; toolkitVersions?: Record<string, string> },
   ) {
     if (composioTransport.create) return composioTransport.create(opts);
     Object.assign(this, makeFakeComposio(opts));
@@ -1356,6 +1363,56 @@ describe('ComposioToolProvider — listConnections', () => {
     });
   });
 
+  describe('toolkit versions through the real SDK and HTTP requests', () => {
+    let actual: typeof import('@composio/core');
+    let baseURL: string;
+    const catalogQueries: URLSearchParams[] = [];
+    const server = createServer((request, reply) => {
+      const url = new URL(request.url!, baseURL);
+      if (!url.pathname.endsWith('/tools') || request.method !== 'GET') {
+        reply.writeHead(404).end();
+        return;
+      }
+      catalogQueries.push(url.searchParams);
+      reply.writeHead(200, { 'content-type': 'application/json' });
+      reply.end(JSON.stringify({ items: [], next_cursor: null, total_pages: 1 }));
+    });
+    beforeAll(async () => {
+      actual = await vi.importActual<typeof import('@composio/core')>('@composio/core');
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+    beforeEach(() => {
+      catalogQueries.length = 0;
+      composioTransport.create = opts =>
+        new actual.Composio({ ...opts, baseURL, allowTracking: false, disableVersionCheck: true });
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+    afterAll(async () => {
+      composioTransport.create = undefined;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+    });
+
+    it('requests the catalog at the pinned versions, laid over the environment pins', async () => {
+      vi.stubEnv('COMPOSIO_TOOLKIT_VERSION_GMAIL', '20261001_00');
+      vi.stubEnv('COMPOSIO_TOOLKIT_VERSION_GITHUB', '20261101_00');
+      const toolkitVersions = { gmail: '20261120_00' };
+      const integration = new ComposioToolProvider({ apiKey: 'k', toolkitVersions });
+      // The host edits its map before any client exists: the provider keeps
+      // the map it was built with.
+      toolkitVersions.gmail = 'edited';
+
+      await integration.listToolsVNext({ toolkit: 'gmail' });
+
+      expect(catalogQueries).toHaveLength(1);
+      expect(catalogQueries[0]!.get('toolkit_versions[gmail]')).toBe('20261120_00');
+      expect(catalogQueries[0]!.get('toolkit_versions[github]')).toBe('20261101_00');
+    });
+  });
+
   describe('connections through the real SDK and HTTP responses', () => {
     let actual: typeof import('@composio/core');
     let baseURL: string;
@@ -1721,6 +1778,28 @@ describe('ComposioToolProvider — approval from Composio tags', () => {
       [false, false],
     ]);
     expect(await tracked({})).toEqual([
+      [true, undefined],
+      [false, undefined],
+    ]);
+  });
+
+  it('pins both Composio clients to the configured toolkit versions, and leaves the SDK default otherwise', async () => {
+    const pinned = async (config: Partial<ComposioToolProviderConfig>) => {
+      composioInstances.length = 0;
+      const { integration } = await resolveWithPolicy([], config);
+      // The host edits its map after the Mastra client exists and before the
+      // raw one does: neither client sees the edit.
+      if (config.toolkitVersions) (config.toolkitVersions as Record<string, string>).gmail = 'edited';
+      await integration.listToolkitsVNext().catch(() => undefined);
+      return composioInstances.map(instance => [instance.hasProvider, instance.toolkitVersions]);
+    };
+    const toolkitVersions = { gmail: '20261120_00', github: '20261123_00' };
+    expect(await pinned({ toolkitVersions: { ...toolkitVersions } })).toEqual([
+      [true, toolkitVersions],
+      [false, toolkitVersions],
+    ]);
+    // Absent: the SDK reads COMPOSIO_TOOLKIT_VERSION_* or falls back to `latest`.
+    expect(await pinned({})).toEqual([
       [true, undefined],
       [false, undefined],
     ]);

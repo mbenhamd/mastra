@@ -202,6 +202,13 @@ const editor = new MastraEditor({
       "Passed to both Composio clients. Set it to `false` to turn off the Composio SDK's usage analytics. When omitted, the SDK default applies.",
     isOptional: true,
   },
+  {
+    name: 'toolkitVersions',
+    type: 'Readonly<Record<string, string>>',
+    description:
+      "Passed to both Composio clients. The dated toolkit version each toolkit's tools are fetched and executed at, keyed by toolkit slug, for example `{ gmail: '20261120_00' }`. It overrides the SDK's `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>` environment values key by key. A toolkit in neither runs Composio's `latest` version. The connection-management session tools are not pinned.",
+    isOptional: true,
+  },
 ]}
 />
 

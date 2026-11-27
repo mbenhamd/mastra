@@ -73,6 +73,22 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
    * usage analytics. Absent keeps the SDK default.
    */
   allowTracking?: boolean;
+  /**
+   * The dated toolkit version each toolkit's tools are fetched and executed
+   * at, keyed by toolkit slug (for example `{ gmail: '20261120_00' }`).
+   * Copied when the provider is built and forwarded to both Composio
+   * clients, so a later change to the caller's map reaches neither.
+   *
+   * The SDK lays this map over its `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>`
+   * environment values, key by key, with the map winning. A toolkit in
+   * neither runs Composio's `latest` version: provider execution skips the
+   * SDK's version check. Slugs match case-insensitively but are otherwise
+   * compared as written. A host that must not follow Composio's schema
+   * changes unannounced maps every toolkit it offers. The connection-management
+   * session tools (`COMPOSIO_MANAGE_CONNECTIONS`, `COMPOSIO_WAIT_FOR_CONNECTIONS`)
+   * are not pinned: the SDK's session requests carry no toolkit version.
+   */
+  toolkitVersions?: Readonly<Record<string, string>>;
 }
 
 /** What {@link ComposioToolProviderConfig.requireToolApproval} decides on. */
@@ -261,6 +277,7 @@ export class ComposioToolProvider extends BaseToolProvider {
   private readonly apiKey: string;
   private readonly requireToolApproval?: boolean | ComposioRequireToolApproval;
   private readonly allowTracking?: boolean;
+  private readonly toolkitVersions?: Readonly<Record<string, string>>;
   private readonly sharedConnections?: ComposioSharedConnectionsConfig;
   private rawClient: Composio | null = null;
   private mastraClient: Composio<MastraProvider> | null = null;
@@ -276,17 +293,24 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.sharedConnections = config.sharedConnections;
     this.requireToolApproval = config.requireToolApproval;
     this.allowTracking = config.allowTracking;
+    this.toolkitVersions = config.toolkitVersions === undefined ? undefined : { ...config.toolkitVersions };
   }
 
   /**
    * Options shared by both clients. `disableVersionCheck` stops the SDK from
    * asking the npm registry for its latest version whenever a client is
-   * built: a server provider must not depend on npm egress.
+   * built: a server provider must not depend on npm egress. `toolkitVersions`
+   * pins the version both clients fetch and execute tools at.
    */
-  private clientOptions(): { allowTracking?: boolean; disableVersionCheck: true } {
+  private clientOptions(): {
+    allowTracking?: boolean;
+    disableVersionCheck: true;
+    toolkitVersions?: Record<string, string>;
+  } {
     return {
       disableVersionCheck: true,
       ...(this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking }),
+      ...(this.toolkitVersions === undefined ? {} : { toolkitVersions: { ...this.toolkitVersions } }),
     };
   }
 
