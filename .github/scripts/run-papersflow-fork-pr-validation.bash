@@ -1650,7 +1650,7 @@ pf9666_config() {
   PF9666_CFWORKER_PATCH_SHA256="${PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256:-0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a}"
   PF9666_CLAUDE_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256:-e90382bf1195648c4dcb9e450b02ce59c40cb7c2d7868cc7a0d4a91bfff44492}"
   PF9666_OPENAI_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256:-e02ccfb96bcb3fe17ebfd76899a0c9ac7cb976fe0389629d3a4a84527f03c097}"
-  # Base blobs (path, TAB, sha256) at PR 631's merge base 1819f397a1, so the
+  # Base blobs (path, TAB, sha256) at PR 631's merge base 9391eb2a4c, so the
   # reviewed head blobs are admitted only as the reviewed delta from them.
   PF9666_BASE_BLOBS="${PAPERSFLOW_PF9666_BASE_BLOBS:-pnpm-lock.yaml	e8c8890ae48709efaa920bb8489f278474cb175feebaafe26279fc15b27e1f7f
 pnpm-workspace.yaml	844f8a5cfbf00a42f4bb01656917d5c22f26e918bfc96ca0772109aaefa696aa
@@ -1666,8 +1666,8 @@ mastracode/factory/src/routes/projects.ts	2582235d5f6d07c67a621b7ecbcb6bebe6cccd
   #   bash .github/scripts/run-papersflow-fork-pr-validation.bash \
   #     --print-pf9666-delta <merge base> <head>
   # in a checkout holding both commits. Any other head of PR 631 is refused.
-  PF9666_HEAD_SHA="${PAPERSFLOW_PF9666_HEAD_SHA:-b83c86d94dfec0bba835f738b9a632775f093d62}"
-  PF9666_MERGE_BASE_SHA="${PAPERSFLOW_PF9666_MERGE_BASE_SHA:-1819f397a19b18aef351c8dc3bbad6899684060d}"
+  PF9666_HEAD_SHA="${PAPERSFLOW_PF9666_HEAD_SHA:-b1a3ab01ec10d6d0f671a921eb643465fae7932a}"
+  PF9666_MERGE_BASE_SHA="${PAPERSFLOW_PF9666_MERGE_BASE_SHA:-9391eb2a4c291a2d591e04ad76dc09494bb40aca}"
   PF9666_DELTA="${PAPERSFLOW_PF9666_DELTA:-A	100644	fb4a49b4178990ba4e55eb972a4fa238cba2dbbc5ab1d0f6f1220e7fa3e6d83c	.changeset/json-schema-validation-no-codegen.md
 A	100644	b59674006ef2ba425f2d0ed8d6dffdff329fea198af8bad7c535d4a8b0f0515e	.changeset/json-schema-validator-ready-claude.md
 A	100644	f2c9c85d00c3729c58d1a5abce212841649063204bb442e013fb1ba2aab53184	.changeset/json-schema-validator-ready-core.md
