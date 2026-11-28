@@ -5,11 +5,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 
 import { RequestContext } from '../request-context';
+import { JSON_SCHEMA_NON_RETRYABLE } from '../schema';
 import { createTool } from './tool';
 import {
   ToolSchemaValidationError,
   validateRequestContext,
   validateToolInput,
+  validateToolInputAsync,
   validateToolOutput,
   validateToolSuspendData,
 } from './validation';
@@ -2716,5 +2718,41 @@ describe('validateToolInput - combined fallback corrections (GitHub #25825)', ()
     const result = validateToolInput(schema, { args: '["a"]', count: 'x' });
     expect(result.error?.message).toContain('- count');
     expect(result.error?.message).not.toContain('- args');
+  });
+
+  it('skips null-stripping retries on non-retryable interpreter issues in sync and async validation', async () => {
+    let calls = 0;
+    const schema = {
+      '~standard': {
+        vendor: 'json-schema',
+        version: 1 as const,
+        validate(value: unknown) {
+          calls += 1;
+          if (value && typeof value === 'object' && '\uD800' in value) {
+            const issue = { message: 'The value could not be checked (URI malformed), so it is refused.' };
+            Object.defineProperty(issue, JSON_SCHEMA_NON_RETRYABLE, { value: true });
+            return { issues: [issue] };
+          }
+          return { value };
+        },
+        jsonSchema: {
+          input: () => ({
+            type: 'object' as const,
+            properties: { x: { type: 'string' as const } },
+            additionalProperties: false,
+          }),
+          output: () => ({ type: 'object' as const }),
+        },
+      },
+    } as any;
+
+    const input = { x: null, '\uD800': null };
+    const syncRes = validateToolInput(schema, input, 'test-tool');
+    expect(syncRes.error).toBeDefined();
+    expect(calls).toBe(1);
+
+    const asyncRes = await validateToolInputAsync(schema, input, 'test-tool');
+    expect(asyncRes.error).toBeDefined();
+    expect(calls).toBe(2);
   });
 });

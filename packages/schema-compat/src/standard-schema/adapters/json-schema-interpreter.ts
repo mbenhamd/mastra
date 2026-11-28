@@ -696,8 +696,9 @@ export class NotPlainJsonError extends Error {
  *   validator handles it as Ajv did (absent for `properties` and `required`, present for
  *   `additionalProperties` and the property counts). Model output can hold one.
  *
- * Nesting deeper than {@link MAX_JSON_DEPTH} levels is refused, so a deep value is reported as an
- * issue instead of exhausting the stack.
+ * Nesting deeper than {@link MAX_JSON_DEPTH} levels along the first visit to each object is
+ * refused; deeper shared structures under a recursive schema are caught during validation and
+ * refused as non-retryable issues.
  */
 export function plainJsonSnapshot(value: unknown, kind: 'schema' | 'value'): unknown {
   const open = new Set<object>();
@@ -937,6 +938,68 @@ function toValidationSchema(
 }
 
 /**
+ * Marks a Standard Schema issue returned for a schema refusal, non-plain-JSON value, prototype-key
+ * refusal, or unexpected validator failure. Tool input validation treats any issue carrying this
+ * marker as final and skips null-stripping/coercion/alias retries so it always fails closed.
+ */
+export const JSON_SCHEMA_NON_RETRYABLE: unique symbol = Symbol.for('mastra.schemaCompat.jsonSchemaNonRetryable');
+
+function markNonRetryable(issue: StandardSchemaV1.Issue): StandardSchemaV1.Issue {
+  Object.defineProperty(issue, JSON_SCHEMA_NON_RETRYABLE, { value: true });
+  return issue;
+}
+
+/**
+ * Resolves a cfworker `keywordLocation` (which may cross `$ref` hops) against the compiled
+ * validation schema. Returns `undefined` if any segment does not resolve.
+ */
+function resolveSchemaNode(root: unknown, keywordLocation: string): unknown {
+  const pointer = keywordLocation.startsWith('#') ? keywordLocation.slice(1) : keywordLocation;
+  if (pointer === '') {
+    return root;
+  }
+  const segments = pointer
+    .slice(1)
+    .split('/')
+    .map(segment => decodeURIComponent(segment).replace(/~1/g, '/').replace(/~0/g, '~'));
+  let current: unknown = root;
+  let inSchemaMap = false;
+  for (const seg of segments) {
+    if (inSchemaMap) {
+      if (!isJsonObject(current) || !Object.hasOwn(current, seg)) {
+        return undefined;
+      }
+      current = current[seg];
+      inSchemaMap = false;
+      continue;
+    }
+    if (Array.isArray(current)) {
+      const idx = Number(seg);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= current.length) {
+        return undefined;
+      }
+      current = current[idx];
+      continue;
+    }
+    if (!isJsonObject(current)) {
+      return undefined;
+    }
+    if (seg === '$ref' && typeof current.$ref === 'string') {
+      current = namedReferenceTarget(root, current.$ref);
+      continue;
+    }
+    if (!Object.hasOwn(current, seg)) {
+      return undefined;
+    }
+    current = current[seg];
+    if (seg === 'properties' || seg === '$defs' || seg === 'definitions') {
+      inSchemaMap = true;
+    }
+  }
+  return current;
+}
+
+/**
  * Converts a validator instance location (e.g. "#/foo/0/bar") to a Standard Schema path.
  * Segments are URI-encoded JSON Pointer tokens.
  */
@@ -960,43 +1023,109 @@ function instanceLocationToPath(instanceLocation: string): Array<PropertyKey> {
  * `Property "x" does not match schema.`). The subschema's own error follows it,
  * so these add nothing for the reader.
  */
-const SUMMARY_KEYWORDS = new Set(['properties', 'items', 'prefixItems', 'additionalItems', 'allOf', '$ref']);
-
-/** The validator's error for a property refused by `additionalProperties`. */
-const CLOSED_OBJECT_MESSAGES: Record<string, (name: string) => string> = {
-  additionalProperties: name => `Property "${name}" does not match additional properties schema.`,
-};
+const SUMMARY_KEYWORDS = new Set(['properties', 'prefixItems', 'allOf', '$ref']);
 
 /**
- * Drops summary errors, and the `False boolean schema.` error that follows a
- * closed-object error for the same property: one extra property is reported once,
- * by the error that names it. A `false` error with no such parent is kept.
+ * Normalises cfworker's `OutputUnit[]` to match Ajv's leaf errors and instance paths:
+ * - `propertyNames`: keeps the parent error and rewrites every sub-error's `instanceLocation` to
+ *   the parent object (dropping a direct `propertyNames: false` duplicate), matching Ajv;
+ * - `additionalProperties: false`, `additionalItems: false`, and 2020-12 `prefixItems` + `items:
+ *   false`: keeps the parent error at the container path and drops the paired `False boolean
+ *   schema.` child error, matching Ajv;
+ * - `additionalProperties`, `additionalItems`, and `items` with a non-false subschema (or
+ *   standalone `items: false`): drops the parent summary error and keeps the child errors at the
+ *   property/item path, matching Ajv;
+ * - `properties`, `prefixItems`, `allOf`, `$ref`: drops summary errors.
  */
-function leafErrors(errors: OutputUnit[]): OutputUnit[] {
-  const closedObjectErrors = new Set(
-    errors
-      .filter(error => error.keyword in CLOSED_OBJECT_MESSAGES)
-      .map(error => `${error.instanceLocation}\n${error.error}`),
-  );
-  return errors.filter(error => {
+function leafErrors(errors: OutputUnit[], compiledSchema: unknown): OutputUnit[] {
+  const out: OutputUnit[] = [];
+  for (let i = 0; i < errors.length; i++) {
+    const error = errors[i]!;
+    if (error.keyword === 'propertyNames') {
+      out.push(error);
+      const pnParent = error.instanceLocation;
+      const pnKwPrefix = `${error.keywordLocation}/`;
+      const next = errors[i + 1];
+      const childInst =
+        next !== undefined && next.instanceLocation.startsWith(`${pnParent}/`) ? next.instanceLocation : undefined;
+      if (childInst !== undefined) {
+        const directFalse = resolveSchemaNode(compiledSchema, error.keywordLocation) === false;
+        while (i + 1 < errors.length) {
+          const child = errors[i + 1]!;
+          const isSubError =
+            child.instanceLocation === childInst &&
+            (child.keywordLocation.startsWith(pnKwPrefix) ||
+              (child.keyword === 'false' && child.keywordLocation === childInst));
+          if (!isSubError) {
+            break;
+          }
+          i += 1;
+          if (directFalse && child.keyword === 'false') {
+            continue;
+          }
+          if (SUMMARY_KEYWORDS.has(child.keyword)) {
+            continue;
+          }
+          out.push({ ...child, instanceLocation: pnParent });
+        }
+      }
+      continue;
+    }
+
+    if (error.keyword === 'additionalProperties') {
+      const target = resolveSchemaNode(compiledSchema, error.keywordLocation);
+      if (target === false) {
+        out.push(error);
+        const next = errors[i + 1];
+        if (next?.keyword === 'false' && next.keywordLocation === next.instanceLocation) {
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if (error.keyword === 'additionalItems') {
+      const target = resolveSchemaNode(compiledSchema, error.keywordLocation);
+      if (target === false) {
+        out.push(error);
+        const next = errors[i + 1];
+        if (next?.keyword === 'false' && next.keywordLocation === next.instanceLocation) {
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if (error.keyword === 'items') {
+      const parentKwLoc = error.keywordLocation.endsWith('/items')
+        ? error.keywordLocation.slice(0, -'/items'.length)
+        : '';
+      const parentNode = resolveSchemaNode(compiledSchema, parentKwLoc);
+      if (isJsonObject(parentNode) && Array.isArray(parentNode.prefixItems) && parentNode.items === false) {
+        out.push(error);
+        const next = errors[i + 1];
+        if (next?.keyword === 'false' && next.keywordLocation === next.instanceLocation) {
+          i += 1;
+        }
+      }
+      continue;
+    }
+
     if (SUMMARY_KEYWORDS.has(error.keyword)) {
-      return false;
+      continue;
     }
-    if (error.keyword !== 'false' || closedObjectErrors.size === 0) {
-      return true;
-    }
-    const slash = error.instanceLocation.lastIndexOf('/');
-    const parent = error.instanceLocation.slice(0, slash);
-    const name = String(instanceLocationToPath(error.instanceLocation).at(-1));
-    return !Object.values(CLOSED_OBJECT_MESSAGES).some(message =>
-      closedObjectErrors.has(`${parent}\n${message(name)}`),
-    );
-  });
+
+    out.push(error);
+  }
+  return out;
 }
 
 /** A Standard Schema issue for a value refused because it is not plain JSON. */
 function notPlainJsonIssue(error: NotPlainJsonError): StandardSchemaV1.Issue {
-  return { message: `The value ${error.reason}, which JSON cannot carry, so it is refused.`, path: error.path };
+  return markNonRetryable({
+    message: `The value ${error.reason}, which JSON cannot carry, so it is refused.`,
+    path: error.path,
+  });
 }
 
 /**
@@ -1007,6 +1136,7 @@ function notPlainJsonIssue(error: NotPlainJsonError): StandardSchemaV1.Issue {
 export class InterpretedJsonSchema {
   #snapshot: unknown;
   #snapshotError: string | undefined;
+  #compiledSchema: unknown;
   #validator: Validator | null = null;
   #comparesValues = false;
   #refusal: string | undefined;
@@ -1054,6 +1184,7 @@ export class InterpretedJsonSchema {
     }
     try {
       const { schema, comparesValues } = toValidationSchema(this.#snapshot, dereferenceSchema);
+      this.#compiledSchema = schema;
       this.#comparesValues = comparesValues;
       // Every schema, draft-07 included, is validated in the validator's 2020-12 mode. In its
       // draft-07 mode the validator skips keywords beside `$ref` (for example `{ $ref, maxLength }`),
@@ -1072,7 +1203,7 @@ export class InterpretedJsonSchema {
   validate<Output>(value: unknown): StandardSchemaV1.Result<Output> {
     const refusal = this.refusal();
     if (refusal !== undefined) {
-      return { issues: [{ message: `Schema validation error: ${refusal}` }] };
+      return { issues: [markNonRetryable({ message: `Schema validation error: ${refusal}` })] };
     }
     let snapshot: unknown;
     try {
@@ -1088,11 +1219,11 @@ export class InterpretedJsonSchema {
       if (at !== undefined) {
         return {
           issues: [
-            {
+            markNonRetryable({
               message:
                 'The value holds a key that Ajv compared through the prototype (constructor, toString, valueOf or __proto__) under a schema with const or enum, so it is refused.',
               path: at,
-            },
+            }),
           ],
         };
       }
@@ -1102,14 +1233,17 @@ export class InterpretedJsonSchema {
       result = this.#validator!.validate(snapshot);
     } catch (error) {
       // For example a stack overflow under a recursive schema, or a key holding a lone surrogate
-      // that the validator cannot write into an error location. The value is refused as an issue.
+      // that the validator cannot write into an error location. The value is refused as a
+      // non-retryable issue so tool-input validation never strips nulls and retries past it.
       const reason = error instanceof Error ? error.message : 'unknown error';
-      return { issues: [{ message: `The value could not be checked (${reason}), so it is refused.` }] };
+      return {
+        issues: [markNonRetryable({ message: `The value could not be checked (${reason}), so it is refused.` })],
+      };
     }
     if (result.valid) {
       return { value: value as Output };
     }
-    const leaves = leafErrors(result.errors);
+    const leaves = leafErrors(result.errors, this.#compiledSchema);
     // An invalid value is never returned as valid, even if every error was a summary.
     const errors = leaves.length === 0 ? result.errors : leaves;
     const issues: StandardSchemaV1.Issue[] = errors.map(error => ({

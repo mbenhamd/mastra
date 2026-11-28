@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 
 import {
   InterpretedJsonSchema,
+  JSON_SCHEMA_NON_RETRYABLE,
   jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
   startInterpreterLoad,
@@ -471,6 +472,80 @@ describe('JSON Schema interpreter (code generation disallowed)', () => {
 
       expect(interpreted.validate({ a: 'x' })).toEqual({ value: { a: 'x' } });
       expect(interpreted.validate({ a: 1 })).toHaveProperty('issues');
+    });
+
+    it('reports Ajv-compatible issue paths for propertyNames, additionalProperties, additionalItems, and prefixItems+items:false', () => {
+      const paths = (schema: unknown, value: unknown) => {
+        const res = validate(schema, value);
+        if (!('issues' in res)) throw new Error('expected issues');
+        return [...new Set(res.issues.map(i => JSON.stringify(i.path ?? [])))].sort();
+      };
+
+      expect(paths({ type: 'object', propertyNames: { maxLength: 1 } }, { long: null })).toEqual(['[]']);
+      expect(
+        paths(
+          { type: 'object', properties: { sub: { type: 'object', propertyNames: { pattern: '^[a-z]$' } } } },
+          {
+            sub: { BAD: null },
+          },
+        ),
+      ).toEqual(['["sub"]']);
+      expect(paths({ type: 'object', propertyNames: false }, { a: null })).toEqual(['[]']);
+      expect(paths({ type: 'object', $defs: { F: false }, propertyNames: { $ref: '#/$defs/F' } }, { a: null })).toEqual(
+        ['[]'],
+      );
+      expect(
+        paths({ type: 'object', properties: { a: { type: 'string' } }, additionalProperties: false }, { extra: null }),
+      ).toEqual(['[]']);
+      expect(
+        paths(
+          { type: 'object', properties: { a: { type: 'string' } }, additionalProperties: { type: 'string' } },
+          { extra: null },
+        ),
+      ).toEqual(['["extra"]']);
+      expect(
+        paths({ type: 'object', $defs: { F: false }, additionalProperties: { $ref: '#/$defs/F' } }, { extra: null }),
+      ).toEqual(['["extra"]']);
+      expect(paths({ type: 'array', items: [{ type: 'string' }], additionalItems: false }, ['ok', null])).toEqual([
+        '[]',
+      ]);
+      expect(
+        paths(
+          {
+            $schema: 'https://json-schema.org/draft/2020-12/schema',
+            type: 'array',
+            prefixItems: [{ type: 'string' }],
+            items: false,
+          },
+          ['ok', null],
+        ),
+      ).toEqual(['[]']);
+      expect(paths({ type: 'array', items: false }, [null])).toEqual(['[0]']);
+    });
+
+    it('marks schema refusals, non-plain values, prototype-key refusals, and validator throws as non-retryable', () => {
+      const isNonRetryable = (res: ReturnType<typeof validate>) =>
+        'issues' in res &&
+        res.issues.some(i => (i as { [JSON_SCHEMA_NON_RETRYABLE]?: boolean })[JSON_SCHEMA_NON_RETRYABLE] === true);
+
+      expect(isNonRetryable(validate({ not: {} }, 'a'))).toBe(true);
+      expect(isNonRetryable(validate({ type: 'object' }, { n: 1n }))).toBe(true);
+      expect(isNonRetryable(validate({ const: {} }, JSON.parse('{"valueOf":1}')))).toBe(true);
+      expect(
+        isNonRetryable(
+          validate(
+            { type: 'object', properties: { x: { type: 'string' } }, additionalProperties: false },
+            {
+              x: null,
+              '\uD800': null,
+            },
+          ),
+        ),
+      ).toBe(true);
+      // Ordinary schema violations stay retryable (e.g. null-stripping for optional fields).
+      expect(isNonRetryable(validate({ type: 'object', properties: { x: { type: 'string' } } }, { x: null }))).toBe(
+        false,
+      );
     });
   });
 

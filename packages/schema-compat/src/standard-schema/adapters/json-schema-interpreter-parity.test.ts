@@ -3,7 +3,12 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { toStandardSchema } from './json-schema';
-import { InterpretedJsonSchema, isCanonicalRootId, startInterpreterLoad } from './json-schema-interpreter';
+import {
+  InterpretedJsonSchema,
+  JSON_SCHEMA_NON_RETRYABLE,
+  isCanonicalRootId,
+  startInterpreterLoad,
+} from './json-schema-interpreter';
 
 // The interpreter must accept nothing that fork main's Ajv refuses where Ajv can compile. This
 // process allows code generation, so `toStandardSchema` validates with Ajv exactly as fork main
@@ -220,6 +225,17 @@ const outcome = (result: { issues?: readonly unknown[] } | Promise<unknown>) => 
   return result.issues ? 'refuse' : 'accept';
 };
 
+const pathSet = (issues: ReadonlyArray<{ path?: ReadonlyArray<PropertyKey | { key: PropertyKey }> }>): string =>
+  JSON.stringify(
+    [
+      ...new Set(
+        issues.map(issue =>
+          JSON.stringify((issue.path ?? []).map(p => (typeof p === 'object' && p !== null && 'key' in p ? p.key : p))),
+        ),
+      ),
+    ].sort(),
+  );
+
 describe('JSON Schema interpreter parity with fork main Ajv', () => {
   beforeAll(async () => {
     // Ajv warns once per unknown format it ignores; both validators ignore every format.
@@ -231,8 +247,9 @@ describe('JSON Schema interpreter parity with fork main Ajv', () => {
   });
 
   for (const dialect of ['draft-07', '2020-12'] as const) {
-    it(`accepts no ${dialect} value that Ajv refuses (seeds ${SEEDS.join(', ')})`, () => {
+    it(`accepts no ${dialect} value that Ajv refuses and matches Ajv issue paths (seeds ${SEEDS.join(', ')})`, () => {
       const accepted: string[] = [];
+      const pathMismatches: string[] = [];
       let compared = 0;
       let bothAccepted = 0;
       let compiled = 0;
@@ -245,15 +262,36 @@ describe('JSON Schema interpreter parity with fork main Ajv', () => {
           if (interpreted.refusal() === undefined) compiled++;
           for (const value of VALUES()) {
             compared++;
-            const ajvOutcome = outcome(ajv['~standard'].validate(value));
-            if (outcome(interpreted.validate(value)) !== 'accept') continue;
-            if (ajvOutcome === 'accept') bothAccepted++;
-            else if (accepted.length < 5) accepted.push(`${text} with ${JSON.stringify(value)}`);
+            const ajvResult = ajv['~standard'].validate(value);
+            const ajvOutcome = outcome(ajvResult);
+            const interpResult = interpreted.validate(value);
+            const interpOutcome = outcome(interpResult);
+            if (interpOutcome === 'accept') {
+              if (ajvOutcome === 'accept') bothAccepted++;
+              else if (accepted.length < 5) accepted.push(`${text} with ${JSON.stringify(value)}`);
+            } else if (
+              ajvOutcome === 'refuse' &&
+              !(ajvResult instanceof Promise) &&
+              'issues' in ajvResult &&
+              ajvResult.issues &&
+              'issues' in interpResult &&
+              interpResult.issues &&
+              !interpResult.issues.some(
+                issue => (issue as { [JSON_SCHEMA_NON_RETRYABLE]?: boolean })[JSON_SCHEMA_NON_RETRYABLE] === true,
+              )
+            ) {
+              const ajvPaths = pathSet(ajvResult.issues);
+              const interpPaths = pathSet(interpResult.issues);
+              if (ajvPaths !== interpPaths && pathMismatches.length < 5) {
+                pathMismatches.push(`${text} with ${JSON.stringify(value)}: ajv=${ajvPaths} interp=${interpPaths}`);
+              }
+            }
           }
         }
       }
 
       expect(accepted).toEqual([]);
+      expect(pathMismatches).toEqual([]);
       expect(compared).toBe(SEEDS.length * SCHEMAS_PER_SEED * VALUES().length);
       // The comparison is not vacuous: listed schemas are compiled and accept values.
       expect(compiled, 'schemas the interpreter compiled').toBeGreaterThanOrEqual(
@@ -287,5 +325,5 @@ describe('JSON Schema interpreter parity with fork main Ajv', () => {
       }
     }
     expect(checked).toBeGreaterThan(200);
-  });
+  }, 30_000);
 });

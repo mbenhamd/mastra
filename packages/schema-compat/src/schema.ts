@@ -20,4 +20,5 @@ export {
   jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
   JSON_SCHEMA_REFUSAL,
+  JSON_SCHEMA_NON_RETRYABLE,
 } from './standard-schema/adapters/json-schema';

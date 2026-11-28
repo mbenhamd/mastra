@@ -21,4 +21,5 @@ export {
   jsonSchemaValidatorLoading,
   jsonSchemaValidatorReady,
   JSON_SCHEMA_REFUSAL,
+  JSON_SCHEMA_NON_RETRYABLE,
 } from '@mastra/schema-compat/schema';

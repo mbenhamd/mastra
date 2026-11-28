@@ -6,6 +6,8 @@ Where code generation from strings is disallowed, so that JSON Schemas are valid
 
 In the same runtimes, a tool whose output schema the interpreter refuses is not run. Its call returns a validation error, `Tool output schema is refused for <tool>, so the tool was not run`, before the tool performs any action. This applies to Mastra tools and AI SDK tools, whatever the output validation mode. Elsewhere, output schemas are validated after the tool runs, as before.
 
+When JSON Schema validation returns an issue marked with `JSON_SCHEMA_NON_RETRYABLE` (re-exported from `@mastra/core/schema`), `validateToolInput` and `validateToolInputAsync` return the validation error immediately instead of retrying after stripping `null` values or coercing types.
+
 ```ts
 import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '@mastra/core/schema';
 import { validateToolInput } from '@mastra/core/tools';

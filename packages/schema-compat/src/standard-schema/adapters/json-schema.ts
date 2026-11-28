@@ -6,7 +6,11 @@ import traverse from 'json-schema-traverse';
 import type { StandardSchemaWithJSON, StandardSchemaWithJSONProps } from '../standard-schema.types';
 import { InterpretedJsonSchema, startInterpreterLoad } from './json-schema-interpreter';
 
-export { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from './json-schema-interpreter';
+export {
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+  JSON_SCHEMA_NON_RETRYABLE,
+} from './json-schema-interpreter';
 
 /**
  * Vendor name for JSON Schema wrapped schemas.
