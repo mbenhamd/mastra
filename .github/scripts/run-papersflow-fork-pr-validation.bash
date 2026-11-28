@@ -1645,9 +1645,9 @@ pf9666_config() {
   # Head blobs of PR 631's patched-cfworker dependency graph (see
   # verify_pf9666_patched_cfworker_graph). The schema-compat manifest pin above
   # is shared by both PF-9666 paths.
-  PF9666_LOCKFILE_SHA256="${PAPERSFLOW_PF9666_LOCKFILE_SHA256:-5a9b587d7ec84048f16e62032ba8dde3349afb883857b87ce5ae160a962b167c}"
+  PF9666_LOCKFILE_SHA256="${PAPERSFLOW_PF9666_LOCKFILE_SHA256:-6dd8e6cc1225b05d326a36a55e811ce786a809dc9d91fa4a45047b1f3234ce37}"
   PF9666_WORKSPACE_SHA256="${PAPERSFLOW_PF9666_WORKSPACE_SHA256:-d12157a9ec78427d4f624713a33a636a7429f7586cd681ca70d90382e92fc545}"
-  PF9666_CFWORKER_PATCH_SHA256="${PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256:-589ef99fb1f202232af277a479b493e3d38fdcc5818dee2563db959dcc970059}"
+  PF9666_CFWORKER_PATCH_SHA256="${PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256:-0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a}"
   PF9666_CLAUDE_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_CLAUDE_PACKAGE_JSON_SHA256:-e90382bf1195648c4dcb9e450b02ce59c40cb7c2d7868cc7a0d4a91bfff44492}"
   PF9666_OPENAI_PACKAGE_JSON_SHA256="${PAPERSFLOW_PF9666_OPENAI_PACKAGE_JSON_SHA256:-e02ccfb96bcb3fe17ebfd76899a0c9ac7cb976fe0389629d3a4a84527f03c097}"
   # Base blobs (path, TAB, sha256) at PR 631's merge base 1819f397a1, so the
@@ -1661,6 +1661,59 @@ agent-sdks/openai/src/utils.ts	ec7a239bb1902b86b37382816958790a1ac07be54ed93840e
 mastracode/factory/src/routes/projects.ts	2582235d5f6d07c67a621b7ecbcb6bebe6cccded3a82ddaffc570d1b0e5d8f3f}"
   # PR 631's only Agent SDK and Factory changes besides the two SDK manifests
   # (path, TAB, head sha256). No other path under those workspaces may change.
+  # PR 631's one reviewed head, its merge base, and every path it changes from
+  # that base (see pf9666_delta_table). Made by
+  #   bash .github/scripts/run-papersflow-fork-pr-validation.bash \
+  #     --print-pf9666-delta <merge base> <head>
+  # in a checkout holding both commits. Any other head of PR 631 is refused.
+  PF9666_HEAD_SHA="${PAPERSFLOW_PF9666_HEAD_SHA:-b83c86d94dfec0bba835f738b9a632775f093d62}"
+  PF9666_MERGE_BASE_SHA="${PAPERSFLOW_PF9666_MERGE_BASE_SHA:-1819f397a19b18aef351c8dc3bbad6899684060d}"
+  PF9666_DELTA="${PAPERSFLOW_PF9666_DELTA:-A	100644	fb4a49b4178990ba4e55eb972a4fa238cba2dbbc5ab1d0f6f1220e7fa3e6d83c	.changeset/json-schema-validation-no-codegen.md
+A	100644	b59674006ef2ba425f2d0ed8d6dffdff329fea198af8bad7c535d4a8b0f0515e	.changeset/json-schema-validator-ready-claude.md
+A	100644	f2c9c85d00c3729c58d1a5abce212841649063204bb442e013fb1ba2aab53184	.changeset/json-schema-validator-ready-core.md
+A	100644	821c919e68aa93238cf80bfd86c962c2beb7de859c0605c23ac39b8307aa35c8	.changeset/json-schema-validator-ready-factory.md
+A	100644	7f332f5e19ea226a78edbff3a495c9b6d16cad5d2d600d31736816b1fb1ed4e4	.changeset/json-schema-validator-ready-mcp.md
+A	100644	46bda3fecf03a811f38cafb875d605c7dd17a2738e11c007fc8a71ff38081d6f	.changeset/json-schema-validator-ready-memory.md
+A	100644	e34a8e0c69eb5813614a0520db75f186dd78b5c4f3643560079a2c81554d6f54	.changeset/json-schema-validator-ready-openai.md
+M	100644	e90382bf1195648c4dcb9e450b02ce59c40cb7c2d7868cc7a0d4a91bfff44492	agent-sdks/claude/package.json
+M	100644	8aab34c97e79154e60eba2a56c8e94be95d6c5df2b48f3f3bf8cc6d553daf375	agent-sdks/claude/src/utils.ts
+M	100644	e02ccfb96bcb3fe17ebfd76899a0c9ac7cb976fe0389629d3a4a84527f03c097	agent-sdks/openai/package.json
+M	100644	692b92047e36572cda8264e1ff419071de5ec407fee8f9cc9ff28ee3193a3a53	agent-sdks/openai/src/utils.ts
+M	100644	23eca000d74e8247fbe647f00fe4ff8a9b5c759bbbf52de09c1cb7af2b86cd7b	mastracode/factory/src/routes/projects.ts
+M	100644	8c16d0351bfb5943683903233d6aaa6c9c01cf04d686df121e885be9d4a67e13	packages/core/src/agent-controller/session.ts
+M	100644	b8bc6ab52997cfcc3000fb4bad66b36b5dda8370e91feb5ee182cde457746f6a	packages/core/src/agent/agent.ts
+M	100644	e919c777e7c1f7df4c0dddb5e5bdba581fce7d1d17b35aabd023c7f6359d32a9	packages/core/src/agent/durable/preparation.ts
+M	100644	6aae04424b35759ef35de0625b0f926048d4923ba1f822c5e20b9e70519d3603	packages/core/src/agent/durable/workflows/steps/tool-call.ts
+M	100644	1e92ff3005691edac88c0a73f7a537e46ac8e53495a19e9d24844fa4e30eb088	packages/core/src/loop/shared/terminal-tool-result.ts
+M	100644	497c3f1b06147f6da272e1b2551c63f9f9cda4f90d9f86b3a9492f8255484c67	packages/core/src/loop/workflows/agentic-execution/tool-approval-verdict.ts
+M	100644	ab05478d39372d0ea17f9d1b7cd07e1e0449a753b15852cf22f28d224f5e9a43	packages/core/src/loop/workflows/agentic-execution/tool-call-step.ts
+M	100644	ab90c3d2060c7e95701592f4c9b8712e699aaab664313ad27392fa326bd53e14	packages/core/src/schema/index.ts
+M	100644	28d7ea63284304aeac2a294a0ac5d7001ab3c0f4e25f86736e1cd8ed2aa37b15	packages/core/src/stream/base/output-format-handlers.ts
+A	100644	59d3a2b3f7eed38f8cec44eac5fb75053ced8aa943e537c04c848b344cfb78de	packages/core/src/tools/output-schema-refusal.test.ts
+M	100644	1e21614e9e46303c114743c8ef61305a9c1f5a23f54ed2b36d9e51e76b962c82	packages/core/src/tools/tool-builder/builder.ts
+A	100644	6b734bc48f3e805da8d3a6153a5e2dcecdfcc2a4e346babe235860524925d5fa	packages/core/src/tools/tool-builder/validator-loading-window.test.ts
+M	100644	58a901dfa121a855304d5580961ec54956f449e7f0aeae76d0f0992ffd7cc66c	packages/core/src/tools/tool.ts
+M	100644	9a5ce41c08e33f1045fbaf8c2bf9eb857bc34e492672d3ed2996b08aa243ff89	packages/core/src/tools/validation.test.ts
+M	100644	56c825e3b512e7422cb39516a6f37615f187c19b16fda10cc31779f5156a9488	packages/core/src/tools/validation.ts
+M	100644	cb11686f0377bd53d653613d7c577d2a80535bc5a8fe6d7f5fe29258faf88e8b	packages/core/src/workflows/utils.ts
+M	100644	5c843adc232b6068a55a23f813608425d6451c9b21f925e2070ba98f8069a479	packages/core/src/workflows/workflow.ts
+M	100644	a94e1919cf8df0fdafc210f727b9395292a6a413a61888063126a88e2d9d5e36	packages/mcp/src/server/events/registry.ts
+M	100644	586b58b39972efc5077dc4b411db2bbf344bdd919450a3b026807b871c6a1f44	packages/mcp/src/server/server.ts
+M	100644	1d64bab3b9a7b07c93a6e6186aab187937ba4fee9a9cb4c9f3f609e418b43085	packages/memory/src/processors/observational-memory/working-memory-extractor.ts
+M	100644	1edadeb05c30dcfa2f97814bdd41d90518ae2a5f7867f04bc5f4f5899a920a66	packages/schema-compat/package.json
+M	100644	73df7a768c768642a7e7acccf21b29e10187c4ac11d93f2f293d025180f639f0	packages/schema-compat/src/index.ts
+M	100644	a8ecf6452ad52f2ca8868e73c746f5713e340111e37cfc5be838d3125b78cf7c	packages/schema-compat/src/schema.ts
+A	100644	412cf3c56d0dca4d28be18d7cec97a89037f0f99f89659d68f72e6e86fb38889	packages/schema-compat/src/standard-schema/adapters/json-schema-blob-worker.test.ts
+A	100644	7b9ad47f1703e0226efb3911bb45507f952b867683b52b0233f3c51da19e7712	packages/schema-compat/src/standard-schema/adapters/json-schema-interpreter-parity.test.ts
+A	100644	8329dcd3270a9a631e2ed13284b750099f714483695706d8622c450072b239cc	packages/schema-compat/src/standard-schema/adapters/json-schema-interpreter.test.ts
+A	100644	8bd4e6cb96cb6161c8a59b015dec617d5549b84f2d6ac23ac0ae793c5ca404ca	packages/schema-compat/src/standard-schema/adapters/json-schema-interpreter.ts
+A	100644	6b3d904920224e0634e71b65f985816b25c06483420637530a61259a0c5ac946	packages/schema-compat/src/standard-schema/adapters/json-schema-no-codegen.test.ts
+M	100644	9cc0d75e7f91f3a9007483d2f7204f342096a37d47a07d3f7f416780f540cd53	packages/schema-compat/src/standard-schema/adapters/json-schema.test.ts
+M	100644	500028d1d314d7494ea60051101ffc82a1cebc5af7b64110eabaf9a5c5260a24	packages/schema-compat/src/standard-schema/adapters/json-schema.ts
+M	100644	c388e930ec1a353ec2983ea0686049d08bf8ee582635ea70fbbc979308c004bd	packages/schema-compat/vitest.config.ts
+A	100644	0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a	patches/@cfworker__json-schema@4.1.6.patch
+M	100644	6dd8e6cc1225b05d326a36a55e811ce786a809dc9d91fa4a45047b1f3234ce37	pnpm-lock.yaml
+M	100644	d12157a9ec78427d4f624713a33a636a7429f7586cd681ca70d90382e92fc545	pnpm-workspace.yaml}"
   PF9666_OWNED_SOURCE_BLOBS="${PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS:-agent-sdks/claude/src/utils.ts	8aab34c97e79154e60eba2a56c8e94be95d6c5df2b48f3f3bf8cc6d553daf375
 agent-sdks/openai/src/utils.ts	692b92047e36572cda8264e1ff419071de5ec407fee8f9cc9ff28ee3193a3a53
 mastracode/factory/src/routes/projects.ts	23eca000d74e8247fbe647f00fe4ff8a9b5c759bbbf52de09c1cb7af2b86cd7b}"
@@ -1681,6 +1734,75 @@ verify_pf9666_pinned_blobs() {
       return 1
     fi
   done <<< "$3"
+}
+
+# Prints every path changed from $1 to $2, one "status<TAB>mode<TAB>sha256<TAB>path"
+# line each, in byte order of path: the diff status letter, the head mode
+# (000000 for a deletion), and the sha256 of the head blob (- for a deletion).
+# Renames are listed as a deletion and an addition. A path outside printable
+# ASCII is refused, so every line compares as written.
+pf9666_delta_table() {
+  node - "$1" "$2" <<'NODE'
+const { execFileSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
+
+const [baseSha, headSha] = process.argv.slice(2);
+const git = (args, encoding) => execFileSync('git', args, { encoding, maxBuffer: 256 * 1024 * 1024 });
+const fields = git(['diff', '--no-renames', '--no-abbrev', '--raw', '-z', baseSha, headSha], 'latin1').split('\0');
+if (fields.at(-1) !== '') throw new Error('PF-9666 could not read the raw diff.');
+fields.pop();
+if (fields.length % 2 !== 0) throw new Error('PF-9666 raw diff has an unpaired record.');
+const rows = [];
+for (let index = 0; index < fields.length; index += 2) {
+  const meta = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([ADMT])$/.exec(fields[index]);
+  const path = fields[index + 1];
+  if (!meta) throw new Error('PF-9666 raw diff record is not a plain add, delete, modify or type change.');
+  if (!/^[\x20-\x7e]+$/.test(path)) throw new Error('PF-9666 refuses a changed path outside printable ASCII.');
+  const [, , headMode, , headBlob, status] = meta;
+  const hash = status === 'D' ? '-' : createHash('sha256').update(git(['cat-file', 'blob', headBlob])).digest('hex');
+  rows.push(`${status}\t${headMode}\t${hash}\t${path}`);
+}
+rows.sort((left, right) => Buffer.compare(Buffer.from(left.split('\t')[3]), Buffer.from(right.split('\t')[3])));
+if (rows.length > 0) process.stdout.write(`${rows.join('\n')}\n`);
+NODE
+}
+
+# PR 631 is admitted only at its pinned head, from its pinned merge base, with
+# exactly the pinned delta: no other head of PR 631 and no other PR passes.
+verify_pf9666_reviewed_head() {
+  local merge_base_sha="$1" head_sha="$2" actual
+  if [[ "$head_sha" != "$PF9666_HEAD_SHA" ]]; then
+    echo "PF-9666 admits only PR 631's reviewed head $PF9666_HEAD_SHA, not $head_sha." >&2
+    return 1
+  fi
+  if [[ "$merge_base_sha" != "$PF9666_MERGE_BASE_SHA" ]]; then
+    echo "PF-9666 admits PR 631 only from its reviewed merge base $PF9666_MERGE_BASE_SHA, not $merge_base_sha." >&2
+    return 1
+  fi
+  if ! actual="$(pf9666_delta_table "$merge_base_sha" "$head_sha")"; then
+    echo 'PF-9666 could not list the changed paths of the reviewed head.' >&2
+    return 1
+  fi
+  if [[ "$actual" != "$PF9666_DELTA" ]]; then
+    echo 'PF-9666 changed paths are not the pinned reviewed delta:' >&2
+    diff <(printf '%s\n' "$PF9666_DELTA") <(printf '%s\n' "$actual") >&2 || true
+    return 1
+  fi
+}
+
+# Self-test helper: sets pf9666_pins to the PF-9666 head pin of $3 against its
+# merge base with $2, in the fixture repository $1. A head whose delta cannot be
+# listed (a path outside printable ASCII) keeps an empty delta pin, so the
+# fixture reaches the validator's own listing refusal.
+pf9666_fixture_head_pins() {
+  local merge_base delta
+  merge_base="$(git -C "$1" merge-base "$2" "$3")" || return 1
+  delta="$(cd "$1" && pf9666_delta_table "$merge_base" "$3" 2> /dev/null)" || delta=''
+  pf9666_pins=(
+    PAPERSFLOW_PF9666_HEAD_SHA="$3"
+    PAPERSFLOW_PF9666_MERGE_BASE_SHA="$merge_base"
+    PAPERSFLOW_PF9666_DELTA="$delta"
+  )
 }
 
 # Self-test helper: prints a "path<TAB>sha256" line for each path ($2...) at
@@ -1731,6 +1853,7 @@ verify_pf9666_cfworker_dependency() {
     echo 'PF-9666 cfworker devDependency admission is bound to reviewed PR 631 metadata.' >&2
     return 1
   fi
+  verify_pf9666_reviewed_head "$1" "$2" || return 1
   if ! git_regular_file_at_revision "$2" packages/schema-compat/package.json || \
     [[ "$(git_blob_sha256 "$2" packages/schema-compat/package.json)" != "$PF9666_PACKAGE_JSON_SHA256" ]]; then
     echo 'PF-9666 packages/schema-compat/package.json is not the reviewed blob.' >&2
@@ -1826,6 +1949,7 @@ verify_pf9666_patched_cfworker_graph() (
     echo 'PF-9666 patched cfworker graph admission is bound to reviewed PR 631 metadata.' >&2
     return 1
   fi
+  verify_pf9666_reviewed_head "$base_sha" "$head_sha" || return 1
 
   expected_paths="$(mktemp)"
   actual_paths="$(mktemp)"
@@ -1978,12 +2102,20 @@ NODE
 # The install classifier's watched dependency-graph paths, also recomputed by
 # the main validator for the PF-9666 planning admission.
 list_watched_dependency_graph_changes() {
-  git -c core.quotePath=false diff --no-renames --name-only "${1}...${2}" -- \
+  git -c core.quotePath=false diff --no-renames --name-only -z "${1}...${2}" -- \
     .npmrc .pnpmfile.cjs pnpmfile.cjs .pnpmfile.mjs pnpmfile.mjs \
     package.json package.yaml package.json5 pnpm-workspace.yaml \
     patches packages/server/package.json server-adapters/fastify/package.json \
     packages/_types-builder/package.json packages/agent-builder/package.json |
-    sort -u
+    node -e '
+const paths = require("node:fs").readFileSync(0, "latin1").split("\0").filter(Boolean);
+const unsupported = paths.find((path) => !/^[\x20-\x7e]+$/.test(path));
+if (unsupported !== undefined) {
+  console.error(`Watched dependency-graph path names must be printable ASCII: ${JSON.stringify(unsupported)}`);
+  process.exit(1);
+}
+process.stdout.write([...new Set(paths)].sort().map((path) => `${path}\n`).join(""));
+'
 }
 
 classify_install_lane() (
@@ -3101,12 +3233,13 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     local fixture_output="$1"
     shift
     (
+      pf9666_fixture_head_pins "$fixture_repo" "${pin_base_sha:-$base_sha}" "$head_sha" || exit 1
       cd "$fixture_repo"
       env \
         GITHUB_OUTPUT= \
         BASE_SHA="$base_sha" HEAD_SHA="$head_sha" PR_NUMBER=631 \
         HEAD_REPOSITORY=mbenhamd/mastra HEAD_REF=fix/pf-9666-schema-compat-no-codegen BASE_REF=main \
-        "${pins[@]}" "$@" bash "$script_path" --classify-install
+        "${pins[@]}" "${pf9666_pins[@]}" "$@" bash "$script_path" --classify-install
     ) > "$fixture_output" 2>&1
   }
 
@@ -3137,8 +3270,8 @@ run_pf9666_patched_cfworker_admission_self_tests() (
   fi
   grep -Fq 'PF-9666 watched dependency-graph paths are outside the exact reviewed set' "$output"
 
-  # Git quotes a non-ASCII path by default; the verbatim listing must still
-  # see this seventh dependency-graph file.
+  # Git quotes a non-ASCII path by default; the head pin's raw listing refuses
+  # the name before the dependency-graph comparison runs.
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
   mkdir -p "$fixture_repo/pkg-é"
   printf '{"name":"unreviewed"}\n' > "$fixture_repo/pkg-é/package.json"
@@ -3150,7 +3283,8 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     echo 'A manifest under a non-ASCII directory unexpectedly passed PF-9666 admission.' >&2
     return 1
   fi
-  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+  grep -Fq 'PF-9666 refuses a changed path outside printable ASCII.' "$output"
+  grep -Fq 'PF-9666 could not list the changed paths of the reviewed head.' "$output"
 
   # A name with a byte that is not UTF-8, checked under a UTF-8 locale.
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
@@ -3166,7 +3300,8 @@ run_pf9666_patched_cfworker_admission_self_tests() (
     echo 'A manifest under a directory name that is not UTF-8 unexpectedly passed PF-9666 admission.' >&2
     return 1
   fi
-  grep -Fq 'PF-9666 changed dependency-graph files are outside the exact reviewed set' "$output"
+  grep -Fq 'PF-9666 refuses a changed path outside printable ASCII.' "$output"
+  grep -Fq 'PF-9666 could not list the changed paths of the reviewed head.' "$output"
 
   # A patch file in a nested patches directory is a seventh graph file.
   git -C "$fixture_repo" reset -q --hard "$reviewed_head"
@@ -3219,7 +3354,8 @@ run_pf9666_patched_cfworker_admission_self_tests() (
   git -C "$fixture_repo" commit -q -m 'reviewed blobs over the moved base'
   head_sha="$(git -C "$fixture_repo" rev-parse HEAD)"
   output="$test_root/moved-base.log"
-  if run_fixture_admission "$output" BASE_SHA="$moved_base"; then
+  # Pinned to this head over the moved base, so the base file pins answer.
+  if pin_base_sha="$moved_base" run_fixture_admission "$output" BASE_SHA="$moved_base"; then
     echo 'The reviewed head blobs over a different base unexpectedly passed PF-9666 admission.' >&2
     return 1
   fi
@@ -6453,8 +6589,8 @@ NODE
     assert_line_matches '^--dir mastracode/factory exec vitest run .* src/routes/projects\.test\.ts$' "$command_log"
   }
 
-  # Permanent owned targets: an ordinary PR changing a source file under each
-  # workspace plans that workspace's build, typecheck, lint and suites.
+  # Owned targets: an ordinary PR changing a source file under each workspace
+  # is refused before any package command; only the PF-9666 graph plans them.
   run_pf9666_owned_agent_sdk_and_factory_target_fixtures() {
     local owned_base owned_head graph_base graph_head
     local -a graph_env
@@ -6475,7 +6611,8 @@ NODE
     owned_head="$graph_head"
     : > "$command_log"
     output="$test_root/pf9666-owned-targets.log"
-    if ! run_fixture "$owned_head" "$output" "${graph_env[@]}"; then
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$owned_head"
+    if ! run_fixture "$owned_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}"; then
       cat "$output" >&2
       exit 1
     fi
@@ -6492,7 +6629,8 @@ NODE
       git commit -q -m 'redefine factory scripts'
       git rev-parse HEAD
     )"
-    assert_package_contract_rejected "$factory_manifest_head" "$owned_base" "$test_root/pf9666-factory-manifest.log" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$factory_manifest_head"
+    assert_package_contract_rejected "$factory_manifest_head" "$owned_base" "$test_root/pf9666-factory-manifest.log" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$factory_manifest_head")"
     grep -Fq 'mastracode/factory/package.json' "$test_root/pf9666-factory-manifest.log" || {
       echo 'The factory manifest refusal did not name mastracode/factory/package.json.' >&2
@@ -6511,7 +6649,8 @@ NODE
       git commit -q -m 'redefine openai scripts'
       git rev-parse HEAD
     )"
-    assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_manifest_head"
+    assert_package_contract_rejected "$sdk_manifest_head" "$owned_base" "$test_root/pf9666-sdk-manifest.log" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_manifest_head")"
     grep -Fxq 'PF-9666 reviewed dependency file hash changed: agent-sdks/openai/package.json' \
       "$test_root/pf9666-sdk-manifest.log" || {
@@ -6532,7 +6671,8 @@ NODE
     )"
     : > "$command_log"
     output="$test_root/pf9666-sdk-e2e.log"
-    if run_fixture "$sdk_e2e_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_e2e_head"
+    if run_fixture "$sdk_e2e_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_e2e_head")"; then
       echo 'An Agent SDK end-to-end test unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6562,7 +6702,8 @@ NODE
     )"
     : > "$command_log"
     output="$test_root/pf9666-sdk-symlink.log"
-    if run_fixture "$sdk_symlink_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_symlink_head"
+    if run_fixture "$sdk_symlink_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_symlink_head")"; then
       echo 'An Agent SDK test symlink unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6592,7 +6733,8 @@ NODE
     )"
     : > "$command_log"
     output="$test_root/pf9666-sdk-dir-symlink.log"
-    if run_fixture "$sdk_dir_symlink_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_dir_symlink_head"
+    if run_fixture "$sdk_dir_symlink_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_dir_symlink_head")"; then
       echo 'An Agent SDK directory symlink unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6620,7 +6762,8 @@ NODE
     chmod +x "$failing_git_bin/git"
     : > "$command_log"
     output="$test_root/pf9666-sdk-inventory-error.log"
-    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$owned_head"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$failing_git_bin:$mock_bin:$PATH"; then
       echo 'A failed Agent SDK file inventory unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6645,7 +6788,8 @@ NODE
     git -C "$fixture_repo" reset -q --hard "$owned_head"
     : > "$command_log"
     output="$test_root/pf9666-sdk-generated-test.log"
-    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$owned_head"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$generating_pnpm_bin:$mock_bin:$PATH"; then
       echo 'A test file written by the Agent SDK build unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6677,7 +6821,8 @@ NODE
     )"
     : > "$command_log"
     output="$test_root/pf9666-sdk-config.log"
-    if run_fixture "$sdk_config_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_config_head"
+    if run_fixture "$sdk_config_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_config_head")"; then
       echo 'A changed Agent SDK Vitest configuration unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6707,7 +6852,8 @@ NODE
     git -C "$fixture_repo" reset -q --hard "$owned_head"
     : > "$command_log"
     output="$test_root/pf9666-sdk-rewritten-source.log"
-    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$owned_head"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$rewriting_pnpm_bin:$mock_bin:$PATH"; then
       echo 'A source rewritten by the Agent SDK build unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6735,7 +6881,8 @@ NODE
     : > "$command_log"
     : > "$command_environment_log"
     output="$test_root/pf9666-sdk-test-env.log"
-    if ! run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_test_head"
+    if ! run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_test_head")" OPENAI_API_KEY=ambient-fixture-key; then
       echo 'An ordinary Agent SDK unit test did not pass validation.' >&2
       cat "$output" >&2
@@ -6760,7 +6907,8 @@ NODE
     chmod +x "$failing_scan_bin/grep"
     : > "$command_log"
     output="$test_root/pf9666-manifest-scan-error.log"
-    if run_fixture "$owned_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$owned_head"
+    if run_fixture "$owned_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$owned_head")" PATH="$failing_scan_bin:$mock_bin:$PATH"; then
       echo 'A failed manifest scan unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6778,7 +6926,8 @@ NODE
     chmod +x "$failing_sdk_scan_bin/grep"
     : > "$command_log"
     output="$test_root/pf9666-sdk-scan-error.log"
-    if run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$sdk_test_head"
+    if run_fixture "$sdk_test_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_OWNED_SOURCE_BLOBS="$(pf9666_owned_source_table "$sdk_test_head")" PATH="$failing_sdk_scan_bin:$mock_bin:$PATH"; then
       echo 'A failed Agent SDK changed-file scan unexpectedly passed validation.' >&2
       cat "$output" >&2
@@ -6799,7 +6948,8 @@ NODE
 
     : > "$command_log"
     output="$test_root/pf9666-graph-planning.log"
-    if ! run_fixture "$graph_head" "$output" "${graph_env[@]}"; then
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$graph_head"
+    if ! run_fixture "$graph_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}"; then
       cat "$output" >&2
       exit 1
     fi
@@ -6809,7 +6959,8 @@ NODE
     # One zeroed pin exercises the shared install/planning verifier.
     : > "$command_log"
     output="$test_root/pf9666-graph-zeroed-pin.log"
-    if run_fixture "$graph_head" "$output" "${graph_env[@]}" \
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$graph_head"
+    if run_fixture "$graph_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" \
       PAPERSFLOW_PF9666_CFWORKER_PATCH_SHA256=0000000000000000000000000000000000000000000000000000000000000000; then
       echo 'PF-9666 planning unexpectedly admitted a graph with a zeroed patch pin.' >&2
       cat "$output" >&2
@@ -6825,7 +6976,8 @@ NODE
 
     : > "$command_log"
     output="$test_root/pf9666-graph-wrong-metadata.log"
-    if run_fixture "$graph_head" "$output" "${graph_env[@]}" PR_NUMBER=632; then
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$graph_head"
+    if run_fixture "$graph_head" "$output" "${graph_env[@]}" "${pf9666_pins[@]}" PR_NUMBER=632; then
       echo 'PF-9666 planning unexpectedly admitted the graph for another pull request.' >&2
       cat "$output" >&2
       exit 1
@@ -6837,6 +6989,67 @@ NODE
       cat "$command_log" >&2
       exit 1
     fi
+
+    # The head pin: another head of PR 631 (here one more documentation file),
+    # a pinned delta that differs by one path, and another merge base are each
+    # refused before any validation command.
+    local other_head pinned_delta
+    other_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$graph_head"
+      printf '%s\n' 'Reviewed elsewhere.' > NOTES.md
+      git add NOTES.md
+      git commit -q -m 'one more documentation file'
+      git rev-parse HEAD
+    )"
+    pf9666_fixture_head_pins "$fixture_repo" "$graph_base" "$graph_head"
+    pinned_delta="$(printf '%s\n' "${pf9666_pins[2]#PAPERSFLOW_PF9666_DELTA=}" | sed 1d)"
+    local -a head_pin_cases=(
+      "other-head|$other_head|PF-9666 admits only PR 631's reviewed head $graph_head, not $other_head."
+      "other-delta|$graph_head|PF-9666 changed paths are not the pinned reviewed delta:"
+      "other-merge-base|$graph_head|PF-9666 admits PR 631 only from its reviewed merge base $pf9666_base_sha, not "
+    )
+    local head_pin_case case_name case_head case_message
+    for head_pin_case in "${head_pin_cases[@]}"; do
+      IFS='|' read -r case_name case_head case_message <<< "$head_pin_case"
+      : > "$command_log"
+      output="$test_root/pf9666-graph-$case_name.log"
+      local -a case_pins=("${pf9666_pins[@]}")
+      case "$case_name" in
+        other-delta) case_pins+=(PAPERSFLOW_PF9666_DELTA="$pinned_delta") ;;
+        other-merge-base) case_pins+=(PAPERSFLOW_PF9666_MERGE_BASE_SHA="$pf9666_base_sha") ;;
+      esac
+      if run_fixture "$case_head" "$output" "${graph_env[@]}" "${case_pins[@]}"; then
+        echo "PF-9666 planning unexpectedly admitted the $case_name case." >&2
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains "$case_message" "$output"
+      assert_not_contains 'PF-9666 exact patched cfworker dependency graph admitted to planning' "$output"
+      if [[ -s "$command_log" ]]; then
+        echo "PF-9666 refused $case_name planning executed validation commands." >&2
+        cat "$command_log" >&2
+        exit 1
+      fi
+    done
+
+    # A watched path name that Git would quote is refused, never listed escaped.
+    local quoted_head
+    quoted_head="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$graph_head"
+      printf '%s\n' 'tab' > $'patches/tab\tname.patch'
+      git add patches
+      git commit -q -m 'a watched path with a tab'
+      git rev-parse HEAD
+    )"
+    if (cd "$fixture_repo" && list_watched_dependency_graph_changes "$graph_base" "$quoted_head") \
+      > "$test_root/pf9666-quoted-path.out" 2> "$test_root/pf9666-quoted-path.err"; then
+      echo 'PF-9666 watched paths unexpectedly listed a name with a tab.' >&2
+      exit 1
+    fi
+    assert_contains 'Watched dependency-graph path names must be printable ASCII: "patches/tab\tname.patch"' \
+      "$test_root/pf9666-quoted-path.err"
     git -C "$fixture_repo" reset -q --hard "$base_sha"
     echo 'PF-9666 patched cfworker planning admission fixtures passed.'
   }
@@ -9547,8 +9760,9 @@ NODE
     local admission_output="$2"
     shift 2
     (
+      pf9666_fixture_head_pins "$fixture_repo" "$pf9666_base_sha" "$admission_head" || exit 1
       cd "$fixture_repo"
-      env "${pf9666_env[@]}" HEAD_SHA="$admission_head" GITHUB_OUTPUT= "$@" \
+      env "${pf9666_env[@]}" "${pf9666_pins[@]}" HEAD_SHA="$admission_head" GITHUB_OUTPUT= "$@" \
         bash "$validator_path" --classify-install
     ) > "$admission_output" 2>&1
   }
@@ -9561,7 +9775,8 @@ NODE
   assert_contains 'lane=standard' "$output"
   : > "$command_log"
   output="$test_root/pf9666-success.log"
-  if ! run_fixture "$head_sha" "$output" "${pf9666_env[@]}"; then
+  pf9666_fixture_head_pins "$fixture_repo" "$pf9666_base_sha" "$head_sha" || exit 1
+  if ! run_fixture "$head_sha" "$output" "${pf9666_env[@]}" "${pf9666_pins[@]}"; then
     cat "$output" >&2
     exit 1
   fi
@@ -12804,6 +13019,11 @@ fi
 if [[ "${1:-}" == "--self-test-pf9666-owned-targets" ]]; then
   run_validator_self_tests --pf9666-owned-targets-only
   exit 0
+fi
+
+if [[ "${1:-}" == "--print-pf9666-delta" ]]; then
+  pf9666_delta_table "${2:?merge base required}" "${3:?head required}"
+  exit
 fi
 
 

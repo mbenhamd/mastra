@@ -229,6 +229,15 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   cleared; Factory runs build, check, `build:lib` and lint; and
   `mastracode/factory/src/routes/projects.ts` is paired with
   `projects.test.ts`.
+  The workflow reads this validator from the protected base, so #634 must
+  merge before a rerun of #631 can use it. The SDK and Factory targets are
+  planned only for the admitted #631 head; another pull request that changes
+  source in those workspaces is still refused. Both PF-9666 admissions are
+  also pinned to #631's reviewed head, its merge base and its whole changed-path
+  delta (status, mode, blob sha256 and path, printed by
+  `--print-pf9666-delta <merge-base> <head>`), so any other head of #631 is
+  refused. Once #631 has merged, its head can no longer be a pull request head,
+  so the exception admits nothing; a follow-up removes it.
   Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation
