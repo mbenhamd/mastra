@@ -1,4 +1,5 @@
 import { vi } from 'vitest';
+import type { Mock } from 'vitest';
 import { EVENTS_SUBSCRIPTION_ID_META_KEY } from '../../../shared/events';
 import type {
   EventActiveNotificationParams,
@@ -101,8 +102,8 @@ export class FakePort implements EventsPort {
   readonly unsubscribeCalls: UnsubscribeEventsRequestParams[] = [];
   private readonly pollSteps: PollStep[] = [];
   private readonly subscribeSteps: SubscribeStep[] = [];
-  readonly ensureConnected = vi.fn(async () => {});
-  readonly log = vi.fn();
+  readonly ensureConnected: Mock<EventsPort['ensureConnected']> = vi.fn<EventsPort['ensureConnected']>(async () => {});
+  readonly log: Mock<EventsPort['log']> = vi.fn<EventsPort['log']>();
   webhookSetup?: EventsWebhookSetup;
   unsubscribeError?: Error;
 
