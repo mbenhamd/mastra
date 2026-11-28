@@ -214,7 +214,31 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   the `@cfworker/json-schema@4.1.6` devDependency of `packages/schema-compat`
   from #631, whose manifest blob is pinned and whose lockfile must equal the
   merge base plus the importer entry, the package entry and the snapshot, each
-  in its own section. Supported package checks use
+  in its own section. A second PF-9666 install admission covers #631 after it
+  added `patches/@cfworker__json-schema@4.1.6.patch`: the changed
+  dependency-graph files must be exactly that patch, `pnpm-workspace.yaml`,
+  `pnpm-lock.yaml` and the `schema-compat`, `agent-sdks/claude` and
+  `agent-sdks/openai` manifests, each pinned to its sha256 at the reviewed head,
+  with the lockfile `patch_hash` and workspace patch path naming the pinned
+  patch; any later change to those files needs a new owner-reviewed exception.
+  The validation plan admits the patch, `pnpm-workspace.yaml` and the
+  re-keyed lockfile importers for #631 only through that same verifier, so a
+  failing pin refuses both install and plan. `agent-sdks/claude`,
+  `agent-sdks/openai` and `mastracode/factory` are owned workspaces: the SDKs
+  run build, `tsc --noEmit`, lint and their Vitest suites with provider keys
+  cleared; Factory runs build, check, `build:lib` and lint; and
+  `mastracode/factory/src/routes/projects.ts` is paired with
+  `projects.test.ts`.
+  The workflow reads this validator from the protected base, so #634 must
+  merge before a rerun of #631 can use it. The SDK and Factory targets are
+  planned only for the admitted #631 head; another pull request that changes
+  source in those workspaces is still refused. Both PF-9666 admissions are
+  also pinned to #631's reviewed head, its merge base and its whole changed-path
+  delta (status, mode, blob sha256 and path, printed by
+  `--print-pf9666-delta <merge-base> <head>`), so any other head of #631 is
+  refused. Once #631 has merged, its head can no longer be a pull request head,
+  so the exception admits nothing; a follow-up removes it.
+  Supported package checks use
   path-bound filters that fail when no workspace matches. The exact PF-1880 CommonJS
   fixer and Vitest configuration files receive scripts TypeScript validation
   plus changed-test execution. Root `harnessv1/sections/**/*.md` specification
