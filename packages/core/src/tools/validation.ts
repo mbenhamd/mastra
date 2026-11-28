@@ -113,10 +113,20 @@ function safeValidate<T>(
 async function safeValidateAsync<T>(
   schema: StandardSchemaWithJSON<T>,
   data: unknown,
+  answered?: { asynchronously: boolean },
 ): Promise<{ value: T } | { issues: readonly StandardSchemaIssue[] }> {
   let result;
   try {
-    result = await schema['~standard'].validate(data);
+    const pending = schema['~standard'].validate(data);
+    if (
+      answered &&
+      pending !== null &&
+      (typeof pending === 'object' || typeof pending === 'function') &&
+      typeof (pending as PromiseLike<unknown>).then === 'function'
+    ) {
+      answered.asynchronously = true;
+    }
+    result = await pending;
   } catch {
     throw new ToolSchemaValidationError();
   }
@@ -338,6 +348,20 @@ function normalizeNullishInput(schema: StandardSchemaWithJSON<any>, input: unkno
  * @param value The value to check
  * @returns true if the value is a plain object
  */
+/** Primitives, arrays and plain objects with the same contents; anything else only when identical. */
+function isSamePlainValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, index) => isSamePlainValue(item, b[index]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const keys = Object.keys(a);
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every(key => Object.prototype.hasOwnProperty.call(b, key) && isSamePlainValue(a[key], b[key]))
+  );
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') {
     return false;
@@ -581,8 +605,11 @@ export function validateToolInput<T = unknown>(
 }
 
 /**
- * Validates tool input with the same normalization as `validateToolInput`, while
- * also supporting Standard Schema validators that return promises.
+ * Validates tool input with the same pipeline as `validateToolInput` (each
+ * fallback building on the previous one, and the same issues reported when
+ * every attempt fails), while also supporting Standard Schema validators that
+ * return promises. Keep the two in step: agent tool calls validate here, and
+ * `Tool.execute` then skips its own synchronous check.
  */
 export async function validateToolInputAsync<T = unknown>(
   schema: StandardSchemaWithJSON<T> | undefined,
@@ -593,33 +620,58 @@ export async function validateToolInputAsync<T = unknown>(
     if (!schema || !('~standard' in schema)) return { data: input as T };
     schema = toStandardSchema(schema);
 
+    // A validator that answers with a promise has no synchronous counterpart
+    // to mirror (safeValidate rejects it). Once one does, the remaining
+    // retries run as they did before this function mirrored the synchronous
+    // pipeline, so such a schema accepts nothing that path refused.
+    const answered = { asynchronously: false };
+
     let normalizedInput = normalizeNullishInput(schema, input);
     normalizedInput = convertUndefinedToNull(normalizedInput);
-    const validation = await safeValidateAsync(schema, normalizedInput);
+    const validation = await safeValidateAsync(schema, normalizedInput, answered);
     if ('value' in validation) return { data: validation.value };
+    const standardSchema = schema;
+    // Attempts already made after the first and the coerced one. When a later
+    // attempt answers with a promise, the earlier fallbacks run from here; an
+    // attempt with the same input is reused, never sent to the validator again.
+    const made: Array<{ input: unknown; result: Awaited<ReturnType<typeof safeValidateAsync<T>>> }> = [];
+    const asAsyncSchema = () =>
+      validateAsyncSchemaRetries(standardSchema, input, normalizedInput, validation, toolId, made);
+
+    let currentInput = normalizedInput;
+    let currentIssues = validation.issues;
 
     const coercedInput = coerceStringifiedJsonValues(schema, normalizedInput);
     if (coercedInput !== normalizedInput) {
-      const coercedValidation = await safeValidateAsync(schema, coercedInput);
+      const coercedValidation = await safeValidateAsync(schema, coercedInput, answered);
       if ('value' in coercedValidation) return { data: coercedValidation.value };
+      currentInput = coercedInput;
+      currentIssues = coercedValidation.issues;
     }
+    if (answered.asynchronously) return await asAsyncSchema();
 
     const failingNullPaths = new Set(
-      validation.issues
+      currentIssues
         .filter(issue => {
           if (!issue.path || issue.path.length === 0) return false;
-          const value = getValueAtPath(normalizedInput, issue.path);
+          const value = getValueAtPath(currentInput, issue.path);
           return value === null || value === undefined;
         })
         .map(issue => issue.path?.map(p => (typeof p === 'object' && 'key' in p ? String(p.key) : String(p))).join('.'))
         .filter((path): path is string => Boolean(path)),
     );
     const strippedInput =
-      failingNullPaths.size > 0 ? stripNullishValuesAtPaths(input, failingNullPaths) : stripNullishValues(input);
+      failingNullPaths.size > 0
+        ? stripNullishValuesAtPaths(currentInput, failingNullPaths)
+        : stripNullishValues(coercedInput !== normalizedInput ? coercedInput : input);
     const normalizedStripped = normalizeNullishInput(schema, strippedInput);
-    const retryValidation = await safeValidateAsync(schema, normalizedStripped);
+    const retryValidation = await safeValidateAsync(schema, normalizedStripped, answered);
+    made.push({ input: normalizedStripped, result: retryValidation });
+    if (answered.asynchronously) return await asAsyncSchema();
     if ('value' in retryValidation) return { data: retryValidation.value };
+    if (failingNullPaths.size > 0) currentInput = normalizedStripped;
 
+    let aliasIssues: typeof validation.issues | undefined;
     const promptJsonSchema = standardSchemaToJSONSchema(schema, { io: 'input' });
     const schemaExpectsPrompt =
       promptJsonSchema.type === 'object' &&
@@ -627,33 +679,104 @@ export async function validateToolInputAsync<T = unknown>(
       'prompt' in promptJsonSchema.properties;
     if (
       schemaExpectsPrompt &&
-      normalizedInput != null &&
-      typeof normalizedInput === 'object' &&
-      !Array.isArray(normalizedInput)
+      currentInput != null &&
+      typeof currentInput === 'object' &&
+      !Array.isArray(currentInput)
     ) {
-      const obj = normalizedInput as Record<string, unknown>;
+      const obj = currentInput as Record<string, unknown>;
       if (obj.prompt == null) {
         const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
         if (alias !== undefined) {
-          const promptValidation = await safeValidateAsync(schema, { ...obj, prompt: alias });
+          const promptInput = { ...obj, prompt: alias };
+          const promptValidation = await safeValidateAsync(schema, promptInput, answered);
+          made.push({ input: promptInput, result: promptValidation });
+          if (answered.asynchronously) return await asAsyncSchema();
           if ('value' in promptValidation) return { data: promptValidation.value };
+          aliasIssues = promptValidation.issues;
         }
       }
     }
 
-    const errorMessages = validation.issues
+    // As in validateToolInputUnsafe (GitHub #24539): after a path-stripped
+    // retry, its issues are the real ones; the first pass also lists nulls on
+    // optional fields that stripping resolved.
+    const finalIssues = aliasIssues ?? (failingNullPaths.size > 0 ? retryValidation.issues : currentIssues);
+    const errorMessages = finalIssues
       .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
       .join('\n');
     return {
       error: markToolValidationError<T>({
         error: true,
         message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
-        validationErrors: buildFormattedErrors<T>(validation.issues),
+        validationErrors: buildFormattedErrors<T>(finalIssues),
       }),
     };
   } catch {
     throw new ToolSchemaValidationError();
   }
+}
+
+/**
+ * The null-strip and prompt-alias retries for a schema whose validator answers
+ * with a promise: nulls are located from the first attempt's issues, stripped
+ * from the raw input, and the alias is tried on the first normalized input.
+ * A refusal lists the first attempt's issues. An attempt in `made` whose input
+ * is the same plain value is reused instead of being validated again.
+ */
+async function validateAsyncSchemaRetries<T>(
+  schema: StandardSchemaWithJSON<T>,
+  input: unknown,
+  normalizedInput: unknown,
+  validation: { issues: readonly StandardSchemaIssue[] },
+  toolId: string | undefined,
+  made: ReadonlyArray<{ input: unknown; result: { value: T } | { issues: readonly StandardSchemaIssue[] } }>,
+): Promise<{ data: T; error?: undefined } | { data?: undefined; error: ValidationError<T> }> {
+  const attempt = (candidate: unknown) =>
+    made.find(entry => isSamePlainValue(entry.input, candidate))?.result ?? safeValidateAsync(schema, candidate);
+  const failingNullPaths = new Set(
+    validation.issues
+      .filter(issue => {
+        if (!issue.path || issue.path.length === 0) return false;
+        const value = getValueAtPath(normalizedInput, issue.path);
+        return value === null || value === undefined;
+      })
+      .map(issue => issue.path?.map(p => (typeof p === 'object' && 'key' in p ? String(p.key) : String(p))).join('.'))
+      .filter((path): path is string => Boolean(path)),
+  );
+  const strippedInput =
+    failingNullPaths.size > 0 ? stripNullishValuesAtPaths(input, failingNullPaths) : stripNullishValues(input);
+  const retryValidation = await attempt(normalizeNullishInput(schema, strippedInput));
+  if ('value' in retryValidation) return { data: retryValidation.value };
+
+  const promptJsonSchema = standardSchemaToJSONSchema(schema, { io: 'input' });
+  if (
+    promptJsonSchema.type === 'object' &&
+    promptJsonSchema.properties != null &&
+    'prompt' in promptJsonSchema.properties &&
+    normalizedInput != null &&
+    typeof normalizedInput === 'object' &&
+    !Array.isArray(normalizedInput)
+  ) {
+    const obj = normalizedInput as Record<string, unknown>;
+    if (obj.prompt == null) {
+      const alias = [obj.query, obj.message, obj.input].find((value): value is string => typeof value === 'string');
+      if (alias !== undefined) {
+        const promptValidation = await attempt({ ...obj, prompt: alias });
+        if ('value' in promptValidation) return { data: promptValidation.value };
+      }
+    }
+  }
+
+  const errorMessages = validation.issues
+    .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
+    .join('\n');
+  return {
+    error: markToolValidationError<T>({
+      error: true,
+      message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
+      validationErrors: buildFormattedErrors<T>(validation.issues),
+    }),
+  };
 }
 
 function validateToolInputUnsafe<T = unknown>(
