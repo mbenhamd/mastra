@@ -202,6 +202,13 @@ const editor = new MastraEditor({
       "Passed to both Composio clients. Set it to `false` to turn off the Composio SDK's usage analytics. When omitted, the SDK default applies.",
     isOptional: true,
   },
+  {
+    name: 'toolkitVersions',
+    type: 'Readonly<Record<string, string>>',
+    description:
+      "Passed to both Composio clients. The dated toolkit version each toolkit's tools are fetched and executed at, keyed by toolkit slug, for example `{ gmail: '20261120_00' }`. It overrides the SDK's `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>` environment values key by key. A toolkit in neither runs Composio's `latest` version. The connection-management session tools are not pinned.",
+    isOptional: true,
+  },
 ]}
 />
 
@@ -265,6 +272,20 @@ new ComposioToolProvider({
 Without `sharedConnections`, shared-scope connections are Composio PRIVATE accounts under the `shared` user. Composio doesn't support SHARED accounts for toolkits that require custom connection fields, so authorization fails for those toolkits instead of creating a PRIVATE account.
 
 `listConnections()` returns the requested users' PRIVATE and SHARED accounts, plus SHARED accounts owned by other users whose ACL grants access to one of the requested users. You can pin these accounts like any other connected account.
+
+### List a user's own connections across toolkits
+
+`listOwnedConnections()` lists the accounts one user owns across several toolkits in one listing, and reads every page. Each account carries its toolkit slug. Use it to check which apps a user has connected without one request per toolkit.
+
+```typescript
+const connections = await composio.listOwnedConnections({
+  userId: 'workspace:user_42',
+  toolkits: ['gmail', 'googlecalendar'],
+})
+const connected = new Set(connections.filter(c => c.status === 'active').map(c => c.toolkit))
+```
+
+Like `listConnections({ ownedOnly: true })`, it relies on Composio's owner filter, so it leaves out SHARED accounts owned by other users. It throws instead of returning a partial list when Composio fails, returns a page without items, an account without an id or toolkit, a non-string cursor, a repeated cursor, or more than 50 pages. A `userId` must be non-empty and contain no commas.
 
 ### Map application users to Composio users
 
@@ -417,6 +438,13 @@ export const composioTools = await composio.resolveCatalogTools({
     isOptional: true,
   },
   {
+    name: 'fixedArguments',
+    type: 'Record<string, Record<string, unknown>>',
+    description:
+      "Arguments set on every call, keyed by tool slug and matched case-insensitively. The model isn't offered them, and the fixed value replaces whatever a call sends. When the tool's schema doesn't allow additional properties, a call that sends a fixed argument is refused before it reaches Composio.",
+    isOptional: true,
+  },
+  {
     name: 'resolveIdentity',
     type: '(input: { requestContext?: RequestContext; toolSlug: string; toolkit?: string }) => ComposioCallIdentity | undefined | Promise<ComposioCallIdentity | undefined>',
     description:
@@ -425,7 +453,7 @@ export const composioTools = await composio.resolveCatalogTools({
 ]}
 />
 
-`resolveCatalogTools()` returns the tools keyed by slug. It throws when `toolSlugs` contains a connection management tool, because those tools need a session owned by the caller. A call throws before it reaches Composio when `resolveIdentity` returns `undefined`, a blank user ID, or the reserved ID `__mastra_catalog_schema__` that the schemas are fetched under. `requireToolApproval` applies to catalog tools as well.
+`resolveCatalogTools()` returns the tools keyed by slug. It throws when `toolSlugs` contains a connection management tool, because those tools need a session owned by the caller. It also throws when `fixedArguments` names a tool outside `toolSlugs`, or an argument that isn't one of the tool's top-level input parameters, so a renamed Composio argument fails instead of going unset. A call throws before it reaches Composio when `resolveIdentity` returns `undefined`, a blank user ID, or the reserved ID `__mastra_catalog_schema__` that the schemas are fetched under. `requireToolApproval` applies to catalog tools as well.
 
 An approved call executes with the request context of the resumed run. Ensure that a resumed run carries the original caller's context.
 

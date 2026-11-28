@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
@@ -14,6 +14,7 @@ const { composioInstances, makeFakeComposio, composioTransport } = vi.hoisted(()
   interface FakeComposioInstance {
     apiKey: string;
     allowTracking?: boolean;
+    toolkitVersions?: Record<string, string>;
     hasProvider: boolean;
     toolkits: { get: ReturnType<typeof vi.fn>; getConnectedAccountInitiationFields: ReturnType<typeof vi.fn> };
     tools: { get: ReturnType<typeof vi.fn>; getRawComposioTools: ReturnType<typeof vi.fn> };
@@ -30,10 +31,16 @@ const { composioInstances, makeFakeComposio, composioTransport } = vi.hoisted(()
 
   const instances: FakeComposioInstance[] = [];
 
-  const factory = (opts: { apiKey: string; provider?: unknown; allowTracking?: boolean }): FakeComposioInstance => {
+  const factory = (opts: {
+    apiKey: string;
+    provider?: unknown;
+    allowTracking?: boolean;
+    toolkitVersions?: Record<string, string>;
+  }): FakeComposioInstance => {
     const inst: FakeComposioInstance = {
       apiKey: opts.apiKey,
       allowTracking: opts.allowTracking,
+      toolkitVersions: opts.toolkitVersions,
       hasProvider: Boolean(opts.provider),
       toolkits: { get: vi.fn(), getConnectedAccountInitiationFields: vi.fn() },
       tools: { get: vi.fn(), getRawComposioTools: vi.fn() },
@@ -59,7 +66,7 @@ type FakeComposioInstance = ReturnType<typeof makeFakeComposio>;
 vi.mock('@composio/core', () => ({
   Composio: function (
     this: Record<string, unknown>,
-    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean },
+    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean; toolkitVersions?: Record<string, string> },
   ) {
     if (composioTransport.create) return composioTransport.create(opts);
     Object.assign(this, makeFakeComposio(opts));
@@ -1356,6 +1363,56 @@ describe('ComposioToolProvider — listConnections', () => {
     });
   });
 
+  describe('toolkit versions through the real SDK and HTTP requests', () => {
+    let actual: typeof import('@composio/core');
+    let baseURL: string;
+    const catalogQueries: URLSearchParams[] = [];
+    const server = createServer((request, reply) => {
+      const url = new URL(request.url!, baseURL);
+      if (!url.pathname.endsWith('/tools') || request.method !== 'GET') {
+        reply.writeHead(404).end();
+        return;
+      }
+      catalogQueries.push(url.searchParams);
+      reply.writeHead(200, { 'content-type': 'application/json' });
+      reply.end(JSON.stringify({ items: [], next_cursor: null, total_pages: 1 }));
+    });
+    beforeAll(async () => {
+      actual = await vi.importActual<typeof import('@composio/core')>('@composio/core');
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    });
+    beforeEach(() => {
+      catalogQueries.length = 0;
+      composioTransport.create = opts =>
+        new actual.Composio({ ...opts, baseURL, allowTracking: false, disableVersionCheck: true });
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+    afterAll(async () => {
+      composioTransport.create = undefined;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+    });
+
+    it('requests the catalog at the pinned versions, laid over the environment pins', async () => {
+      vi.stubEnv('COMPOSIO_TOOLKIT_VERSION_GMAIL', '20261001_00');
+      vi.stubEnv('COMPOSIO_TOOLKIT_VERSION_GITHUB', '20261101_00');
+      const toolkitVersions = { gmail: '20261120_00' };
+      const integration = new ComposioToolProvider({ apiKey: 'k', toolkitVersions });
+      // The host edits its map before any client exists: the provider keeps
+      // the map it was built with.
+      toolkitVersions.gmail = 'edited';
+
+      await integration.listToolsVNext({ toolkit: 'gmail' });
+
+      expect(catalogQueries).toHaveLength(1);
+      expect(catalogQueries[0]!.get('toolkit_versions[gmail]')).toBe('20261120_00');
+      expect(catalogQueries[0]!.get('toolkit_versions[github]')).toBe('20261101_00');
+    });
+  });
+
   describe('connections through the real SDK and HTTP responses', () => {
     let actual: typeof import('@composio/core');
     let baseURL: string;
@@ -1458,6 +1515,64 @@ describe('ComposioToolProvider — listConnections', () => {
 
       await expect(integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] })).rejects.toThrow(
         'Composio repeated a cursor before connection ownership could be resolved',
+      );
+    });
+
+    it("lists the user's own accounts across toolkits and pages in one owner-filtered listing", async () => {
+      const queries: URLSearchParams[] = [];
+      response = query => {
+        queries.push(query);
+        if (query.get('user_ids') !== 'user_a' || query.get('account_type') !== 'ALL') {
+          return { items: [account('ca_other', 'ACTIVE', 'admin', 'SHARED')], next_cursor: null };
+        }
+        // Page 2 repeats ca_mail, as a listing that shifts between pages can.
+        return query.get('cursor') === 'page-2'
+          ? {
+              items: [
+                account('ca_mail', 'ACTIVE', 'user_a', 'SHARED'),
+                { ...account('ca_cal', 'INITIATED', 'user_a', 'PRIVATE'), toolkit: { slug: 'googlecalendar' } },
+              ],
+            }
+          : { items: [account('ca_mail', 'ACTIVE', 'user_a', 'SHARED')], next_cursor: 'page-2' };
+      };
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+
+      const result = await integration.listOwnedConnections({
+        userId: 'user_a',
+        toolkits: ['gmail', 'googlecalendar', 'gmail'],
+      });
+
+      expect(result).toEqual([
+        {
+          connectionId: 'ca_mail',
+          toolkit: 'gmail',
+          status: 'active',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          accountType: 'SHARED',
+        },
+        {
+          connectionId: 'ca_cal',
+          toolkit: 'googlecalendar',
+          status: 'pending',
+          createdAt: '2026-01-01T00:00:00Z',
+          authorId: 'user_a',
+          accountType: 'PRIVATE',
+        },
+      ]);
+      expect(queries).toHaveLength(2);
+      expect(queries.map(query => query.getAll('toolkit_slugs').join(','))).toEqual([
+        'gmail,googlecalendar',
+        'gmail,googlecalendar',
+      ]);
+    });
+
+    it('rejects an owned-connection listing whose cursor repeats instead of returning part of it', async () => {
+      response = () => ({ items: [account('ca_mail', 'ACTIVE', 'user_a', 'PRIVATE')], next_cursor: 'same' });
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+
+      await expect(integration.listOwnedConnections({ userId: 'user_a', toolkits: ['gmail'] })).rejects.toThrow(
+        'Composio repeated a cursor before the owned connections were listed',
       );
     });
   });
@@ -1667,6 +1782,28 @@ describe('ComposioToolProvider — approval from Composio tags', () => {
       [false, undefined],
     ]);
   });
+
+  it('pins both Composio clients to the configured toolkit versions, and leaves the SDK default otherwise', async () => {
+    const pinned = async (config: Partial<ComposioToolProviderConfig>) => {
+      composioInstances.length = 0;
+      const { integration } = await resolveWithPolicy([], config);
+      // The host edits its map after the Mastra client exists and before the
+      // raw one does: neither client sees the edit.
+      if (config.toolkitVersions) (config.toolkitVersions as Record<string, string>).gmail = 'edited';
+      await integration.listToolkitsVNext().catch(() => undefined);
+      return composioInstances.map(instance => [instance.hasProvider, instance.toolkitVersions]);
+    };
+    const toolkitVersions = { gmail: '20261120_00', github: '20261123_00' };
+    expect(await pinned({ toolkitVersions: { ...toolkitVersions } })).toEqual([
+      [true, toolkitVersions],
+      [false, toolkitVersions],
+    ]);
+    // Absent: the SDK reads COMPOSIO_TOOLKIT_VERSION_* or falls back to `latest`.
+    expect(await pinned({})).toEqual([
+      [true, undefined],
+      [false, undefined],
+    ]);
+  });
 });
 
 describe('ComposioToolProvider — shared catalog tools', () => {
@@ -1830,5 +1967,115 @@ describe('ComposioToolProvider — shared catalog tools', () => {
     await expect(
       integration.resolveCatalogTools({ toolSlugs: ['COMPOSIO_MANAGE_CONNECTIONS'], resolveIdentity: () => undefined }),
     ).rejects.toThrow('caller-scoped session');
+  });
+
+  // PF-9975: a Gmail search with the schema defaults returns each message's
+  // whole base64 MIME payload (1.67 MB for ten messages). The host fixes
+  // `include_payload: false`; the model must not be offered the argument and
+  // cannot turn it back on. The real `MastraProvider.wrapTool` builds the
+  // model-facing tool from the modified schema, as `tools.get` does; the call
+  // then runs `beforeExecute` on the SDK's execute body.
+  const gmailSearchSchema = {
+    slug: 'GMAIL_FETCH_EMAILS',
+    name: 'Fetch emails',
+    description: 'Fetch emails',
+    toolkit: { slug: 'gmail', name: 'Gmail' },
+    tags: ['readOnlyHint'],
+    inputParameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        include_payload: { type: 'boolean', default: true },
+        verbose: { type: 'boolean', default: true },
+      },
+      required: ['query', 'include_payload'],
+    },
+    outputParameters: { type: 'object', properties: {} },
+  };
+
+  async function realWrapperCatalog(fixedArguments: Record<string, Record<string, unknown>>) {
+    const { MastraProvider } = await vi.importActual<typeof import('@composio/mastra')>('@composio/mastra');
+    const integration = new ComposioToolProvider({ apiKey: 'k' });
+    await integration
+      .resolveToolsVNext({ toolSlugs: ['warm'], toolMeta: {}, connectionId: 'ca_0' })
+      .catch(() => undefined);
+    const mastra = getMastraInstance();
+    mastra.tools.get.mockReset();
+    const sentArguments: Array<Record<string, unknown> | undefined> = [];
+    mastra.tools.get.mockImplementation(
+      async (
+        fetchedAs: string,
+        _filters: unknown,
+        modifiers: {
+          beforeExecute: (input: { toolSlug: string; toolkitSlug: string; params: Record<string, unknown> }) => unknown;
+          modifySchema: (input: { toolSlug: string; toolkitSlug: string; schema: unknown }) => unknown;
+        },
+      ) => {
+        const schema = await modifiers.modifySchema({
+          toolSlug: gmailSearchSchema.slug,
+          toolkitSlug: 'gmail',
+          schema: gmailSearchSchema,
+        });
+        const wrapped = (
+          new MastraProvider() as unknown as {
+            wrapTool: (
+              tool: unknown,
+              exec: (slug: string, args: Record<string, unknown>) => Promise<unknown>,
+            ) => unknown;
+          }
+        ).wrapTool(schema, async (toolSlug, args) => {
+          const params = (await modifiers.beforeExecute({
+            toolSlug,
+            toolkitSlug: 'gmail',
+            params: { userId: fetchedAs, arguments: args },
+          })) as { arguments?: Record<string, unknown> };
+          sentArguments.push(params.arguments);
+          return { data: {}, error: null, successful: true };
+        });
+        return { [gmailSearchSchema.slug]: wrapped };
+      },
+    );
+    const tools = await integration.resolveCatalogTools({
+      toolSlugs: [gmailSearchSchema.slug],
+      fixedArguments,
+      resolveIdentity: () => ({ userId: 'pf:alice' }),
+    });
+    return { tools, sentArguments };
+  }
+
+  it('hides a fixed argument from the model, sends its value, and refuses a call that sets it', async () => {
+    const { standardSchemaToJSONSchema } = await import('@mastra/schema-compat');
+    const { tools, sentArguments } = await realWrapperCatalog({
+      GMAIL_FETCH_EMAILS: { include_payload: false },
+    });
+    const search = tools.GMAIL_FETCH_EMAILS!;
+    const modelSchema = standardSchemaToJSONSchema(search.inputSchema as never, { io: 'input' }) as {
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+    expect(Object.keys(modelSchema.properties ?? {}).sort()).toEqual(['query', 'verbose']);
+    expect(modelSchema.required).toEqual(['query']);
+
+    const context = { requestContext: createRequestContext({}) } as never;
+    await search.execute!({ query: 'from:me' } as never, context);
+    expect(sentArguments).toEqual([{ query: 'from:me', include_payload: false }]);
+
+    // A model that sends the hidden argument anyway fails input validation;
+    // nothing reaches Composio with its value.
+    const refused = (await search.execute!({ query: 'from:me', include_payload: true } as never, context)) as {
+      error?: boolean;
+      message?: string;
+    };
+    expect(refused.error).toBe(true);
+    expect(refused.message).toContain('Tool input validation failed');
+    expect(sentArguments).toHaveLength(1);
+    // The SDK keeps the raw schema for execution; it is not edited in place.
+    expect(Object.keys(gmailSearchSchema.inputParameters.properties)).toContain('include_payload');
+  });
+
+  it('refuses to resolve when a fixed argument is not one of the tool parameters', async () => {
+    await expect(realWrapperCatalog({ GMAIL_FETCH_EMAILS: { includePayload: false } })).rejects.toThrow(
+      'GMAIL_FETCH_EMAILS has no input parameter includePayload',
+    );
   });
 });

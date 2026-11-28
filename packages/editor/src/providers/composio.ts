@@ -73,6 +73,22 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
    * usage analytics. Absent keeps the SDK default.
    */
   allowTracking?: boolean;
+  /**
+   * The dated toolkit version each toolkit's tools are fetched and executed
+   * at, keyed by toolkit slug (for example `{ gmail: '20261120_00' }`).
+   * Copied when the provider is built and forwarded to both Composio
+   * clients, so a later change to the caller's map reaches neither.
+   *
+   * The SDK lays this map over its `COMPOSIO_TOOLKIT_VERSION_<TOOLKIT>`
+   * environment values, key by key, with the map winning. A toolkit in
+   * neither runs Composio's `latest` version: provider execution skips the
+   * SDK's version check. Slugs match case-insensitively but are otherwise
+   * compared as written. A host that must not follow Composio's schema
+   * changes unannounced maps every toolkit it offers. The connection-management
+   * session tools (`COMPOSIO_MANAGE_CONNECTIONS`, `COMPOSIO_WAIT_FOR_CONNECTIONS`)
+   * are not pinned: the SDK's session requests carry no toolkit version.
+   */
+  toolkitVersions?: Readonly<Record<string, string>>;
 }
 
 /** What {@link ComposioToolProviderConfig.requireToolApproval} decides on. */
@@ -141,11 +157,38 @@ export interface ComposioListConnectionsResult extends ListConnectionsResult {
   items: ComposioExistingConnection[];
 }
 
+/** Options for {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioListOwnedConnectionsOpts {
+  /** The bucket whose own accounts are listed. */
+  userId: string;
+  /** Toolkit slugs to list the bucket's accounts for. */
+  toolkits: readonly string[];
+}
+
+/** One account listed by {@link ComposioToolProvider.listOwnedConnections}. */
+export interface ComposioOwnedConnection extends ExistingConnection {
+  /** The toolkit slug Composio reports for the account. */
+  toolkit: string;
+  /** Composio's sharing model for the account, when Composio reports one. */
+  accountType?: 'PRIVATE' | 'SHARED';
+}
+
 export interface ResolveComposioCatalogToolsOpts {
   /** Composio tool slugs to materialise. */
   toolSlugs: string[];
   /** Per-tool description overrides keyed by slug. */
   toolMeta?: Record<string, { description?: string; toolkit?: string }>;
+  /**
+   * Arguments the host fixes per tool slug (matched case-insensitively, as
+   * Composio matches slugs). Each key is removed from the input schema the
+   * model sees, and its value replaces whatever a call sends. Where the
+   * tool's schema does not allow additional properties, a call that sends the
+   * key is refused by input validation before it reaches Composio. Resolving
+   * throws when a slug is not in `toolSlugs` or a key is not one of the tool's
+   * top-level input parameters, so a renamed Composio argument fails instead
+   * of silently going unfixed.
+   */
+  fixedArguments?: Record<string, Record<string, unknown>>;
   /** Decides each call's identity from that call's request context. */
   resolveIdentity: ComposioCallIdentityResolver;
 }
@@ -234,6 +277,7 @@ export class ComposioToolProvider extends BaseToolProvider {
   private readonly apiKey: string;
   private readonly requireToolApproval?: boolean | ComposioRequireToolApproval;
   private readonly allowTracking?: boolean;
+  private readonly toolkitVersions?: Readonly<Record<string, string>>;
   private readonly sharedConnections?: ComposioSharedConnectionsConfig;
   private rawClient: Composio | null = null;
   private mastraClient: Composio<MastraProvider> | null = null;
@@ -249,17 +293,24 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.sharedConnections = config.sharedConnections;
     this.requireToolApproval = config.requireToolApproval;
     this.allowTracking = config.allowTracking;
+    this.toolkitVersions = config.toolkitVersions === undefined ? undefined : { ...config.toolkitVersions };
   }
 
   /**
    * Options shared by both clients. `disableVersionCheck` stops the SDK from
    * asking the npm registry for its latest version whenever a client is
-   * built: a server provider must not depend on npm egress.
+   * built: a server provider must not depend on npm egress. `toolkitVersions`
+   * pins the version both clients fetch and execute tools at.
    */
-  private clientOptions(): { allowTracking?: boolean; disableVersionCheck: true } {
+  private clientOptions(): {
+    allowTracking?: boolean;
+    disableVersionCheck: true;
+    toolkitVersions?: Record<string, string>;
+  } {
     return {
       disableVersionCheck: true,
       ...(this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking }),
+      ...(this.toolkitVersions === undefined ? {} : { toolkitVersions: { ...this.toolkitVersions } }),
     };
   }
 
@@ -524,15 +575,35 @@ export class ComposioToolProvider extends BaseToolProvider {
    * `requireToolApproval` applies as in {@link resolveToolsVNext}.
    */
   async resolveCatalogTools(opts: ResolveComposioCatalogToolsOpts): Promise<Record<string, ToolAction<any, any, any>>> {
+    const catalogSlugs = new Set(opts.toolSlugs.map(slug => slug.toUpperCase()));
+    const unlisted = Object.keys(opts.fixedArguments ?? {}).filter(slug => !catalogSlugs.has(slug.toUpperCase()));
+    if (unlisted.length > 0) {
+      throw new Error(`[composio] fixed arguments name tools outside the catalog: ${unlisted.join(', ')}`);
+    }
     if (opts.toolSlugs.length === 0) return {};
     const slugs = opts.toolSlugs.filter(slug => !COMPOSIO_CONNECTION_MANAGEMENT_TOOLS.has(slug));
     if (slugs.length !== opts.toolSlugs.length) {
       throw new Error('[composio] connection-management tools need a caller-scoped session, not a shared catalog');
     }
+    // Keyed upper-case: the SDK reports `tool.slug` as Composio returns it.
+    const fixedArguments = new Map<string, Record<string, unknown>>();
+    for (const [slug, fixed] of Object.entries(opts.fixedArguments ?? {})) {
+      if (fixedArguments.has(slug.toUpperCase())) {
+        throw new Error(`[composio] fixed arguments name ${slug} more than once`);
+      }
+      fixedArguments.set(slug.toUpperCase(), fixed);
+    }
     const callIdentity = new AsyncLocalStorage<ComposioCallIdentity>();
     const rawToolFacts: ToolFactsBySlug = new Map();
+    const captureFacts = captureToolFacts(rawToolFacts);
     const modifiers = {
-      beforeExecute: ({ params }: { params: { connectedAccountId?: string; userId?: string } }) => {
+      beforeExecute: ({
+        toolSlug,
+        params,
+      }: {
+        toolSlug: string;
+        params: { connectedAccountId?: string; userId?: string; arguments?: Record<string, unknown> };
+      }) => {
         const identity = callIdentity.getStore();
         if (!identity) {
           throw new Error('[composio] a catalog tool executed without its call identity');
@@ -543,9 +614,12 @@ export class ComposioToolProvider extends BaseToolProvider {
         } else {
           delete params.connectedAccountId;
         }
+        const fixed = fixedArguments.get(toolSlug.toUpperCase());
+        if (fixed) params.arguments = { ...params.arguments, ...fixed };
         return params;
       },
-      modifySchema: captureToolFacts(rawToolFacts),
+      modifySchema: (input: { toolSlug: string; toolkitSlug: string; schema: ComposioTool }) =>
+        withoutFixedArguments(captureFacts(input), input.toolSlug, fixedArguments.get(input.toolSlug.toUpperCase())),
     };
     const resolved = (await this.getMastraClient().tools.get(
       CATALOG_SCHEMA_USER_ID,
@@ -837,6 +911,84 @@ export class ComposioToolProvider extends BaseToolProvider {
   }
 
   /**
+   * List every account one bucket owns across several toolkits, in one
+   * owner-filtered listing that follows Composio's cursor to its end.
+   * `listConnections` with `ownedOnly` answers the same question for one
+   * toolkit and its first page only, so a caller checking N toolkits makes N
+   * calls and can miss accounts past that page.
+   *
+   * Ownership rests on Composio's owner filter, as it does for
+   * `listConnections` with `ownedOnly`: another user's SHARED account is not
+   * requested, whatever its ACL. A failed listing, a page without an `items`
+   * array, an account without an id or toolkit slug, a cursor that is not a
+   * string, a repeated cursor or more than {@link MAX_OWNED_CONNECTION_PAGES}
+   * pages throws rather than returning the accounts seen so far, so callers
+   * never read a partial scan as "not connected".
+   */
+  async listOwnedConnections(opts: ComposioListOwnedConnectionsOpts): Promise<ComposioOwnedConnection[]> {
+    // Composio joins `user_ids` with commas, so a comma would widen the owner filter.
+    if (opts.userId.length === 0 || opts.userId.includes(',')) {
+      throw new Error('[composio] listOwnedConnections requires one userId without commas');
+    }
+    const toolkitSlugs = Array.from(new Set(opts.toolkits));
+    if (toolkitSlugs.length === 0) return [];
+
+    const composio = this.getRawClient();
+    const items: ComposioOwnedConnection[] = [];
+    const seen = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let pages = 0; pages < MAX_OWNED_CONNECTION_PAGES; pages += 1) {
+      // Composio lists PRIVATE accounts only by default; `'ALL'` with the
+      // owner filter adds the bucket's own SHARED accounts.
+      const page: ConnectedAccountListResponse = await composio.connectedAccounts.list({
+        toolkitSlugs,
+        userIds: [opts.userId],
+        accountType: 'ALL',
+        limit: MAX_LIMIT,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!Array.isArray(page.items)) {
+        throw new Error('Composio returned a connected-account page without items');
+      }
+      for (const account of page.items) {
+        const id: unknown = account.id;
+        if (typeof id !== 'string' || id.length === 0) {
+          throw new Error('Composio returned a connected account without an id');
+        }
+        if (seen.has(account.id)) continue;
+        seen.add(account.id);
+        const toolkit: unknown = account.toolkit?.slug;
+        if (typeof toolkit !== 'string' || toolkit.length === 0) {
+          throw new Error(`Composio returned connected account ${account.id} without a toolkit`);
+        }
+        const accountType = account.experimental?.accountType;
+        items.push({
+          connectionId: account.id,
+          toolkit,
+          status: mapComposioStatus(account.status, account.isDisabled),
+          createdAt: account.createdAt,
+          authorId: opts.userId,
+          ...(accountType ? { accountType } : {}),
+        });
+      }
+      const next: unknown = (page as { nextCursor?: unknown }).nextCursor;
+      if (next === null || next === undefined || next === '') return items;
+      if (typeof next !== 'string') {
+        throw new Error('Composio returned a connected-account cursor that is not a string');
+      }
+      if (cursors.has(next)) {
+        throw new Error('Composio repeated a cursor before the owned connections were listed');
+      }
+      cursors.add(next);
+      cursor = next;
+    }
+    throw new Error(
+      `Composio listed more than ${MAX_OWNED_CONNECTION_PAGES} pages of owned connections without finishing`,
+    );
+  }
+
+  /**
    * Revoke a Composio connected account via
    * `DELETE /api/v3/connected_accounts/:nanoid`. Composio performs a soft
    * delete and responds with `{ success: boolean }`.
@@ -993,6 +1145,37 @@ function captureToolFacts(into: ToolFactsBySlug) {
   };
 }
 
+/**
+ * The tool schema without the host's fixed arguments, so the model is never
+ * offered them. A tool with fixed arguments gets a copy; the SDK keeps the
+ * raw schema for execution. Only top-level `properties` and `required` are
+ * edited: a key that exists only inside `allOf`/`anyOf`/`oneOf` or behind a
+ * root `$ref` is reported as missing, which fails closed.
+ * Throws when a fixed key is not one of the tool's top-level input parameters.
+ */
+function withoutFixedArguments(
+  schema: ComposioTool,
+  toolSlug: string,
+  fixed: Record<string, unknown> | undefined,
+): ComposioTool {
+  if (!fixed) return schema;
+  const params = (schema.inputParameters ?? {}) as { properties?: Record<string, unknown>; required?: string[] };
+  const properties = { ...params.properties };
+  const missing = Object.keys(fixed).filter(key => !Object.hasOwn(properties, key));
+  if (missing.length > 0) {
+    throw new Error(`[composio] ${toolSlug} has no input parameter ${missing.join(', ')} to fix`);
+  }
+  for (const key of Object.keys(fixed)) delete properties[key];
+  return {
+    ...schema,
+    inputParameters: {
+      ...params,
+      properties,
+      ...(params.required ? { required: params.required.filter(key => !Object.hasOwn(fixed, key)) } : {}),
+    },
+  } as ComposioTool;
+}
+
 // Mirror of `MASTRA_USER_KEY` from `@mastra/server`. Inlined to avoid a
 // reverse dependency from `editor` onto `server`.
 const MASTRA_USER_KEY = 'mastra__user';
@@ -1051,6 +1234,8 @@ function hasNextCursor(list: ConnectedAccountListResponse): boolean {
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+/** Pages `listOwnedConnections` reads before it gives up: 10,000 accounts at `MAX_LIMIT`. */
+const MAX_OWNED_CONNECTION_PAGES = 50;
 
 function clampLimit(limit: number | undefined): number {
   if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
