@@ -3,6 +3,7 @@ import { ErrorCategory, ErrorDomain, getErrorFromUnknown, MastraError } from '..
 import type { IMastraLogger } from '../logger';
 import type { RequestContext } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../schema';
 import type { StandardSchemaWithJSON } from '../schema';
 import { removeUndefinedValues } from '../utils';
 import type { ExecutionGraph } from './execution-engine';
@@ -29,6 +30,7 @@ async function validateWithStandardSchema<T>(
   schema: StandardSchemaWithJSON<T>,
   data: unknown,
 ): Promise<{ success: true; data: T } | { success: false; issues: { path?: (string | number)[]; message: string }[] }> {
+  if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
   const result = schema['~standard'].validate(data);
   const resolvedResult = result instanceof Promise ? await result : result;
 
@@ -197,7 +199,10 @@ export async function validateStepRequestContext({
   const requestContextSchema = step.requestContextSchema;
 
   if (requestContextSchema && validateInputs) {
-    // Get input-form values so transformed contexts can be forwarded safely.
+    // Read the context after the validator wait, so the values validated are
+    // the ones the step runs with. Input-form values let transformed contexts
+    // be forwarded safely.
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const contextValues = getRequestContextInputValues(requestContext);
     const validatedRequestContext = await validateWithStandardSchema(requestContextSchema, contextValues);
     if (!validatedRequestContext.success) {

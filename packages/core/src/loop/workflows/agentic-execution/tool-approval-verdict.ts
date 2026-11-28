@@ -2,6 +2,7 @@ import type { ActorSignal } from '../../../auth/ee';
 import type { IMastraLogger } from '../../../logger';
 import type { RequestContext } from '../../../request-context';
 import type { StandardSchemaWithJSON } from '../../../schema';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../../../schema';
 import type { RequireToolApproval } from '../../../tools';
 import {
   getBeforeApprovalFn,
@@ -128,6 +129,7 @@ export async function runBeforeApprovalChecks({
   // network loop still carry `inputSchema`.
   const validateInput = (tool as { validateInput?: unknown } | undefined)?.validateInput;
   const inputSchema = (tool as { inputSchema?: unknown } | undefined)?.inputSchema;
+  if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
   const validation: ToolInputValidationResult | undefined =
     typeof validateInput === 'function'
       ? await (validateInput as ToolInputValidator)(input)

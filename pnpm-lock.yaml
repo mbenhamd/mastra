@@ -280,6 +280,7 @@ overrides:
 packageExtensionsChecksum: sha256-rq5jU0RdanQwUgWwciVz3gHVxVAwgurzhPp0CNj8oD4=
 
 patchedDependencies:
+  '@cfworker/json-schema@4.1.6': 0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a
   '@changesets/get-dependents-graph@2.1.4': eb65c5cbf43c61ce6dcb0c77fa30d9aebcdffa3a70dee1faefc4cde4125f28fa
   '@earendil-works/pi-tui@0.80.6': 143464b7be6f7b88d7fdecf41bbb2f10b48be0bb8b69fc378f27932d403e5e7c
   '@joshwooding/vite-plugin-react-docgen-typescript@0.7.0': b12da0e1afbb3227d182cd3f3a5812bae17b2b04fc5c8e4f4fd4c530a76ad4c4
@@ -436,10 +437,14 @@ importers:
         version: 4.6.7
 
   agent-sdks/claude:
+    dependencies:
+      '@mastra/schema-compat':
+        specifier: workspace:*
+        version: link:../../packages/schema-compat
     devDependencies:
       '@anthropic-ai/claude-agent-sdk':
         specifier: ^0.3.220
-        version: 0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)
+        version: 0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)
       '@internal/lint':
         specifier: workspace:*
         version: link:../../packages/_config
@@ -508,6 +513,10 @@ importers:
         version: 4.1.12(@opentelemetry/api@1.9.1)(@types/node@22.19.15)(@vitest/coverage-v8@4.1.12)(@vitest/ui@4.1.12)(jsdom@30.1.1(@noble/hashes@2.4.0))(msw@2.14.6(@types/node@22.19.15)(typescript@7.0.2))(vite@8.3.4(@types/node@22.19.15)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.44.1)(tsx@4.23.1)(yaml@2.9.1))
 
   agent-sdks/openai:
+    dependencies:
+      '@mastra/schema-compat':
+        specifier: workspace:*
+        version: link:../../packages/schema-compat
     devDependencies:
       '@internal/lint':
         specifier: workspace:*
@@ -520,7 +529,7 @@ importers:
         version: link:../../packages/core
       '@openai/agents':
         specifier: ^0.11.6
-        version: 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+        version: 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       '@types/node':
         specifier: 22.19.15
         version: 22.19.15
@@ -3137,7 +3146,7 @@ importers:
         version: link:../mastra
       deepeval:
         specifier: ^0.1.32
-        version: 0.1.32(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@aws-sdk/client-bedrock-runtime@3.1104.0)(@aws-sdk/credential-provider-node@3.972.78)(@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2))(@mastra/core@packages+core)(@mastra/observability@observability+mastra)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ai@7.0.143(zod@4.6.7))(chokidar@3.6.0)(debug@4.4.3(supports-color@10.2.2))(rxjs@7.8.2)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))
+        version: 0.1.32(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@aws-sdk/client-bedrock-runtime@3.1104.0)(@aws-sdk/credential-provider-node@3.972.78)(@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2))(@mastra/core@packages+core)(@mastra/observability@observability+mastra)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ai@7.0.143(zod@4.6.7))(chokidar@3.6.0)(debug@4.4.3(supports-color@10.2.2))(rxjs@7.8.2)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))
     devDependencies:
       '@internal/lint':
         specifier: workspace:*
@@ -5474,7 +5483,7 @@ importers:
         version: 4.1.12(vitest@4.1.12)
       '@wong2/mcp-cli':
         specifier: ^2.0.0
-        version: 2.0.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7)
+        version: 2.0.0(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)
       cross-env:
         specifier: ^10.1.0
         version: 10.1.0
@@ -6185,6 +6194,9 @@ importers:
       '@ai-sdk/openai':
         specifier: ^3.0.130
         version: 3.0.130(zod@4.6.7)
+      '@cfworker/json-schema':
+        specifier: ^4.1.6
+        version: 4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a)
       '@internal/ai-sdk-v4':
         specifier: workspace:*
         version: link:../_vendored/ai_v4
@@ -8774,7 +8786,7 @@ importers:
     dependencies:
       '@google/genai':
         specifier: ^1.52.0
-        version: 1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2)
+        version: 1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2)
       '@mastra/schema-compat':
         specifier: workspace:*
         version: link:../../packages/schema-compat
@@ -9922,7 +9934,7 @@ importers:
     dependencies:
       files-sdk:
         specifier: ^1.9.0
-        version: 1.9.0(3229b866a7cacef5d335aa52e32d931b)
+        version: 1.9.0(13ad65e48fd01ea8c94f162843cb3bd1)
     devDependencies:
       '@internal/lint':
         specifier: workspace:*
@@ -12402,6 +12414,9 @@ packages:
   '@cfworker/json-schema@4.1.1':
     resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}
 
+  '@cfworker/json-schema@4.1.6':
+    resolution: {integrity: sha512-YzVGTHXf4bzlyAL5KAvHYCdNbbt6zM5cYkAgxqxQPDQM6aZ4ShIIN5yJ+6q7YeonnevxT8k/LmD2tJi/jOiKkg==}
+
   '@changesets/apply-release-plan@7.1.1':
     resolution: {integrity: sha512-9qPCm/rLx/xoOFXIHGB229+4GOL76S4MC+7tyOuTsR6+1jYlfFDQORdvwR5hDA6y4FL2BPt3qpbcQIS+dW85LA==}
 
@@ -13178,7 +13193,7 @@ packages:
 
   '@daytonaio/sdk@0.201.0':
     resolution: {integrity: sha512-j4kCkxyfGf9vd5SH/lQxXDr3LsatI9pm6Cr3eMnh1JZQxB4e3fbag7G2StjyUwXV7/90MOfja7xe8ntLIsoO1w==}
-    deprecated: 'Moved to @daytona/sdk, same API, no breaking changes. Please update: npm uninstall @daytonaio/sdk && npm i @daytona/sdk'
+    deprecated: 'Moved to @daytona/sdk, same API, no breaking changes. Please update: npm uninstall @daytonaio/sdk && npm i @daytona/sdk@0'
 
   '@deepgram/captions@1.2.0':
     resolution: {integrity: sha512-8B1C/oTxTxyHlSFubAhNRgCbQ2SQ5wwvtlByn8sDYZvdDtdn/VE2yEPZ4BvUnrKWmsbTQY6/ooLV+9Ka2qmDSQ==}
@@ -19496,6 +19511,7 @@ packages:
   '@sapphire/shapeshift@4.0.0':
     resolution: {integrity: sha512-d9dUmWVA7MMiKobL3VpLF8P2aeanRTu6ypG2OIaEv/ZHH/SUQ2iHOVyi5wAPjQ+HmnMuL0whK9ez8I/raWbtIg==}
     engines: {node: '>=v16'}
+    deprecated: Shapeshift was created when other validation libraries had significant limitations in performance and error reporting. Those advantages have diminished as libraries such as Zod have become faster and improved their error messages, while also gaining broader environment support, a larger community, and custom error printers.
 
   '@sapphire/snowflake@3.5.5':
     resolution: {integrity: sha512-xzvBr1Q1c4lCe7i6sRnrofxeO1QTP/LKQ6A6qy0iB4x5yfiSfARMEQEghojzTNALDTcv8En04qYNIco9/K9eZQ==}
@@ -19698,6 +19714,9 @@ packages:
   '@smithy/core@3.31.1':
     resolution: {integrity: sha512-CyogUINxvi7C7LDsh8Syo6hVJOT9ckz4rG8dRZfTJ8r91HkMY59PnNooaj7WcHyxEkxPfBAmbgztZU+xTo76lg==}
     engines: {node: '>=18.0.0'}
+    deprecated: |-
+      Deprecated due to a bug in custom logger data redaction. Upgrade to the latest version. If you used a custom logger with this
+        version, review your logs and rotate any credentials or other secrets. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/credential-provider-imds@4.4.16':
     resolution: {integrity: sha512-QfuLWAkLzptffFW980AFeHZFdqds2B64rpEd3uJ6lgs3xVn9QegGMUgUcj+4d7dRrAsya3r58ZKpku97WcFb4w==}
@@ -30243,7 +30262,7 @@ packages:
 
   serialize-error-cjs@0.1.4:
     resolution: {integrity: sha512-6a6dNqipzbCPlTFgztfNP2oG+IGcflMe/01zSzGrQcxGMKbIjOemBBD85pH92klWaJavAUWxAh9Z0aU28zxW6A==}
-    deprecated: Rolling release, please update to 0.3.0
+    deprecated: 'No longer maintained: Error causes are lost across JSON round-trips (finwo/serialize-error-cjs#12). Upgrade to 0.1.5 or the latest release.'
 
   serialize-error@12.0.0:
     resolution: {integrity: sha512-ZYkZLAvKTKQXWuh5XpBw7CdbSzagarX39WyZ2H07CDLC5/KfsRGlIXV8d4+tfqX1M7916mRqR1QfNHSij+c9Pw==}
@@ -32975,10 +32994,10 @@ snapshots:
   '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.220':
     optional: true
 
-  '@anthropic-ai/claude-agent-sdk@0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)':
+  '@anthropic-ai/claude-agent-sdk@0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)':
     dependencies:
       '@anthropic-ai/sdk': 0.112.3(zod@4.6.7)
-      '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7)
+      '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)
       zod: 4.6.7
     optionalDependencies:
       '@anthropic-ai/claude-agent-sdk-darwin-arm64': 0.3.220
@@ -35051,6 +35070,8 @@ snapshots:
     optional: true
 
   '@cfworker/json-schema@4.1.1': {}
+
+  '@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a)': {}
 
   '@changesets/apply-release-plan@7.1.1':
     dependencies:
@@ -38118,6 +38139,19 @@ snapshots:
       - supports-color
       - utf-8-validate
 
+  '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2)':
+    dependencies:
+      google-auth-library: 10.9.1(supports-color@10.2.2)
+      p-retry: 4.6.2
+      protobufjs: 8.8.0
+      ws: 8.22.0(bufferutil@4.1.0)
+    optionalDependencies:
+      '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)
+    transitivePeerDependencies:
+      - bufferutil
+      - supports-color
+      - utf-8-validate
+
   '@graphql-typed-document-node/core@3.2.0(graphql@16.14.0)':
     dependencies:
       graphql: 16.14.0
@@ -39736,6 +39770,30 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
+  '@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)':
+    dependencies:
+      '@hono/node-server': 1.19.15(hono@4.13.13)
+      ajv: 8.20.0
+      ajv-formats: 3.0.1(ajv@8.20.0)
+      content-type: 1.0.5
+      cors: 2.8.6
+      cross-spawn: 7.0.6
+      eventsource: 3.0.7
+      eventsource-parser: 3.0.8
+      express: 5.2.1(supports-color@10.2.2)
+      express-rate-limit: 8.5.1(express@5.2.1(supports-color@10.2.2))
+      hono: 4.13.13
+      jose: 6.2.12
+      json-schema-typed: 8.0.2
+      pkce-challenge: 5.0.0
+      raw-body: 4.0.0
+      zod: 4.6.7
+      zod-to-json-schema: 3.25.2(zod@4.6.7)
+    optionalDependencies:
+      '@cfworker/json-schema': 4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a)
+    transitivePeerDependencies:
+      - supports-color
+
   '@modelcontextprotocol/server-legacy@2.3.1(express@5.2.1(supports-color@10.2.2))':
     dependencies:
       '@modelcontextprotocol/core': 2.3.1
@@ -40274,9 +40332,24 @@ snapshots:
       - supports-color
       - ws
 
-  '@openai/agents-openai@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)':
+  '@openai/agents-core@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)':
     dependencies:
-      '@openai/agents-core': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+      debug: 4.4.3(supports-color@10.2.2)
+      openai: 6.49.0(@aws-sdk/credential-provider-node@3.972.78)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+    optionalDependencies:
+      '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)
+      zod: 4.6.7
+    transitivePeerDependencies:
+      - '@aws-sdk/credential-provider-node'
+      - '@cfworker/json-schema'
+      - '@smithy/hash-node'
+      - '@smithy/signature-v4'
+      - supports-color
+      - ws
+
+  '@openai/agents-openai@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)':
+    dependencies:
+      '@openai/agents-core': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       debug: 4.4.3(supports-color@10.2.2)
       openai: 6.49.0(@aws-sdk/credential-provider-node@3.972.78)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       zod: 4.6.7
@@ -40288,9 +40361,9 @@ snapshots:
       - supports-color
       - ws
 
-  '@openai/agents-realtime@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.6.7)':
+  '@openai/agents-realtime@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.6.7)':
     dependencies:
-      '@openai/agents-core': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+      '@openai/agents-core': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       '@types/ws': 8.18.1
       debug: 4.4.3(supports-color@10.2.2)
       ws: 8.22.0(bufferutil@4.1.0)
@@ -40304,11 +40377,11 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@openai/agents@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)':
+  '@openai/agents@0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)':
     dependencies:
       '@openai/agents-core': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
-      '@openai/agents-openai': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
-      '@openai/agents-realtime': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.6.7)
+      '@openai/agents-openai': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+      '@openai/agents-realtime': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.6.7)
       debug: 4.4.3(supports-color@10.2.2)
       openai: 6.49.0(@aws-sdk/credential-provider-node@3.972.78)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       zod: 4.6.7
@@ -45933,6 +46006,27 @@ snapshots:
       - supports-color
       - zod
 
+  '@wong2/mcp-cli@2.0.0(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)':
+    dependencies:
+      '@json-schema-tools/traverse': 1.11.0
+      '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7)
+      conf: 15.1.0
+      eventsource: 4.1.0
+      express: 5.2.1(supports-color@10.2.2)
+      get-port: 7.2.0
+      lodash-es: 4.18.1
+      meow: 14.1.0
+      open: 11.0.4
+      prompts: 2.4.2
+      strict-url-sanitise: 0.0.1
+      uri-template: 2.0.0
+      yocto-spinner: '@socketregistry/yocto-spinner@1.0.25'
+      yoctocolors: 2.1.2
+    transitivePeerDependencies:
+      - '@cfworker/json-schema'
+      - supports-color
+      - zod
+
   '@workflow/serde@4.1.0': {}
 
   '@workflow/serde@4.1.0-beta.2': {}
@@ -48106,7 +48200,7 @@ snapshots:
 
   deep-is@0.1.4: {}
 
-  deepeval@0.1.32(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@aws-sdk/client-bedrock-runtime@3.1104.0)(@aws-sdk/credential-provider-node@3.972.78)(@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2))(@mastra/core@packages+core)(@mastra/observability@observability+mastra)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ai@7.0.143(zod@4.6.7))(chokidar@3.6.0)(debug@4.4.3(supports-color@10.2.2))(rxjs@7.8.2)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0)):
+  deepeval@0.1.32(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@aws-sdk/client-bedrock-runtime@3.1104.0)(@aws-sdk/credential-provider-node@3.972.78)(@google/genai@1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2))(@mastra/core@packages+core)(@mastra/observability@observability+mastra)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(ai@7.0.143(zod@4.6.7))(chokidar@3.6.0)(debug@4.4.3(supports-color@10.2.2))(rxjs@7.8.2)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0)):
     dependencies:
       '@opentelemetry/api': 1.9.1
       '@opentelemetry/exporter-trace-otlp-grpc': 0.207.0(@opentelemetry/api@1.9.1)
@@ -48131,7 +48225,7 @@ snapshots:
     optionalDependencies:
       '@anthropic-ai/sdk': 0.112.3(zod@4.6.7)
       '@aws-sdk/client-bedrock-runtime': 3.1104.0
-      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2)
+      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(bufferutil@4.1.0)(supports-color@10.2.2)
       '@mastra/core': link:packages/core
       '@mastra/observability': link:observability/mastra
       ai: 7.0.143(zod@4.6.7)
@@ -49408,12 +49502,12 @@ snapshots:
   file-uri-to-path@1.0.0:
     optional: true
 
-  files-sdk@1.9.0(3229b866a7cacef5d335aa52e32d931b):
+  files-sdk@1.9.0(13ad65e48fd01ea8c94f162843cb3bd1):
     dependencies:
       commander: 15.0.0
       picomatch: 4.0.7
     optionalDependencies:
-      '@anthropic-ai/claude-agent-sdk': 0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)
+      '@anthropic-ai/claude-agent-sdk': 0.3.220(@anthropic-ai/sdk@0.112.3(zod@4.6.7))(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(supports-color@10.2.2)(zod@4.6.7))(zod@4.6.7)
       '@aws-sdk/client-s3': 3.1104.0
       '@aws-sdk/lib-storage': 3.997.0(@aws-sdk/client-s3@3.1104.0)
       '@azure/core-auth': 1.11.0(supports-color@10.2.2)
@@ -49421,7 +49515,7 @@ snapshots:
       '@azure/storage-blob': 12.34.0(supports-color@10.2.2)
       '@google-cloud/storage': 7.22.0(encoding@0.1.13)(supports-color@10.2.2)
       '@modelcontextprotocol/sdk': 1.32.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.6.7)
-      '@openai/agents': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.1)(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
+      '@openai/agents': 0.11.6(@aws-sdk/credential-provider-node@3.972.78)(@cfworker/json-schema@4.1.6(patch_hash=0238bcd3be2ecfaf5e9e9fb54be81478808b48fdba178b9e6aaa41092875c83a))(@smithy/hash-node@4.4.6)(@smithy/signature-v4@5.6.12)(bufferutil@4.1.0)(supports-color@10.2.2)(ws@8.22.0(bufferutil@4.1.0))(zod@4.6.7)
       '@opentelemetry/api': 1.9.1
       '@supabase/storage-js': 2.111.0
       ai: 6.0.309(zod@4.6.7)

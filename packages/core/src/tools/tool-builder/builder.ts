@@ -35,7 +35,13 @@ import { SpanType, wrapMastra, EntityType, getOrCreateSpan, createObservabilityC
 import type { AnySpan } from '../../observability';
 import { executeWithContext } from '../../observability/utils';
 import { isInfrastructureRequestContextKey, RequestContext } from '../../request-context';
-import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
+import {
+  isStandardSchemaWithJSON,
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+} from '../../schema';
 import type { StandardSchemaWithJSON } from '../../schema';
 import {
   getNeedsApprovalFn,
@@ -74,6 +80,7 @@ import {
   isToolValidationError,
   registerToolOutputValidationSchema,
   ToolSchemaValidationError,
+  refuseUnusableToolOutputSchema,
   validateToolInput,
   validateToolInputAsync,
   validateToolOutput,
@@ -815,6 +822,7 @@ export class CoreToolBuilder extends MastraBase {
       !isVercelTool(tool) && 'mcpMetadata' in tool ? (tool as { mcpMetadata?: McpMetadata }).mcpMetadata : undefined;
 
     const execFunction = async (args: unknown, execOptions: MastraToolInvocationOptions, toolSpan?: AnySpan) => {
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       // Without a tool span (skipToolSpan), nested work attaches to the caller's span instead.
       const contextSpan = toolSpan ?? (execOptions?.tracingContext || options.tracingContext)?.currentSpan;
       try {
@@ -1075,6 +1083,7 @@ export class CoreToolBuilder extends MastraBase {
     };
 
     return async (args: unknown, execOptions?: MastraToolInvocationOptions) => {
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       let logger = options.logger || this.logger;
       const actor = execOptions?.actor;
 
@@ -1181,6 +1190,17 @@ export class CoreToolBuilder extends MastraBase {
             logger.warn('Tool resume data validation failed', logData);
             toolSpan?.end({ output: { error: true }, attributes: { success: false } });
             return resumeValidation.error;
+          }
+        }
+
+        // A Vercel/AI SDK tool's output is validated here after it runs, so a tool whose output
+        // schema is refused must not run (Mastra tools check this in Tool.execute).
+        if (isVercelTool(tool)) {
+          const outputSchemaRefusal = refuseUnusableToolOutputSchema(this.getOutputSchema(), options.name);
+          if (outputSchemaRefusal) {
+            logger.warn('Tool output schema refused', logData);
+            toolSpan?.end({ output: { error: true }, attributes: { success: false } });
+            return outputSchemaRefusal;
           }
         }
 
@@ -1328,35 +1348,51 @@ export class CoreToolBuilder extends MastraBase {
           schemaToUse = toStandardSchema(originalSchema);
         }
 
+        const validateWithSchema = (value: unknown) => {
+          const result = schemaToUse['~standard'].validate(value);
+          // standard-schema validate may return a Promise
+          if (result instanceof Promise) {
+            return result.then(r => {
+              if ('issues' in r && r.issues) {
+                return {
+                  success: false as const,
+                  error: createStandardSchemaIssuesError(r.issues),
+                };
+              }
+              return { success: true as const, value: (r as { value: unknown }).value };
+            });
+          }
+          // standard-schema returns { value } on success or { issues } on failure,
+          // but AI SDK expects { success: boolean, value/error }
+          if ('issues' in result && result.issues) {
+            return {
+              success: false as const,
+              error: createStandardSchemaIssuesError(result.issues),
+            };
+          }
+          return { success: true as const, value: (result as { value: unknown }).value };
+        };
+
         processedInputSchema = jsonSchema(
           standardSchemaToJSONSchema(schemaToUse, {
             io: 'input',
           }),
           {
-            validate: (value: unknown) => {
-              const result = schemaToUse['~standard'].validate(value);
-              // standard-schema validate may return a Promise
-              if (result instanceof Promise) {
-                return result.then(r => {
-                  if ('issues' in r && r.issues) {
-                    return {
+            // While the JSON Schema validator import is still loading, return a Promise that waits
+            // for it. AI SDK versions that await the hook validate after the load. AI SDK v4 does
+            // not await it and reads the Promise as a failed result, so it refuses the call (fail
+            // closed). AI SDK v4 also drops that Promise, so a throw while validating it becomes a
+            // failed result here rather than an unhandled rejection. Once the validator has loaded,
+            // validation stays synchronous.
+            validate: (value: unknown) =>
+              jsonSchemaValidatorLoading()
+                ? jsonSchemaValidatorReady()
+                    .then(() => validateWithSchema(value))
+                    .catch((error: unknown) => ({
                       success: false as const,
-                      error: createStandardSchemaIssuesError(r.issues),
-                    };
-                  }
-                  return { success: true as const, value: (r as { value: unknown }).value };
-                });
-              }
-              // standard-schema returns { value } on success or { issues } on failure,
-              // but AI SDK expects { success: boolean, value/error }
-              if ('issues' in result && result.issues) {
-                return {
-                  success: false as const,
-                  error: createStandardSchemaIssuesError(result.issues),
-                };
-              }
-              return { success: true as const, value: (result as { value: unknown }).value };
-            },
+                      error: error instanceof Error ? error : new Error(String(error)),
+                    }))
+                : validateWithSchema(value),
           },
         );
       } else {
@@ -1460,10 +1496,14 @@ export class CoreToolBuilder extends MastraBase {
       // validator separately. The agent loop uses this to keep schema-invalid
       // calls out of a user-facing approval queue; execute() still performs
       // authoritative validation immediately before side effects.
-      validateInput: (params: unknown) =>
-        approvalInputValidationSchema
-          ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
-          : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name),
+      // While the JSON Schema validator is still loading, wait for it first.
+      validateInput: (params: unknown) => {
+        const validate = () =>
+          approvalInputValidationSchema
+            ? validateToolInputAsync(approvalInputValidationSchema, params, this.options.name)
+            : validateToolInput(inputValidationSchema ?? this.getParameters(), params, this.options.name);
+        return jsonSchemaValidatorLoading() ? jsonSchemaValidatorReady().then(validate) : validate();
+      },
       approvalInputEditing,
       execute: this.originalTool.execute
         ? this.createExecute(

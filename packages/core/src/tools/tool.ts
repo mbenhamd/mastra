@@ -2,7 +2,7 @@ import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
 import { RequestContext } from '../request-context';
 import { getRequestContextInputSource, REQUEST_CONTEXT_INPUT_SOURCE } from '../request-context/input-source';
-import { toStandardSchema } from '../schema';
+import { toStandardSchema, jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema, InferPublicSchemaInput } from '../schema';
 import type { SuspendOptions } from '../workflows';
 import { consumeBuilderValidatedInput, consumeBuilderValidatedSuspend } from './builder-validation-context';
@@ -22,7 +22,13 @@ import type {
   ToolResultStatus,
   ToolTerminalResultConfig,
 } from './types';
-import { validateToolInput, validateToolOutput, validateToolSuspendData, validateRequestContext } from './validation';
+import {
+  refuseUnusableToolOutputSchema,
+  validateToolInput,
+  validateToolOutput,
+  validateToolSuspendData,
+  validateRequestContext,
+} from './validation';
 
 /**
  * Marker to identify Mastra tools even when `instanceof` fails.
@@ -512,6 +518,7 @@ export class Tool<
     const originalExecute = opts.renderOnly ? async () => ({ acknowledged: true }) : opts.execute;
     if (originalExecute) {
       this.execute = async (inputData: TSchemaIn, context?: any) => {
+        if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
         // When a tool is being resumed (resumeData present in context), validation
         // must not FAIL the call: the original args were already validated during
         // the initial execution, and delegated resumes replay control fields the
@@ -709,6 +716,12 @@ export class Tool<
           if (resumeValidation.error) {
             return resumeValidation.error as any;
           }
+        }
+
+        // A tool whose output schema is refused does not run (see refuseUnusableToolOutputSchema).
+        const outputSchemaRefusal = refuseUnusableToolOutputSchema(this.outputSchema, this.id);
+        if (outputSchemaRefusal) {
+          return outputSchemaRefusal as any;
         }
 
         // Call the original execute with validated input and organized context

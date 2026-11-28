@@ -1,6 +1,14 @@
 import type { RequestContext } from '../request-context';
 import { getRequestContextInputValues } from '../request-context/input-source';
-import { isStandardSchemaWithJSON, toStandardSchema, standardSchemaToJSONSchema } from '../schema';
+import {
+  isStandardSchemaWithJSON,
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+  JSON_SCHEMA_REFUSAL,
+  JSON_SCHEMA_NON_RETRYABLE,
+} from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, StandardSchemaIssue } from '../schema';
 import { getZodTypeName, isZodArray, isZodObject, unwrapZodType } from '../utils/zod-utils';
 
@@ -116,6 +124,7 @@ async function safeValidateAsync<T>(
 ): Promise<{ value: T } | { issues: readonly StandardSchemaIssue[] }> {
   let result;
   try {
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     result = await schema['~standard'].validate(data);
   } catch {
     throw new ToolSchemaValidationError();
@@ -580,6 +589,27 @@ export function validateToolInput<T = unknown>(
   return runSchemaValidationBoundary(() => validateToolInputUnsafe(schema, input, toolId));
 }
 
+function hasNonRetryableIssue(issues: readonly StandardSchemaIssue[]): boolean {
+  return issues.some(issue => (issue as { [JSON_SCHEMA_NON_RETRYABLE]?: boolean })[JSON_SCHEMA_NON_RETRYABLE] === true);
+}
+
+function buildInputValidationError<T>(
+  issues: readonly StandardSchemaIssue[],
+  input: unknown,
+  toolId?: string,
+): { error: ValidationError<T> } {
+  const errorMessages = issues
+    .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
+    .join('\n');
+  return {
+    error: markToolValidationError<T>({
+      error: true,
+      message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
+      validationErrors: buildFormattedErrors<T>(issues),
+    }),
+  };
+}
+
 /**
  * Validates tool input with the same normalization as `validateToolInput`, while
  * also supporting Standard Schema validators that return promises.
@@ -597,11 +627,17 @@ export async function validateToolInputAsync<T = unknown>(
     normalizedInput = convertUndefinedToNull(normalizedInput);
     const validation = await safeValidateAsync(schema, normalizedInput);
     if ('value' in validation) return { data: validation.value };
+    if (hasNonRetryableIssue(validation.issues)) {
+      return buildInputValidationError<T>(validation.issues, input, toolId);
+    }
 
     const coercedInput = coerceStringifiedJsonValues(schema, normalizedInput);
     if (coercedInput !== normalizedInput) {
       const coercedValidation = await safeValidateAsync(schema, coercedInput);
       if ('value' in coercedValidation) return { data: coercedValidation.value };
+      if (hasNonRetryableIssue(coercedValidation.issues)) {
+        return buildInputValidationError<T>(coercedValidation.issues, input, toolId);
+      }
     }
 
     const failingNullPaths = new Set(
@@ -641,16 +677,7 @@ export async function validateToolInputAsync<T = unknown>(
       }
     }
 
-    const errorMessages = validation.issues
-      .map(issue => `- ${issue.path?.map(path => getPathKey(path)).join('.') || 'root'}: ${issue.message}`)
-      .join('\n');
-    return {
-      error: markToolValidationError<T>({
-        error: true,
-        message: `Tool input validation failed${toolId ? ` for ${toolId}` : ''}. Please fix the following errors and try again:\n${errorMessages}\n\nProvided arguments: ${truncateForLogging(input)}`,
-        validationErrors: buildFormattedErrors<T>(validation.issues),
-      }),
-    };
+    return buildInputValidationError<T>(validation.issues, input, toolId);
   } catch {
     throw new ToolSchemaValidationError();
   }
@@ -703,6 +730,9 @@ function validateToolInputUnsafe<T = unknown>(
   if ('value' in validation) {
     return { data: validation.value };
   }
+  if (hasNonRetryableIssue(validation.issues)) {
+    return buildInputValidationError<T>(validation.issues, input, toolId);
+  }
 
   // Step 4: Retry with stringified JSON values coerced (GitHub #12757)
   // LLMs like GLM4.7 send stringified JSON for array/object parameters, e.g.
@@ -719,6 +749,9 @@ function validateToolInputUnsafe<T = unknown>(
     const coercedValidation = safeValidate(schema, coercedInput);
     if ('value' in coercedValidation) {
       return { data: coercedValidation.value };
+    }
+    if (hasNonRetryableIssue(coercedValidation.issues)) {
+      return buildInputValidationError<T>(coercedValidation.issues, input, toolId);
     }
     currentInput = coercedInput;
     currentIssues = coercedValidation.issues;
@@ -852,6 +885,31 @@ function validateToolOutputUnsafe<T = unknown>(
   });
 
   return { error };
+}
+
+/**
+ * Refuses to run a tool whose output schema is refused. Where code generation from strings is
+ * disallowed, a JSON Schema output schema is compiled here, before the tool runs, so a tool
+ * whose result could never be validated does not perform its action and then report failure.
+ * Where Ajv validates, and for every other kind of schema, this returns `undefined`.
+ */
+export function refuseUnusableToolOutputSchema<T = unknown>(
+  schema: StandardSchemaWithJSON<T> | undefined,
+  toolId?: string,
+): ValidationError<T> | undefined {
+  const refusal = runSchemaValidationBoundary(() => {
+    const check = (schema as { [JSON_SCHEMA_REFUSAL]?: () => string | undefined } | undefined)?.[JSON_SCHEMA_REFUSAL];
+    return typeof check === 'function' ? check.call(schema) : undefined;
+  });
+  if (refusal === undefined) {
+    return undefined;
+  }
+  const issues = [{ message: `Schema validation error: ${refusal}` }];
+  return markToolValidationError<T>({
+    error: true,
+    message: `Tool output schema is refused${toolId ? ` for ${toolId}` : ''}, so the tool was not run:\n- root: ${issues[0]!.message}`,
+    validationErrors: buildFormattedErrors<T>(issues),
+  });
 }
 
 /**

@@ -1,7 +1,7 @@
 import type { JSONSchema7 } from 'json-schema';
 import { describe, it, expect } from 'vitest';
 import { isStandardSchemaWithJSON } from '../standard-schema';
-import { toStandardSchema } from './json-schema';
+import { JSON_SCHEMA_REFUSAL, jsonSchemaValidatorLoading, toStandardSchema } from './json-schema';
 
 describe('json-schema standard-schema adapter', () => {
   describe('toStandardSchema', () => {
@@ -289,6 +289,20 @@ describe('json-schema standard-schema adapter', () => {
       if ('issues' in invalidResult && invalidResult.issues) {
         expect(invalidResult.issues.length).toBeGreaterThan(0);
       }
+    });
+  });
+
+  describe('where code generation is allowed', () => {
+    it('validates with Ajv as before, with no interpreter load pending and no refusal', async () => {
+      // `not` is outside the interpreter's allow-list, and Ajv still checks it here.
+      const wrapper = toStandardSchema({ not: { type: 'string' } });
+
+      expect(wrapper[JSON_SCHEMA_REFUSAL]()).toBeUndefined();
+      expect(await wrapper['~standard'].validate(5)).toEqual({ value: 5 });
+      expect(await wrapper['~standard'].validate('a')).toEqual({
+        issues: [{ message: 'must NOT be valid', path: [] }],
+      });
+      expect(jsonSchemaValidatorLoading()).toBe(false);
     });
   });
 

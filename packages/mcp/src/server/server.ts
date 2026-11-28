@@ -21,6 +21,7 @@ import { createTool, isValidationError } from '@mastra/core/tools';
 import type { InternalCoreTool, MCPToolExecutionContext, MCPToolType, ToolAction } from '@mastra/core/tools';
 import { makeCoreTool } from '@mastra/core/utils';
 import type { SuspendOptions, Workflow } from '@mastra/core/workflows';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '@mastra/schema-compat';
 import { PromptSchema } from '@modelcontextprotocol/core';
 import { RESOURCE_MIME_TYPE, RESOURCE_URI_META_KEY } from '@modelcontextprotocol/ext-apps';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
@@ -818,6 +819,7 @@ export class MCPServer extends MCPServerBase {
     const argsHash = hashArguments(args);
     const continuation = readContinuation(ctx, requestContext, { method, name, argsHash });
     if (continuation?.outcome === 'accept' && resumeSchema) {
+      if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
       const validation = await resumeSchema['~standard'].validate(continuation.resumeData);
       if (validation.issues) {
         throw new ProtocolError(

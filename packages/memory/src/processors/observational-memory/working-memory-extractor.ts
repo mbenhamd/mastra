@@ -1,6 +1,7 @@
 import { parseMemoryRequestContext } from '@mastra/core/memory';
 import { toStandardSchema } from '@mastra/core/schema';
 import type { PublicSchema } from '@mastra/core/schema';
+import { jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '@mastra/schema-compat';
 import { standardSchemaToJSONSchema } from '@mastra/schema-compat/schema';
 import { z } from 'zod';
 
@@ -20,6 +21,7 @@ async function validateAgainstConfiguredSchema(
 ): Promise<{ value: unknown; jsonSchema: Record<string, unknown> }> {
   const standardSchema = toStandardSchema(schema);
   const jsonSchema = standardSchemaToJSONSchema(standardSchema, { io: 'input' }) as Record<string, unknown>;
+  if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
   const result = await standardSchema['~standard'].validate(stripNullsFromOptional(value, jsonSchema));
   if (!result.issues) {
     return { value: result.value, jsonSchema };

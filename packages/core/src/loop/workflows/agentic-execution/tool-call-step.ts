@@ -23,7 +23,12 @@ import type { BackgroundTaskProgressChunk, ToolBackgroundConfig } from '../../..
 import type { MastraDBMessage } from '../../../memory';
 import { BACKGROUND_WORK_CONTEXT, notifyBackgroundWorkTerminal } from '../../../processors/background-work-signals';
 import { RequestContext } from '../../../request-context';
-import { toStandardSchema, standardSchemaToJSONSchema } from '../../../schema';
+import {
+  toStandardSchema,
+  standardSchemaToJSONSchema,
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+} from '../../../schema';
 import { safeEnqueue } from '../../../stream/base';
 import { toPendingStepUsage } from '../../../stream/pending-step-usage';
 import { ChunkFrom } from '../../../stream/types';
@@ -2325,6 +2330,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
                   let rawResult = execution.result;
                   if (execution.adopted) {
+                    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
                     const outputValidation = validateToolOutput(
                       resolveToolOutputValidationSchema(resolvedTool),
                       rawResult,

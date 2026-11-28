@@ -30,7 +30,7 @@ import {
 } from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
 import { getRequestContextInputValues } from '../../request-context/input-source';
-import { toStandardSchema } from '../../schema';
+import { toStandardSchema, jsonSchemaValidatorLoading, jsonSchemaValidatorReady } from '../../schema';
 import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage';
 import { structuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
 import { getSemanticJsonSchema } from '../../stream/base/schema';
@@ -608,6 +608,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // mirroring Agent.stream()/generate(). Without this, schema violations are
   // silently ignored on the durable path.
   if (typedAgent.requestContextSchema) {
+    if (jsonSchemaValidatorLoading()) await jsonSchemaValidatorReady();
     const contextValues = getRequestContextInputValues(requestContext);
     const validation = await typedAgent.requestContextSchema['~standard'].validate(contextValues);
 

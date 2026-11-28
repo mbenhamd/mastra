@@ -4,11 +4,47 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import type { JSONSchema7 } from 'json-schema';
 import traverse from 'json-schema-traverse';
 import type { StandardSchemaWithJSON, StandardSchemaWithJSONProps } from '../standard-schema.types';
+import { InterpretedJsonSchema, startInterpreterLoad } from './json-schema-interpreter';
+
+export {
+  jsonSchemaValidatorLoading,
+  jsonSchemaValidatorReady,
+  JSON_SCHEMA_NON_RETRYABLE,
+} from './json-schema-interpreter';
 
 /**
  * Vendor name for JSON Schema wrapped schemas.
  */
 const VENDOR = 'json-schema';
+
+/**
+ * Whether this process can generate code from strings, which Ajv needs to compile a schema. It
+ * is probed once per process (the result is shared by every copy of this module) and decides the
+ * path for every schema: where it can, validation is fork main's Ajv, unchanged; where it cannot
+ * (for example under `--disallow-code-generation-from-strings`, or a Content Security Policy
+ * without `unsafe-eval`), validation is the interpreter in `json-schema-interpreter.ts`.
+ */
+const CODE_GENERATION: unique symbol = Symbol.for('mastra.schemaCompat.codeGenerationAllowed');
+const codeGenerationAllowed: boolean = ((globalThis as { [CODE_GENERATION]?: boolean })[CODE_GENERATION] ??= (() => {
+  try {
+    // eslint-disable-next-line no-new-func -- the probe for the code generation Ajv needs
+    return new Function('return true')() === true;
+  } catch {
+    return false;
+  }
+})());
+
+if (!codeGenerationAllowed) {
+  void startInterpreterLoad();
+}
+
+/**
+ * A method on every JSON Schema wrapper that returns why the schema is refused, or `undefined`.
+ * Where code generation is disallowed it compiles the schema, so a caller can refuse to run a
+ * tool whose output schema is refused before the tool runs. Where Ajv validates, it compiles
+ * nothing and returns `undefined`, as fork main compiled only when it first validated.
+ */
+export const JSON_SCHEMA_REFUSAL: unique symbol = Symbol.for('mastra.schemaCompat.jsonSchemaRefusal');
 
 /**
  * Options for creating a Standard Schema from JSON Schema.
@@ -62,6 +98,7 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
   readonly #options: JsonSchemaAdapterOptions;
   #ajvValidateCache: ReturnType<Ajv['compile']> | null = null;
   #ajvInstance: Ajv | null = null;
+  #interpreted: InterpretedJsonSchema | null = null;
 
   readonly '~standard': StandardSchemaWithJSONProps<Input, Output>;
 
@@ -81,6 +118,25 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
     };
   }
 
+  /** See {@link JSON_SCHEMA_REFUSAL}. */
+  [JSON_SCHEMA_REFUSAL](): string | undefined {
+    return codeGenerationAllowed ? undefined : this.#getInterpreted().refusal();
+  }
+
+  /**
+   * The interpreter for this schema where code generation is disallowed. Ajv options cannot be
+   * honoured there, so a schema given `ajvOptions` is refused in that path.
+   */
+  #getInterpreted(): InterpretedJsonSchema {
+    if (!this.#interpreted) {
+      this.#interpreted = new InterpretedJsonSchema(
+        this.#schema,
+        this.#options.ajvOptions === undefined ? undefined : 'is given ajvOptions, and Ajv needs code generation',
+      );
+    }
+    return this.#interpreted;
+  }
+
   /**
    * Validates a value against the JSON Schema using Ajv.
    *
@@ -88,6 +144,9 @@ export class JsonSchemaWrapper<Input = unknown, Output = Input> implements Stand
    * @returns A result object with either the validated value or validation issues
    */
   #validate(value: unknown): StandardSchemaV1.Result<Output> | Promise<StandardSchemaV1.Result<Output>> {
+    if (!codeGenerationAllowed) {
+      return this.#getInterpreted().validate<Output>(value);
+    }
     try {
       const validateFn = this.#getAjvValidator();
       const result = validateFn(value);
